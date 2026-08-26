@@ -40,6 +40,18 @@ impl TestPack {
         fs::write(path, contents).unwrap();
     }
 
+    fn write_function_tag(&self, id: &str, contents: &str) {
+        let (namespace, path) = id.split_once(':').unwrap();
+        let path = self
+            .root
+            .join("data")
+            .join(namespace)
+            .join("tags/function")
+            .join(format!("{path}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
     fn root(&self) -> &Path {
         &self.root
     }
@@ -241,6 +253,42 @@ fn accepts_official_compatible_format_encodings() {
     )
     .unwrap();
     assert!(Vm::load_directory(pack.root()).is_ok());
+}
+
+#[test]
+fn loads_function_tags_from_the_target_resource_directory() {
+    let pack = TestPack::new();
+    pack.write_function("example:main", "return run function #example:answers\n");
+    pack.write_function("example:answer", "return 42\n");
+    pack.write_function_tag("example:answers", r#"{"values":["example:answer"]}"#);
+    let ignored = pack.root().join("data/example/tags/functions/answers.json");
+    fs::create_dir_all(ignored.parent().unwrap()).unwrap();
+    fs::write(ignored, r#"{"values":[]}"#).unwrap();
+
+    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    assert_eq!(
+        vm.execute_function("example:main", 3).unwrap(),
+        FunctionOutcome::Returned {
+            success: true,
+            value: 42
+        }
+    );
+}
+
+#[test]
+fn directory_loader_reports_invalid_function_tags() {
+    let pack = TestPack::new();
+    pack.write_function("example:main", "return 1\n");
+    pack.write_function_tag("example:broken", r#"{"values":["example:missing"]}"#);
+    let expected_path = pack.root().join("data/example/tags/function/broken.json");
+
+    match Vm::load_directory(pack.root()).unwrap_err() {
+        LoadError::InvalidFunctionTag { path, reason } => {
+            assert_eq!(path, expected_path);
+            assert_eq!(reason, "required function `example:missing` does not exist");
+        }
+        error => panic!("expected an invalid function tag error, got {error}"),
+    }
 }
 
 #[test]

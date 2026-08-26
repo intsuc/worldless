@@ -391,12 +391,12 @@ fn quota_failure_preserves_tested_function_side_effects() {
 }
 
 #[test]
-fn function_conditions_reject_terminal_and_unsupported_reference_forms() {
+fn function_conditions_reject_terminal_and_invalid_reference_forms() {
     for command in [
         "execute if function example:predicate",
         "execute unless function example:predicate",
-        "execute if function #example:predicates run return 1",
-        "execute unless function #example:predicates run return 1",
+        "execute if function ##example:predicates run return 1",
+        "execute unless function #Upper:predicates run return 1",
         "execute if function Upper:predicate run return 1",
     ] {
         assert!(
@@ -409,13 +409,16 @@ fn function_conditions_reject_terminal_and_unsupported_reference_forms() {
     }
 
     assert!(
-        Vm::from_functions([
-            (
-                "example:valid",
-                "execute if function example:predicate run return 1\n",
-            ),
-            ("example:predicate", "return 1\n"),
-        ])
+        Vm::from_functions_and_tags(
+            [
+                (
+                    "example:valid",
+                    "execute if function #example:predicates run return 1\n",
+                ),
+                ("example:predicate", "return 1\n"),
+            ],
+            [("example:predicates", r#"{"values":["example:predicate"]}"#)],
+        )
         .is_ok()
     );
 }

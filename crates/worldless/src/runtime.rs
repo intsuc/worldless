@@ -2,10 +2,10 @@ use std::{cell::Cell, collections::VecDeque, error::Error, fmt, rc::Rc};
 
 use crate::{
     program::{
-        Command, Function, Modifier, Program, ScoreCondition, Scoreboard, ScoreboardCommand,
-        StoreKind,
+        Command, Function, Modifier, Program, ResolvedFunctions, ScoreCondition, Scoreboard,
+        ScoreboardCommand, StoreKind,
     },
-    resource::Identifier,
+    resource::{FunctionReference, Identifier},
 };
 
 /// The observable result of a function invocation.
@@ -76,6 +76,7 @@ enum ConsumerEnd {
     Ignore,
     TopLevel,
     FunctionCondition(Rc<Cell<Option<i32>>>),
+    FunctionTag(Rc<Cell<Option<i32>>>),
 }
 
 #[derive(Clone)]
@@ -103,6 +104,13 @@ impl ResultConsumer {
         Self {
             stores: Vec::new(),
             end: ConsumerEnd::FunctionCondition(result),
+        }
+    }
+
+    fn function_tag(result: Rc<Cell<Option<i32>>>) -> Self {
+        Self {
+            stores: Vec::new(),
+            end: ConsumerEnd::FunctionTag(result),
         }
     }
 
@@ -143,6 +151,11 @@ impl ResultConsumer {
             ConsumerEnd::FunctionCondition(condition_result) => {
                 condition_result.set(Some(result.value));
             }
+            ConsumerEnd::FunctionTag(tag_result) => {
+                tag_result.set(Some(
+                    tag_result.get().unwrap_or(0).wrapping_add(result.value),
+                ));
+            }
         }
     }
 }
@@ -182,6 +195,13 @@ enum QueueEntry<'a> {
         expected: bool,
         result: Rc<Cell<Option<i32>>>,
     },
+    ContinueFunctionTag {
+        frame: Frame<'a>,
+        functions: &'a [Identifier],
+        next_function: usize,
+        stores: Vec<StoreAction>,
+        result: Option<Rc<Cell<Option<i32>>>>,
+    },
     Fallthrough {
         depth: usize,
         discard_depth: usize,
@@ -196,7 +216,8 @@ impl QueueEntry<'_> {
             | Self::Step(frame)
             | Self::Prepare { frame, .. }
             | Self::ExecuteOrdinary { frame, .. }
-            | Self::ResumeFunctionCondition { frame, .. } => frame.depth,
+            | Self::ResumeFunctionCondition { frame, .. }
+            | Self::ContinueFunctionTag { frame, .. } => frame.depth,
             Self::Fallthrough { depth, .. } => *depth,
         }
     }
@@ -330,17 +351,21 @@ pub(crate) fn execute(
                         }
                         Modifier::FunctionCondition {
                             expected,
-                            function: function_id,
+                            function: function_reference,
                         } => {
                             forked = true;
                             let frame = frame.take().expect("the frame has not been queued");
                             let stores = stores.take().expect("the stores have not been queued");
-                            let Some(condition_function) = program.function(function_id) else {
-                                if !return_run {
-                                    schedule_next_instruction(&mut queue, frame);
-                                }
-                                break false;
-                            };
+                            let condition_functions =
+                                match program.resolve_functions(function_reference) {
+                                    Some(ResolvedFunctions::Tag([])) | None => {
+                                        if !return_run {
+                                            schedule_next_instruction(&mut queue, frame);
+                                        }
+                                        break false;
+                                    }
+                                    Some(functions) => functions,
+                                };
 
                             if !active {
                                 queue.push_front(QueueEntry::Prepare {
@@ -373,13 +398,30 @@ pub(crate) fn execute(
                                 discard_depth: isolated_depth,
                                 result_consumer: result_consumer.clone(),
                             });
-                            queue.push_front(QueueEntry::Call(Frame {
-                                function: condition_function,
-                                next_instruction: 0,
-                                depth: isolated_depth,
-                                discard_depth: isolated_depth,
-                                result_consumer,
-                            }));
+                            match condition_functions {
+                                ResolvedFunctions::Single(function) => {
+                                    queue.push_front(QueueEntry::Call(Frame {
+                                        function,
+                                        next_instruction: 0,
+                                        depth: isolated_depth,
+                                        discard_depth: isolated_depth,
+                                        result_consumer,
+                                    }));
+                                }
+                                ResolvedFunctions::Tag(functions) => {
+                                    for function_id in functions.iter().rev() {
+                                        queue.push_front(QueueEntry::Call(Frame {
+                                            function: program.function(function_id).expect(
+                                                "resolved function tags contain loaded functions",
+                                            ),
+                                            next_instruction: 0,
+                                            depth: isolated_depth,
+                                            discard_depth: isolated_depth,
+                                            result_consumer: result_consumer.clone(),
+                                        }));
+                                    }
+                                }
+                            }
                             break false;
                         }
                         Modifier::ReturnRun => {
@@ -429,13 +471,13 @@ pub(crate) fn execute(
                 }
 
                 match &compiled.command {
-                    Command::Function(id) => execute_function_command(
+                    Command::Function(reference) => execute_function_command(
                         program,
                         scoreboard,
                         &mut queue,
                         &mut top_level_result,
                         frame,
-                        id,
+                        reference,
                         stores,
                         return_run,
                     ),
@@ -507,6 +549,46 @@ pub(crate) fn execute(
                     forked: true,
                 });
             }
+            QueueEntry::ContinueFunctionTag {
+                frame,
+                functions,
+                next_function,
+                stores,
+                result,
+            } => {
+                let Some(function_id) = functions.get(next_function) else {
+                    if let Some(value) = result.as_ref().and_then(|result| result.get()) {
+                        ResultConsumer::ignoring(stores).accept(
+                            CommandResult::success(value),
+                            scoreboard,
+                            &mut top_level_result,
+                        );
+                    }
+                    schedule_next_instruction(&mut queue, frame);
+                    continue;
+                };
+                let child_depth = frame.depth + 1;
+                let result_consumer = result.as_ref().map_or_else(
+                    || ResultConsumer::ignoring(Vec::new()),
+                    |result| ResultConsumer::function_tag(Rc::clone(result)),
+                );
+                queue.push_front(QueueEntry::ContinueFunctionTag {
+                    frame,
+                    functions,
+                    next_function: next_function + 1,
+                    stores,
+                    result,
+                });
+                queue.push_front(QueueEntry::Call(Frame {
+                    function: program
+                        .function(function_id)
+                        .expect("resolved function tags contain loaded functions"),
+                    next_instruction: 0,
+                    depth: child_depth,
+                    discard_depth: child_depth,
+                    result_consumer,
+                }));
+            }
             QueueEntry::Fallthrough {
                 discard_depth,
                 result_consumer,
@@ -526,22 +608,83 @@ fn execute_function_command<'a>(
     queue: &mut VecDeque<QueueEntry<'a>>,
     top_level_result: &mut Option<FunctionOutcome>,
     frame: Frame<'a>,
-    id: &Identifier,
+    reference: &FunctionReference,
     stores: Vec<StoreAction>,
     return_run: bool,
 ) {
-    let Some(function) = program.function(id) else {
-        ResultConsumer::ignoring(stores).accept(
-            CommandResult::FAILURE,
-            scoreboard,
-            top_level_result,
-        );
-        if !return_run {
-            schedule_next_instruction(queue, frame);
+    let functions = match program.resolve_functions(reference) {
+        Some(ResolvedFunctions::Tag([])) | None => {
+            ResultConsumer::ignoring(stores).accept(
+                CommandResult::FAILURE,
+                scoreboard,
+                top_level_result,
+            );
+            if !return_run {
+                schedule_next_instruction(queue, frame);
+            }
+            return;
         }
-        return;
+        Some(functions) => functions,
     };
 
+    match functions {
+        ResolvedFunctions::Single(function) => {
+            queue_single_function(queue, frame, function, stores, return_run);
+        }
+        ResolvedFunctions::Tag([function_id]) => {
+            queue_single_function(
+                queue,
+                frame,
+                program
+                    .function(function_id)
+                    .expect("resolved function tags contain loaded functions"),
+                stores,
+                return_run,
+            );
+        }
+        ResolvedFunctions::Tag(functions) if return_run => {
+            let child_depth = frame.depth + 1;
+            let fallback_depth = frame.depth;
+            let discard_depth = frame.discard_depth;
+            let parent_consumer = frame.result_consumer;
+            let child_consumer = parent_consumer.with_prefix(stores);
+            queue.push_front(QueueEntry::Fallthrough {
+                depth: fallback_depth,
+                discard_depth,
+                result_consumer: parent_consumer,
+            });
+            for function_id in functions.iter().rev() {
+                queue.push_front(QueueEntry::Call(Frame {
+                    function: program
+                        .function(function_id)
+                        .expect("resolved function tags contain loaded functions"),
+                    next_instruction: 0,
+                    depth: child_depth,
+                    discard_depth,
+                    result_consumer: child_consumer.clone(),
+                }));
+            }
+        }
+        ResolvedFunctions::Tag(functions) => {
+            let result = (!stores.is_empty()).then(|| Rc::new(Cell::new(None)));
+            queue.push_front(QueueEntry::ContinueFunctionTag {
+                frame,
+                functions,
+                next_function: 0,
+                stores,
+                result,
+            });
+        }
+    }
+}
+
+fn queue_single_function<'a>(
+    queue: &mut VecDeque<QueueEntry<'a>>,
+    frame: Frame<'a>,
+    function: &'a Function,
+    stores: Vec<StoreAction>,
+    return_run: bool,
+) {
     let child_depth = frame.depth + 1;
     if return_run {
         let parent_consumer = frame.result_consumer;

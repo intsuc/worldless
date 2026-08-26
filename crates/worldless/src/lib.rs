@@ -2,11 +2,11 @@
 //! data packs.
 //!
 //! The current slice supports function calls and returns, persistent named
-//! scoreboard arithmetic, score- and direct-function-backed `execute`
+//! scoreboard arithmetic, function tags, score- and function-backed `execute`
 //! conditions, and `execute store score`/`return run` result propagation.
-//! Functions can be compiled from an expanded directory data pack or in-memory
-//! source. Construction is atomic: an invalid supported function rejects the
-//! whole program instead of leaving a partially populated VM.
+//! Functions and tags can be compiled from an expanded directory data pack or
+//! in-memory source. Construction is atomic: an invalid supported resource
+//! rejects the whole program instead of leaving a partially populated VM.
 
 mod loader;
 mod program;
@@ -41,6 +41,28 @@ impl Vm {
         S: AsRef<str>,
     {
         loader::compile_functions(functions).map(Self::new)
+    }
+
+    /// Compiles functions and function-tag JSON without reading a data pack
+    /// from the file system.
+    ///
+    /// Function and tag identifiers without a namespace use `minecraft`.
+    /// Duplicate identifiers after that normalization are rejected within each
+    /// resource type. Tag sources use the same JSON representation as files in
+    /// `data/<namespace>/tags/function`.
+    pub fn from_functions_and_tags<FI, FN, FS, TI, TN, TS>(
+        functions: FI,
+        function_tags: TI,
+    ) -> Result<Self, CompileError>
+    where
+        FI: IntoIterator<Item = (FN, FS)>,
+        FN: AsRef<str>,
+        FS: AsRef<str>,
+        TI: IntoIterator<Item = (TN, TS)>,
+        TN: AsRef<str>,
+        TS: AsRef<str>,
+    {
+        loader::compile_functions_and_tags(functions, function_tags).map(Self::new)
     }
 
     /// Loads one expanded data pack from `path`.

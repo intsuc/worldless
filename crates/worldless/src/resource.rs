@@ -35,6 +35,30 @@ impl fmt::Display for Identifier {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FunctionReference {
+    Function(Identifier),
+    Tag(Identifier),
+}
+
+impl FunctionReference {
+    pub(crate) fn parse(input: &str) -> Option<Self> {
+        input.strip_prefix('#').map_or_else(
+            || Identifier::parse(input).map(Self::Function),
+            |id| Identifier::parse(id).map(Self::Tag),
+        )
+    }
+}
+
+impl fmt::Display for FunctionReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Function(id) => id.fmt(formatter),
+            Self::Tag(id) => write!(formatter, "#{id}"),
+        }
+    }
+}
+
 pub(crate) fn is_allowed_in_identifier(unit: u16) -> bool {
     matches!(
         unit,

@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     error::Error,
     fmt, fs, io,
     path::{Path, PathBuf},
@@ -22,7 +22,7 @@ use crate::{
         ScoreCondition, ScorePredicate, ScoreRange, ScoreReference, ScoreboardCommand,
         ScoreboardOperation, StoreKind,
     },
-    resource::{Identifier, is_allowed_in_identifier},
+    resource::{FunctionReference, Identifier, is_allowed_in_identifier},
 };
 
 const TARGET_PACK_FORMAT: PackFormat = PackFormat {
@@ -52,6 +52,10 @@ pub enum LoadError {
         line: usize,
         reason: String,
     },
+    InvalidFunctionTag {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 /// An error encountered while compiling in-memory function source.
@@ -66,6 +70,16 @@ pub enum CompileError {
     InvalidFunction {
         id: String,
         line: usize,
+        reason: String,
+    },
+    InvalidFunctionTagIdentifier {
+        input: String,
+    },
+    DuplicateFunctionTag {
+        id: String,
+    },
+    InvalidFunctionTag {
+        id: String,
         reason: String,
     },
 }
@@ -84,6 +98,15 @@ impl fmt::Display for CompileError {
                     formatter,
                     "invalid function `{id}` at line {line}: {reason}"
                 )
+            }
+            Self::InvalidFunctionTagIdentifier { input } => {
+                write!(formatter, "invalid function tag identifier `{input}`")
+            }
+            Self::DuplicateFunctionTag { id } => {
+                write!(formatter, "duplicate function tag `{id}`")
+            }
+            Self::InvalidFunctionTag { id, reason } => {
+                write!(formatter, "invalid function tag `{id}`: {reason}")
             }
         }
     }
@@ -114,6 +137,11 @@ impl fmt::Display for LoadError {
                 "invalid function {} at line {line}: {reason}",
                 path.display()
             ),
+            Self::InvalidFunctionTag { path, reason } => write!(
+                formatter,
+                "invalid function tag {}: {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -137,6 +165,8 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
 
     let compiler = CommandCompiler::new();
     let mut functions = HashMap::new();
+    let mut unresolved_tags = HashMap::new();
+    let mut tag_paths = HashMap::new();
     let data = root.join("data");
     for namespace_dir in child_directories(&data)? {
         let Some(namespace) = namespace_dir.file_name().and_then(|name| name.to_str()) else {
@@ -171,9 +201,43 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
             })?;
             functions.insert(id, Function { instructions });
         }
+
+        let tag_root = namespace_dir.join("tags/function");
+        for path in regular_files_recursive(&tag_root)? {
+            let Some(relative) = resource_path(&tag_root, &path) else {
+                continue;
+            };
+            if !relative.ends_with(".json") {
+                continue;
+            }
+            let full_resource_path = format!("tags/function/{relative}");
+            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
+                continue;
+            }
+            let tag_path = &relative[..relative.len() - ".json".len()];
+            let id = Identifier::from_parts(namespace, tag_path)
+                .expect("removing a valid suffix preserves an identifier path");
+            let contents = read_to_string(&path)?;
+            let tag =
+                parse_function_tag(&contents).map_err(|reason| LoadError::InvalidFunctionTag {
+                    path: path.clone(),
+                    reason,
+                })?;
+            tag_paths.insert(id.clone(), path);
+            unresolved_tags.insert(id, tag);
+        }
     }
 
-    Ok(Program::new(functions))
+    let function_tags = resolve_function_tags(&functions, &unresolved_tags).map_err(|error| {
+        LoadError::InvalidFunctionTag {
+            path: tag_paths
+                .get(&error.tag)
+                .expect("every unresolved directory tag has a source path")
+                .clone(),
+            reason: error.reason,
+        }
+    })?;
+    Ok(Program::new(functions, function_tags))
 }
 
 pub(crate) fn compile_functions<I, N, S>(functions: I) -> Result<Program, CompileError>
@@ -181,6 +245,24 @@ where
     I: IntoIterator<Item = (N, S)>,
     N: AsRef<str>,
     S: AsRef<str>,
+{
+    compile_functions_and_tags(
+        functions,
+        std::iter::empty::<(&'static str, &'static str)>(),
+    )
+}
+
+pub(crate) fn compile_functions_and_tags<FI, FN, FS, TI, TN, TS>(
+    functions: FI,
+    function_tags: TI,
+) -> Result<Program, CompileError>
+where
+    FI: IntoIterator<Item = (FN, FS)>,
+    FN: AsRef<str>,
+    FS: AsRef<str>,
+    TI: IntoIterator<Item = (TN, TS)>,
+    TN: AsRef<str>,
+    TS: AsRef<str>,
 {
     let compiler = CommandCompiler::new();
     let mut compiled = HashMap::new();
@@ -209,7 +291,307 @@ where
             }
         }
     }
-    Ok(Program::new(compiled))
+
+    let mut unresolved_tags = HashMap::new();
+    for (raw_id, source) in function_tags {
+        let raw_id = raw_id.as_ref();
+        let id = Identifier::parse(raw_id).ok_or_else(|| {
+            CompileError::InvalidFunctionTagIdentifier {
+                input: raw_id.to_owned(),
+            }
+        })?;
+        match unresolved_tags.entry(id) {
+            Entry::Occupied(entry) => {
+                return Err(CompileError::DuplicateFunctionTag {
+                    id: entry.key().to_string(),
+                });
+            }
+            Entry::Vacant(entry) => {
+                let id = entry.key().to_string();
+                let tag = parse_function_tag(source.as_ref())
+                    .map_err(|reason| CompileError::InvalidFunctionTag { id, reason })?;
+                entry.insert(tag);
+            }
+        }
+    }
+    let function_tags = resolve_function_tags(&compiled, &unresolved_tags).map_err(|error| {
+        CompileError::InvalidFunctionTag {
+            id: error.tag.to_string(),
+            reason: error.reason,
+        }
+    })?;
+    Ok(Program::new(compiled, function_tags))
+}
+
+#[derive(Debug)]
+struct UnresolvedFunctionTag {
+    entries: Vec<FunctionTagEntry>,
+}
+
+#[derive(Debug)]
+struct FunctionTagEntry {
+    reference: FunctionReference,
+    required: bool,
+}
+
+#[derive(Debug)]
+struct FunctionTagResolutionError {
+    tag: Identifier,
+    reason: String,
+}
+
+fn parse_function_tag(contents: &str) -> Result<UnresolvedFunctionTag, String> {
+    let value: Value =
+        serde_json::from_str(contents).map_err(|error| format!("invalid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "the root value must be an object".to_owned())?;
+    if object
+        .get("replace")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("`replace` must be a boolean".to_owned());
+    }
+    let values = object
+        .get("values")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing array field `values`".to_owned())?;
+    let entries = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| parse_function_tag_entry(index, value))
+        .collect::<Result<_, _>>()?;
+    Ok(UnresolvedFunctionTag { entries })
+}
+
+fn parse_function_tag_entry(index: usize, value: &Value) -> Result<FunctionTagEntry, String> {
+    let (raw_id, required) = match value {
+        Value::String(id) => (id.as_str(), true),
+        Value::Object(object) => {
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("`values[{index}].id` must be a string"))?;
+            let required = match object.get("required") {
+                Some(Value::Bool(required)) => *required,
+                Some(_) => {
+                    return Err(format!("`values[{index}].required` must be a boolean"));
+                }
+                None => true,
+            };
+            (id, required)
+        }
+        _ => {
+            return Err(format!("`values[{index}]` must be a string or an object"));
+        }
+    };
+    let reference = FunctionReference::parse(raw_id)
+        .ok_or_else(|| format!("`values[{index}]` has invalid identifier `{raw_id}`"))?;
+    Ok(FunctionTagEntry {
+        reference,
+        required,
+    })
+}
+
+fn resolve_function_tags(
+    functions: &HashMap<Identifier, Function>,
+    tags: &HashMap<Identifier, UnresolvedFunctionTag>,
+) -> Result<HashMap<Identifier, Vec<Identifier>>, FunctionTagResolutionError> {
+    let mut tag_ids = tags.keys().cloned().collect::<Vec<_>>();
+    tag_ids.sort_by_key(ToString::to_string);
+
+    let mut dependencies = tags
+        .keys()
+        .cloned()
+        .map(|id| (id, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    for tag_id in &tag_ids {
+        let tag = tags
+            .get(tag_id)
+            .expect("the tag identifier came from the tag map");
+        for entry in &tag.entries {
+            match &entry.reference {
+                FunctionReference::Function(function) if entry.required => {
+                    if !functions.contains_key(function) {
+                        return Err(invalid_function_tag_reference(
+                            tag_id,
+                            format!("required function `{function}` does not exist"),
+                        ));
+                    }
+                }
+                FunctionReference::Tag(dependency) if entry.required => {
+                    if !tags.contains_key(dependency) {
+                        return Err(invalid_function_tag_reference(
+                            tag_id,
+                            format!("required function tag `#{dependency}` does not exist"),
+                        ));
+                    }
+                    if creates_tag_cycle(&dependencies, tag_id, dependency) {
+                        return Err(invalid_function_tag_reference(
+                            tag_id,
+                            format!("required function tag reference `#{dependency}` is cyclic"),
+                        ));
+                    }
+                    dependencies
+                        .get_mut(tag_id)
+                        .expect("every tag owns a dependency list")
+                        .push(dependency.clone());
+                }
+                FunctionReference::Function(_) | FunctionReference::Tag(_) => {}
+            }
+        }
+    }
+
+    let mut accepted_optional_tags = HashSet::new();
+    for tag_id in &tag_ids {
+        let tag = tags
+            .get(tag_id)
+            .expect("the tag identifier came from the tag map");
+        for (index, entry) in tag.entries.iter().enumerate() {
+            let FunctionTagEntry {
+                reference: FunctionReference::Tag(dependency),
+                required: false,
+            } = entry
+            else {
+                continue;
+            };
+            if !tags.contains_key(dependency)
+                || creates_tag_cycle(&dependencies, tag_id, dependency)
+            {
+                continue;
+            }
+            dependencies
+                .get_mut(tag_id)
+                .expect("every tag owns a dependency list")
+                .push(dependency.clone());
+            accepted_optional_tags.insert((tag_id.clone(), index));
+        }
+    }
+
+    let mut remaining_dependencies = dependencies
+        .iter()
+        .map(|(id, dependencies)| (id.clone(), dependencies.len()))
+        .collect::<HashMap<_, _>>();
+    let mut dependents = tags
+        .keys()
+        .cloned()
+        .map(|id| (id, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    for tag_id in &tag_ids {
+        for dependency in dependencies
+            .get(tag_id)
+            .expect("every tag owns a dependency list")
+        {
+            dependents
+                .get_mut(dependency)
+                .expect("every dependency is an existing tag")
+                .push(tag_id.clone());
+        }
+    }
+
+    let mut ready = tag_ids
+        .iter()
+        .filter(|id| remaining_dependencies.get(*id) == Some(&0))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut resolved = HashMap::new();
+    let mut next = 0;
+    while let Some(tag_id) = ready.get(next).cloned() {
+        next += 1;
+        let values =
+            flatten_function_tag(&tag_id, functions, tags, &accepted_optional_tags, &resolved);
+        resolved.insert(tag_id.clone(), values);
+
+        for dependent in dependents
+            .get(&tag_id)
+            .expect("every tag owns a dependents list")
+        {
+            let remaining = remaining_dependencies
+                .get_mut(dependent)
+                .expect("every dependent is an existing tag");
+            *remaining -= 1;
+            if *remaining == 0 {
+                ready.push(dependent.clone());
+            }
+        }
+    }
+    assert_eq!(
+        resolved.len(),
+        tags.len(),
+        "the accepted function tag dependency graph is acyclic"
+    );
+    Ok(resolved)
+}
+
+fn creates_tag_cycle(
+    dependencies: &HashMap<Identifier, Vec<Identifier>>,
+    tag: &Identifier,
+    dependency: &Identifier,
+) -> bool {
+    if tag == dependency {
+        return true;
+    }
+    let mut pending = vec![dependency];
+    let mut visited = HashSet::new();
+    while let Some(current) = pending.pop() {
+        if current == tag {
+            return true;
+        }
+        if visited.insert(current) {
+            pending.extend(dependencies.get(current).into_iter().flatten());
+        }
+    }
+    false
+}
+
+fn flatten_function_tag(
+    id: &Identifier,
+    functions: &HashMap<Identifier, Function>,
+    tags: &HashMap<Identifier, UnresolvedFunctionTag>,
+    accepted_optional_tags: &HashSet<(Identifier, usize)>,
+    resolved: &HashMap<Identifier, Vec<Identifier>>,
+) -> Vec<Identifier> {
+    let mut values = Vec::new();
+    let mut present = HashSet::new();
+    for (index, entry) in tags
+        .get(id)
+        .expect("only collected tags are flattened")
+        .entries
+        .iter()
+        .enumerate()
+    {
+        match &entry.reference {
+            FunctionReference::Function(function) => {
+                if functions.contains_key(function) && present.insert(function.clone()) {
+                    values.push(function.clone());
+                }
+            }
+            FunctionReference::Tag(tag)
+                if entry.required || accepted_optional_tags.contains(&(id.clone(), index)) =>
+            {
+                for function in resolved
+                    .get(tag)
+                    .expect("accepted tag dependencies are flattened first")
+                {
+                    if present.insert(function.clone()) {
+                        values.push(function.clone());
+                    }
+                }
+            }
+            FunctionReference::Tag(_) => {}
+        }
+    }
+    values
+}
+
+fn invalid_function_tag_reference(
+    tag: &Identifier,
+    reason: impl Into<String>,
+) -> FunctionTagResolutionError {
+    FunctionTagResolutionError {
+        tag: tag.clone(),
+        reason: reason.into(),
+    }
 }
 
 fn validate_pack_metadata(root: &Path) -> Result<(), LoadError> {
@@ -667,15 +1049,15 @@ impl CommandCompiler {
         let dispatcher = CommandDispatcher::new();
 
         let function: Command<LoweringSource> = Rc::new(|context| {
-            let id = context
-                .argument::<Identifier>("name")
+            let reference = context
+                .argument::<FunctionReference>("name")
                 .expect("the function executor is attached below its name argument");
             context
                 .source()
-                .record(CompiledCommand::Function((*id).clone()))
+                .record(CompiledCommand::Function((*reference).clone()))
         });
         let function_name =
-            RequiredArgumentBuilder::argument("name", IdentifierArgument).executes(function);
+            RequiredArgumentBuilder::argument("name", FunctionArgument).executes(function);
         dispatcher
             .register(
                 LiteralArgumentBuilder::literal("function")
@@ -1037,11 +1419,11 @@ fn execute_condition_branch(
         .then(
             LiteralArgumentBuilder::literal("function")
                 .then(
-                    RequiredArgumentBuilder::argument("name", IdentifierArgument)
+                    RequiredArgumentBuilder::argument("name", FunctionArgument)
                         .fork(
                             execute,
                             Rc::new(move |context: &CommandContext<LoweringSource>| {
-                                let function = context.argument::<Identifier>("name").expect(
+                                let function = context.argument::<FunctionReference>("name").expect(
                                     "the function condition is attached below its name argument",
                                 );
                                 Ok(vec![Rc::new(context.source().with_modifier(
@@ -1379,25 +1761,22 @@ fn is_allowed_score_range_number(reader: &StringReader) -> bool {
 }
 
 #[derive(Clone, Copy)]
-struct IdentifierArgument;
+struct FunctionArgument;
 
-impl ArgumentType<LoweringSource> for IdentifierArgument {
-    type Value = Identifier;
+impl ArgumentType<LoweringSource> for FunctionArgument {
+    type Value = FunctionReference;
 
     fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
         let start = reader.cursor();
         if reader.can_read() && reader.peek() == b'#' as u16 {
-            return Err(SimpleCommandExceptionType::new(LiteralMessage::new(
-                "function tags are not supported",
-            ))
-            .create_with_context(reader));
+            reader.skip();
         }
         while reader.can_read() && is_allowed_in_identifier(reader.peek()) {
             reader.skip();
         }
         let raw = reader.substring(start, reader.cursor());
-        if let Some(id) = Identifier::parse(&raw) {
-            Ok(id)
+        if let Some(reference) = FunctionReference::parse(&raw) {
+            Ok(reference)
         } else {
             reader.set_cursor(start);
             Err(
@@ -1408,7 +1787,10 @@ impl ArgumentType<LoweringSource> for IdentifierArgument {
     }
 
     fn examples(&self) -> Vec<String> {
-        ["foo", "foo:bar"].into_iter().map(str::to_owned).collect()
+        ["foo", "foo:bar", "#foo"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
@@ -1671,7 +2053,10 @@ mod tests {
                 && objective == "values"
         ));
 
-        assert!(compiler.compile("function #example:tag").is_err());
+        assert!(matches!(
+            compiler.compile("function #example:tag").unwrap().command,
+            CompiledCommand::Function(ref reference) if reference.to_string() == "#example:tag"
+        ));
         assert!(compiler.compile("scoreboard objectives list").is_err());
         assert!(
             compiler
@@ -1753,7 +2138,7 @@ mod tests {
         let compiler = CommandCompiler::new();
         let instruction = compiler
             .compile(
-                "execute if function example:first unless function example:second run return 3",
+                "execute if function example:first unless function #example:second run return 3",
             )
             .unwrap();
 
@@ -1768,7 +2153,7 @@ mod tests {
                     expected: false,
                     function: second
                 }
-            ] if first.to_string() == "example:first" && second.to_string() == "example:second"
+            ] if first.to_string() == "example:first" && second.to_string() == "#example:second"
         ));
         assert!(matches!(
             instruction.command,
@@ -1784,7 +2169,7 @@ mod tests {
         );
         assert!(
             compiler
-                .compile("execute unless function #example:tag run return 1")
+                .compile("execute unless function ##example:tag run return 1")
                 .is_err()
         );
     }

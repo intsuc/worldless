@@ -1,20 +1,45 @@
 use std::collections::HashMap;
 
-use crate::resource::Identifier;
+use crate::resource::{FunctionReference, Identifier};
 
 #[derive(Debug)]
 pub(crate) struct Program {
     functions: HashMap<Identifier, Function>,
+    function_tags: HashMap<Identifier, Vec<Identifier>>,
 }
 
 impl Program {
-    pub(crate) fn new(functions: HashMap<Identifier, Function>) -> Self {
-        Self { functions }
+    pub(crate) fn new(
+        functions: HashMap<Identifier, Function>,
+        function_tags: HashMap<Identifier, Vec<Identifier>>,
+    ) -> Self {
+        Self {
+            functions,
+            function_tags,
+        }
     }
 
     pub(crate) fn function(&self, id: &Identifier) -> Option<&Function> {
         self.functions.get(id)
     }
+
+    pub(crate) fn resolve_functions(
+        &self,
+        reference: &FunctionReference,
+    ) -> Option<ResolvedFunctions<'_>> {
+        match reference {
+            FunctionReference::Function(id) => self.function(id).map(ResolvedFunctions::Single),
+            FunctionReference::Tag(id) => self
+                .function_tags
+                .get(id)
+                .map(|functions| ResolvedFunctions::Tag(functions)),
+        }
+    }
+}
+
+pub(crate) enum ResolvedFunctions<'a> {
+    Single(&'a Function),
+    Tag(&'a [Identifier]),
 }
 
 #[derive(Debug)]
@@ -38,7 +63,7 @@ pub(crate) enum Modifier {
     Condition(ScoreCondition),
     FunctionCondition {
         expected: bool,
-        function: Identifier,
+        function: FunctionReference,
     },
     ReturnRun,
 }
@@ -51,7 +76,7 @@ pub(crate) enum StoreKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Command {
-    Function(Identifier),
+    Function(FunctionReference),
     Return { success: bool, value: i32 },
     Scoreboard(ScoreboardCommand),
     Condition(ScoreCondition),
