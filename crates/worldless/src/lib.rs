@@ -2,8 +2,8 @@
 //! data packs.
 //!
 //! The current slice supports function calls and returns, persistent named
-//! scoreboard arithmetic and score-only `execute` conditions, and
-//! `execute store score`/`return run` result propagation.
+//! scoreboard arithmetic, score- and direct-function-backed `execute`
+//! conditions, and `execute store score`/`return run` result propagation.
 //! Functions can be compiled from an expanded directory data pack or in-memory
 //! source. Construction is atomic: an invalid supported function rejects the
 //! whole program instead of leaving a partially populated VM.

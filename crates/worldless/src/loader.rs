@@ -924,9 +924,9 @@ impl CommandCompiler {
                     .expect("the store literal can contain the success literal"),
             )
             .expect("the execute literal can contain the store literal")
-            .then(execute_score_condition_branch("if", true, execute.clone()))
+            .then(execute_condition_branch("if", true, execute.clone()))
             .expect("the execute literal can contain the if literal")
-            .then(execute_score_condition_branch("unless", false, execute))
+            .then(execute_condition_branch("unless", false, execute))
             .expect("the execute literal can contain the unless literal");
         dispatcher
             .register(execute_command)
@@ -974,7 +974,7 @@ fn score_delta_branch(
         .expect("a score operation can contain a score holder")
 }
 
-fn execute_score_condition_branch(
+fn execute_condition_branch(
     literal: &'static str,
     expected: bool,
     execute: worldless_brigadier::tree::Node<LoweringSource>,
@@ -1026,7 +1026,7 @@ fn execute_score_condition_branch(
                             .expect(
                                 "a target objective can contain greater-than-or-equal comparison",
                             )
-                            .then(score_matches_condition_branch(expected, execute))
+                            .then(score_matches_condition_branch(expected, execute.clone()))
                             .expect("a target objective can contain a range match"),
                         )
                         .expect("a target score holder can contain an objective"),
@@ -1034,6 +1034,29 @@ fn execute_score_condition_branch(
                 .expect("the score literal can contain a target score holder"),
         )
         .expect("a conditional can contain the score literal")
+        .then(
+            LiteralArgumentBuilder::literal("function")
+                .then(
+                    RequiredArgumentBuilder::argument("name", IdentifierArgument)
+                        .fork(
+                            execute,
+                            Rc::new(move |context: &CommandContext<LoweringSource>| {
+                                let function = context.argument::<Identifier>("name").expect(
+                                    "the function condition is attached below its name argument",
+                                );
+                                Ok(vec![Rc::new(context.source().with_modifier(
+                                    Modifier::FunctionCondition {
+                                        expected,
+                                        function: (*function).clone(),
+                                    },
+                                ))])
+                            }),
+                        )
+                        .expect("a function condition can redirect to execute"),
+                )
+                .expect("the function literal can contain a function name"),
+        )
+        .expect("a conditional can contain the function literal")
 }
 
 fn score_comparison_condition_branch(
@@ -1721,6 +1744,47 @@ mod tests {
         assert!(
             compiler
                 .compile("execute store result score Player values run return 1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compiler_lowers_function_conditions_as_nonterminal_modifiers() {
+        let compiler = CommandCompiler::new();
+        let instruction = compiler
+            .compile(
+                "execute if function example:first unless function example:second run return 3",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            instruction.modifiers.as_slice(),
+            [
+                Modifier::FunctionCondition {
+                    expected: true,
+                    function: first
+                },
+                Modifier::FunctionCondition {
+                    expected: false,
+                    function: second
+                }
+            ] if first.to_string() == "example:first" && second.to_string() == "example:second"
+        ));
+        assert!(matches!(
+            instruction.command,
+            CompiledCommand::Return {
+                success: true,
+                value: 3
+            }
+        ));
+        assert!(
+            compiler
+                .compile("execute if function example:first")
+                .is_err()
+        );
+        assert!(
+            compiler
+                .compile("execute unless function #example:tag run return 1")
                 .is_err()
         );
     }

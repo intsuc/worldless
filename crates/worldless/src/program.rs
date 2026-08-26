@@ -36,6 +36,10 @@ pub(crate) enum Modifier {
         objective: String,
     },
     Condition(ScoreCondition),
+    FunctionCondition {
+        expected: bool,
+        function: Identifier,
+    },
     ReturnRun,
 }
 

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, error::Error, fmt};
+use std::{cell::Cell, collections::VecDeque, error::Error, fmt, rc::Rc};
 
 use crate::{
     program::{
@@ -71,10 +71,11 @@ struct StoreAction {
     objective: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ConsumerEnd {
     Ignore,
     TopLevel,
+    FunctionCondition(Rc<Cell<Option<i32>>>),
 }
 
 #[derive(Clone)]
@@ -98,11 +99,18 @@ impl ResultConsumer {
         }
     }
 
+    fn function_condition(result: Rc<Cell<Option<i32>>>) -> Self {
+        Self {
+            stores: Vec::new(),
+            end: ConsumerEnd::FunctionCondition(result),
+        }
+    }
+
     fn with_prefix(&self, mut prefix: Vec<StoreAction>) -> Self {
         prefix.extend(self.stores.iter().cloned());
         Self {
             stores: prefix,
-            end: self.end,
+            end: self.end.clone(),
         }
     }
 
@@ -124,11 +132,17 @@ impl ResultConsumer {
             );
         }
 
-        if matches!(self.end, ConsumerEnd::TopLevel) {
-            *top_level_result = Some(FunctionOutcome::Returned {
-                success: result.success,
-                value: result.value,
-            });
+        match &self.end {
+            ConsumerEnd::Ignore => {}
+            ConsumerEnd::TopLevel => {
+                *top_level_result = Some(FunctionOutcome::Returned {
+                    success: result.success,
+                    value: result.value,
+                });
+            }
+            ConsumerEnd::FunctionCondition(condition_result) => {
+                condition_result.set(Some(result.value));
+            }
         }
     }
 }
@@ -159,6 +173,15 @@ enum QueueEntry<'a> {
         stores: Vec<StoreAction>,
         return_run: bool,
     },
+    ResumeFunctionCondition {
+        frame: Frame<'a>,
+        instruction: usize,
+        next_modifier: usize,
+        stores: Vec<StoreAction>,
+        return_run: bool,
+        expected: bool,
+        result: Rc<Cell<Option<i32>>>,
+    },
     Fallthrough {
         depth: usize,
         discard_depth: usize,
@@ -172,7 +195,8 @@ impl QueueEntry<'_> {
             Self::Call(frame)
             | Self::Step(frame)
             | Self::Prepare { frame, .. }
-            | Self::ExecuteOrdinary { frame, .. } => frame.depth,
+            | Self::ExecuteOrdinary { frame, .. }
+            | Self::ResumeFunctionCondition { frame, .. } => frame.depth,
             Self::Fallthrough { depth, .. } => *depth,
         }
     }
@@ -304,6 +328,60 @@ pub(crate) fn execute(
                                 active = scoreboard.evaluate_condition(condition).unwrap_or(false);
                             }
                         }
+                        Modifier::FunctionCondition {
+                            expected,
+                            function: function_id,
+                        } => {
+                            forked = true;
+                            let frame = frame.take().expect("the frame has not been queued");
+                            let stores = stores.take().expect("the stores have not been queued");
+                            let Some(condition_function) = program.function(function_id) else {
+                                if !return_run {
+                                    schedule_next_instruction(&mut queue, frame);
+                                }
+                                break false;
+                            };
+
+                            if !active {
+                                queue.push_front(QueueEntry::Prepare {
+                                    frame,
+                                    instruction,
+                                    next_modifier,
+                                    stores,
+                                    return_run,
+                                    active: false,
+                                    forked,
+                                });
+                                break false;
+                            }
+
+                            let result = Rc::new(Cell::new(None));
+                            let result_consumer =
+                                ResultConsumer::function_condition(Rc::clone(&result));
+                            let isolated_depth = frame.depth + 1;
+                            queue.push_front(QueueEntry::ResumeFunctionCondition {
+                                frame,
+                                instruction,
+                                next_modifier,
+                                stores,
+                                return_run,
+                                expected: *expected,
+                                result,
+                            });
+                            queue.push_front(QueueEntry::Fallthrough {
+                                depth: isolated_depth,
+                                discard_depth: isolated_depth,
+                                result_consumer: result_consumer.clone(),
+                            });
+                            queue.push_front(QueueEntry::Call(Frame {
+                                function: condition_function,
+                                next_instruction: 0,
+                                depth: isolated_depth,
+                                discard_depth: isolated_depth,
+                                result_consumer,
+                            }));
+                            break false;
+                        }
                         Modifier::ReturnRun => {
                             let frame = frame.take().expect("the frame has not been queued");
                             if active {
@@ -408,6 +486,26 @@ pub(crate) fn execute(
                 } else {
                     schedule_next_instruction(&mut queue, frame);
                 }
+            }
+            QueueEntry::ResumeFunctionCondition {
+                frame,
+                instruction,
+                next_modifier,
+                stores,
+                return_run,
+                expected,
+                result,
+            } => {
+                let active = result.get().is_some_and(|value| (value != 0) == expected);
+                queue.push_front(QueueEntry::Prepare {
+                    frame,
+                    instruction,
+                    next_modifier,
+                    stores,
+                    return_run,
+                    active,
+                    forked: true,
+                });
             }
             QueueEntry::Fallthrough {
                 discard_depth,
