@@ -21,7 +21,6 @@ use crate::{
 const INVENTORY_SCHEMA_VERSION: u32 = 1;
 const INPUT_FINGERPRINT_VERSION: &str = "worldless-dev-sources-input-v3";
 const TREE_FINGERPRINT_VERSION: &str = "worldless-dev-sources-tree-v1";
-const COMPLETION_FILE: &str = ".worldless-complete";
 const INVENTORY_FILE: &str = "origins.json";
 const CODE_DIRECTORY: &str = "code";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
@@ -33,7 +32,7 @@ pub fn generate(
     libraries: &libraries::Prepared,
     minecraft_version: &str,
     generated_root: &Path,
-) -> Result<PathBuf> {
+) -> Result<VerifiedSources> {
     validate_single_component("Minecraft version", minecraft_version)?;
     validate_sha256("library manifest", &libraries.manifest_sha256)?;
 
@@ -63,9 +62,9 @@ pub fn generate(
                     output.display()
                 );
             }
-            verify_output(&output, minecraft_version, &input_sha256)?;
+            let verified = verify_output(&output, minecraft_version, &input_sha256)?;
             eprintln!("Using existing combined sources");
-            return Ok(output);
+            return Ok(verified);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -76,14 +75,14 @@ pub fn generate(
 
     let temporary = parent.join("sources.part");
     let work = parent.join("sources.work");
-    ensure_absent(&temporary, "temporary source output")?;
-    ensure_absent(&work, "source work directory")?;
+    artifacts::ensure_absent(&temporary, "temporary source output")?;
+    artifacts::ensure_absent(&work, "source work directory")?;
     fs::create_dir(&work)
         .with_context(|| format!("failed to create source work directory {}", work.display()))?;
     let mut work_created = true;
     let mut temporary_created = false;
 
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<VerifiedSources> {
         let mut plans = Vec::with_capacity(resolved_libraries.len() + 1);
 
         let server_output = work.join("server");
@@ -276,12 +275,12 @@ pub fn generate(
         );
         write_inventory(&temporary, &inventory)?;
         let tree_sha256 = payload_tree_sha256(&temporary)?;
-        write_completion(&temporary, &input_sha256, &tree_sha256)?;
-        verify_output(&temporary, minecraft_version, &input_sha256)?;
+        artifacts::write_completion(&temporary, &input_sha256, &tree_sha256)?;
+        let mut verified = verify_output(&temporary, minecraft_version, &input_sha256)?;
 
         remove_owned_directory(&parent, &work)?;
         work_created = false;
-        ensure_absent(&output, "source output")?;
+        artifacts::ensure_absent(&output, "source output")?;
         fs::rename(&temporary, &output).with_context(|| {
             format!(
                 "failed to move completed sources {} to {}",
@@ -290,26 +289,28 @@ pub fn generate(
             )
         })?;
         temporary_created = false;
-        Ok(())
+        verified.path = output;
+        Ok(verified)
     })();
 
-    if let Err(mut error) = result {
-        if temporary_created && let Err(cleanup) = remove_owned_directory(&parent, &temporary) {
-            error = error.context(format!(
-                "also failed to remove temporary source output {}: {cleanup}",
-                temporary.display()
-            ));
+    match result {
+        Ok(verified) => Ok(verified),
+        Err(mut error) => {
+            if temporary_created && let Err(cleanup) = remove_owned_directory(&parent, &temporary) {
+                error = error.context(format!(
+                    "also failed to remove temporary source output {}: {cleanup}",
+                    temporary.display()
+                ));
+            }
+            if work_created && let Err(cleanup) = remove_owned_directory(&parent, &work) {
+                error = error.context(format!(
+                    "also failed to remove source work directory {}: {cleanup}",
+                    work.display()
+                ));
+            }
+            Err(error)
         }
-        if work_created && let Err(cleanup) = remove_owned_directory(&parent, &work) {
-            error = error.context(format!(
-                "also failed to remove source work directory {}: {cleanup}",
-                work.display()
-            ));
-        }
-        return Err(error);
     }
-
-    Ok(output)
 }
 
 struct ResolvedLibrary<'a> {
@@ -487,21 +488,21 @@ fn input_fingerprint(
     libraries: &[ResolvedLibrary<'_>],
 ) -> String {
     let mut hasher = Sha256::new();
-    hash_field(&mut hasher, INPUT_FINGERPRINT_VERSION);
-    hash_field(&mut hasher, minecraft_version);
-    hash_field(&mut hasher, &minecraft.java_major_version.to_string());
-    hash_field(&mut hasher, &minecraft.server_sha1);
-    hash_field(&mut hasher, &minecraft.runtime_manifest_sha1);
-    hash_field(&mut hasher, server_sha256);
-    hash_field(&mut hasher, manifest_sha256);
-    hash_field(&mut hasher, vineflower_fingerprint);
+    artifacts::hash_field(&mut hasher, INPUT_FINGERPRINT_VERSION);
+    artifacts::hash_field(&mut hasher, minecraft_version);
+    artifacts::hash_field(&mut hasher, &minecraft.java_major_version.to_string());
+    artifacts::hash_field(&mut hasher, &minecraft.server_sha1);
+    artifacts::hash_field(&mut hasher, &minecraft.runtime_manifest_sha1);
+    artifacts::hash_field(&mut hasher, server_sha256);
+    artifacts::hash_field(&mut hasher, manifest_sha256);
+    artifacts::hash_field(&mut hasher, vineflower_fingerprint);
     for library in libraries {
-        hash_field(&mut hasher, &library.source.id);
-        hash_field(&mut hasher, &library.artifact_path.text);
-        hash_field(&mut hasher, &library.input_sha256);
+        artifacts::hash_field(&mut hasher, &library.source.id);
+        artifacts::hash_field(&mut hasher, &library.artifact_path.text);
+        artifacts::hash_field(&mut hasher, &library.input_sha256);
         for binary in &library.binaries {
-            hash_field(&mut hasher, &binary.origin.coordinate);
-            hash_field(&mut hasher, &binary.origin.sha256);
+            artifacts::hash_field(&mut hasher, &binary.origin.coordinate);
+            artifacts::hash_field(&mut hasher, &binary.origin.sha256);
         }
         match &library.source.input {
             Input::Published {
@@ -512,22 +513,17 @@ fn input_fingerprint(
                 sha256,
                 ..
             } => {
-                hash_field(&mut hasher, "published");
-                hash_field(&mut hasher, repository);
-                hash_field(&mut hasher, url);
-                hash_field(&mut hasher, checksum_algorithm);
-                hash_field(&mut hasher, checksum);
-                hash_field(&mut hasher, sha256);
+                artifacts::hash_field(&mut hasher, "published");
+                artifacts::hash_field(&mut hasher, repository);
+                artifacts::hash_field(&mut hasher, url);
+                artifacts::hash_field(&mut hasher, checksum_algorithm);
+                artifacts::hash_field(&mut hasher, checksum);
+                artifacts::hash_field(&mut hasher, sha256);
             }
-            Input::Decompiled { .. } => hash_field(&mut hasher, "decompiled"),
+            Input::Decompiled { .. } => artifacts::hash_field(&mut hasher, "decompiled"),
         }
     }
     format!("{:x}", hasher.finalize())
-}
-
-fn hash_field(hasher: &mut Sha256, value: &str) {
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(value.as_bytes());
 }
 
 #[derive(Clone)]
@@ -577,7 +573,7 @@ fn safe_path_from_slashes(text: &str, label: &str) -> Result<SafePath> {
     }
     let mut path = PathBuf::new();
     for component in text.split('/') {
-        validate_portable_component(component, label)?;
+        artifacts::validate_portable_component(component, label)?;
         path.push(component);
     }
     Ok(SafePath {
@@ -585,6 +581,18 @@ fn safe_path_from_slashes(text: &str, label: &str) -> Result<SafePath> {
         path,
         key: portable_key(text),
     })
+}
+
+fn safe_payload_path(text: &str, label: &str) -> Result<SafePath> {
+    let path = safe_path_from_slashes(text, label)?;
+    if !(path.text.starts_with("code/") || path.text.starts_with("artifacts/")) {
+        bail!("{label} is outside the source payload trees: {text:?}");
+    }
+    Ok(path)
+}
+
+pub(crate) fn payload_relative_path(text: &str, label: &str) -> Result<PathBuf> {
+    Ok(safe_payload_path(text, label)?.path)
 }
 
 fn safe_path_from_fs(path: &Path, label: &str) -> Result<SafePath> {
@@ -599,37 +607,14 @@ fn safe_path_from_fs(path: &Path, label: &str) -> Result<SafePath> {
         let component = component
             .to_str()
             .with_context(|| format!("{label} is not UTF-8: {}", path.display()))?;
-        validate_portable_component(component, label)?;
+        artifacts::validate_portable_component(component, label)?;
         components.push(component);
     }
     safe_path_from_slashes(&components.join("/"), label)
 }
 
-fn validate_portable_component(component: &str, label: &str) -> Result<()> {
-    if component.is_empty() || component == "." || component == ".." {
-        bail!("unsafe {label} component: {component:?}");
-    }
-    if component.ends_with('.') || component.ends_with(' ') {
-        bail!("Windows-unsafe {label} component: {component:?}");
-    }
-    if component.chars().any(|character| {
-        character <= '\u{1f}' || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
-    }) {
-        bail!("Windows-unsafe {label} component: {component:?}");
-    }
-    let base = component.split('.').next().unwrap_or(component);
-    let upper = base.to_ascii_uppercase();
-    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || upper.strip_prefix("COM").is_some_and(|suffix| {
-            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-        })
-        || upper.strip_prefix("LPT").is_some_and(|suffix| {
-            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-        })
-    {
-        bail!("Windows-reserved {label} component: {component:?}");
-    }
-    Ok(())
+pub(crate) fn portable_relative_path(path: &Path, label: &str) -> Result<String> {
+    Ok(safe_path_from_fs(path, label)?.text)
 }
 
 fn validate_single_component(label: &str, value: &str) -> Result<()> {
@@ -640,7 +625,7 @@ fn validate_single_component(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn portable_key(path: &str) -> String {
+pub(crate) fn portable_key(path: &str) -> String {
     path.chars().flat_map(char::to_lowercase).collect()
 }
 
@@ -912,9 +897,9 @@ fn output_path(artifact: &SafePath, relative: &SafePath, package_source: bool) -
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum FileKind {
+pub(crate) enum FileKind {
     Java,
     Kotlin,
     PackageInfo,
@@ -1121,7 +1106,7 @@ fn write_planned_file(input: &mut impl Read, planned: &PlannedFile, stage: &Path
         .create_new(true)
         .open(&destination)
         .with_context(|| format!("failed to create source file {}", destination.display()))?;
-    let (sha256, size) = copy_and_hash(input, &mut output, &destination)?;
+    let (sha256, size) = artifacts::copy_and_hash(input, &mut output, &destination, "source file")?;
     output
         .flush()
         .with_context(|| format!("failed to flush source file {}", destination.display()))?;
@@ -1190,35 +1175,9 @@ fn hash_reader(reader: &mut impl Read, label: &str) -> Result<(String, u64)> {
     Ok((format!("{:x}", hasher.finalize()), size))
 }
 
-fn copy_and_hash(
-    input: &mut impl Read,
-    output: &mut impl Write,
-    destination: &Path,
-) -> Result<(String, u64)> {
-    let mut hasher = Sha256::new();
-    let mut size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = input
-            .read(&mut buffer)
-            .with_context(|| format!("failed to read source for {}", destination.display()))?;
-        if read == 0 {
-            break;
-        }
-        output
-            .write_all(&buffer[..read])
-            .with_context(|| format!("failed to write {}", destination.display()))?;
-        hasher.update(&buffer[..read]);
-        size = size
-            .checked_add(read as u64)
-            .context("source file size overflow")?;
-    }
-    Ok((format!("{:x}", hasher.finalize()), size))
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Origins {
+pub(crate) struct Origins {
     schema_version: u32,
     minecraft_version: String,
     input_sha256: String,
@@ -1261,13 +1220,61 @@ enum OriginInput {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct OriginFile {
+pub(crate) struct OriginFile {
     path: String,
     artifact_id: String,
     archive_path: String,
     kind: FileKind,
     sha256: String,
     size: u64,
+}
+
+impl Origins {
+    pub(crate) fn minecraft_version(&self) -> &str {
+        &self.minecraft_version
+    }
+
+    pub(crate) fn input_sha256(&self) -> &str {
+        &self.input_sha256
+    }
+
+    pub(crate) fn vineflower_fingerprint(&self) -> &str {
+        &self.vineflower_fingerprint
+    }
+
+    pub(crate) fn files(&self) -> &[OriginFile] {
+        &self.files
+    }
+}
+
+impl OriginFile {
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn kind(&self) -> FileKind {
+        self.kind
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(path: &str, kind: FileKind, sha256: String, size: u64) -> Self {
+        Self {
+            path: path.to_owned(),
+            artifact_id: "artifact:1".to_owned(),
+            archive_path: path.strip_prefix("code/").unwrap_or(path).to_owned(),
+            kind,
+            sha256,
+            size,
+        }
+    }
 }
 
 fn build_inventory(
@@ -1322,25 +1329,65 @@ fn write_inventory(output: &Path, inventory: &Origins) -> Result<()> {
         .with_context(|| format!("failed to flush source inventory {}", path.display()))
 }
 
-fn write_completion(output: &Path, input_sha256: &str, tree_sha256: &str) -> Result<()> {
-    let path = output.join(COMPLETION_FILE);
-    let record = completion_record(input_sha256, tree_sha256);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| format!("failed to create completion record {}", path.display()))?;
-    file.write_all(record.as_bytes())
-        .with_context(|| format!("failed to write completion record {}", path.display()))?;
-    file.flush()
-        .with_context(|| format!("failed to flush completion record {}", path.display()))
+pub(crate) struct VerifiedSources {
+    path: PathBuf,
+    inventory: Origins,
+    tree_sha256: String,
 }
 
-fn completion_record(input_sha256: &str, tree_sha256: &str) -> String {
-    format!("input-sha256={input_sha256}\ntree-sha256={tree_sha256}\n")
+impl VerifiedSources {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn inventory(&self) -> &Origins {
+        &self.inventory
+    }
+
+    pub(crate) fn tree_sha256(&self) -> &str {
+        &self.tree_sha256
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        path: PathBuf,
+        minecraft_version: &str,
+        input_sha256: String,
+        tree_sha256: String,
+        vineflower_fingerprint: String,
+        files: Vec<OriginFile>,
+    ) -> Self {
+        Self {
+            path,
+            inventory: Origins {
+                schema_version: INVENTORY_SCHEMA_VERSION,
+                minecraft_version: minecraft_version.to_owned(),
+                input_sha256,
+                library_manifest_sha256: "0".repeat(64),
+                vineflower_fingerprint,
+                artifacts: vec![OriginArtifact {
+                    id: "artifact:1".to_owned(),
+                    artifact_path: "artifact".to_owned(),
+                    binaries: vec![OriginBinary {
+                        coordinate: "artifact:1".to_owned(),
+                        sha256: "0".repeat(64),
+                    }],
+                    input: OriginInput::Decompiled {
+                        sha256: "0".repeat(64),
+                    },
+                }],
+                files,
+            },
+            tree_sha256,
+        }
+    }
 }
 
-fn verify_output(output: &Path, minecraft_version: &str, input_sha256: &str) -> Result<()> {
+fn verify_output(
+    output: &Path,
+    minecraft_version: &str,
+    input_sha256: &str,
+) -> Result<VerifiedSources> {
     verify_output_shape(output)?;
     let inventory_path = output.join(INVENTORY_FILE);
     let inventory_file = File::open(&inventory_path).with_context(|| {
@@ -1368,21 +1415,25 @@ fn verify_output(output: &Path, minecraft_version: &str, input_sha256: &str) -> 
     }
 
     let tree_sha256 = payload_tree_sha256(output)?;
-    let completion_path = output.join(COMPLETION_FILE);
+    let completion_path = output.join(artifacts::COMPLETION_FILE);
     let actual_completion = fs::read_to_string(&completion_path).with_context(|| {
         format!(
             "failed to read completion record {}",
             completion_path.display()
         )
     })?;
-    let expected_completion = completion_record(input_sha256, &tree_sha256);
+    let expected_completion = artifacts::completion_record(input_sha256, &tree_sha256);
     if actual_completion != expected_completion {
         bail!(
             "source output does not match its completion record: {}; remove it before retrying",
             output.display()
         );
     }
-    Ok(())
+    Ok(VerifiedSources {
+        path: output.to_owned(),
+        inventory,
+        tree_sha256,
+    })
 }
 
 fn verify_output_shape(output: &Path) -> Result<()> {
@@ -1407,7 +1458,7 @@ fn verify_output_shape(output: &Path) -> Result<()> {
         names.insert(name);
     }
     let expected = [
-        COMPLETION_FILE.to_owned(),
+        artifacts::COMPLETION_FILE.to_owned(),
         INVENTORY_FILE.to_owned(),
         ARTIFACTS_DIRECTORY.to_owned(),
         CODE_DIRECTORY.to_owned(),
@@ -1420,10 +1471,10 @@ fn verify_output_shape(output: &Path) -> Result<()> {
             output.display()
         );
     }
-    require_directory(&output.join(CODE_DIRECTORY))?;
-    require_directory(&output.join(ARTIFACTS_DIRECTORY))?;
-    require_file(&output.join(INVENTORY_FILE))?;
-    require_file(&output.join(COMPLETION_FILE))
+    artifacts::require_directory(&output.join(CODE_DIRECTORY), "source directory")?;
+    artifacts::require_directory(&output.join(ARTIFACTS_DIRECTORY), "source directory")?;
+    artifacts::require_file(&output.join(INVENTORY_FILE), "source file")?;
+    artifacts::require_file(&output.join(artifacts::COMPLETION_FILE), "source file")
 }
 
 fn verify_inventory(
@@ -1504,13 +1555,7 @@ fn verify_inventory(
                 file.artifact_id
             );
         }
-        let path = safe_path_from_slashes(&file.path, "inventory output path")?;
-        if !(path.text.starts_with("code/") || path.text.starts_with("artifacts/")) {
-            bail!(
-                "source inventory contains path outside payload trees: {:?}",
-                file.path
-            );
-        }
+        let path = safe_payload_path(&file.path, "inventory output path")?;
         safe_path_from_slashes(&file.archive_path, "inventory archive path")?;
         validate_sha256(&format!("source file {}", file.path), &file.sha256)?;
         paths.insert(&path, &file.artifact_id)?;
@@ -1584,18 +1629,18 @@ fn payload_tree_sha256(output: &Path) -> Result<String> {
     collect_tree_entries(output, output, &mut entries)?;
     entries.sort_by(|left, right| tree_entry_path(left).cmp(tree_entry_path(right)));
     let mut hasher = Sha256::new();
-    hash_field(&mut hasher, TREE_FINGERPRINT_VERSION);
+    artifacts::hash_field(&mut hasher, TREE_FINGERPRINT_VERSION);
     for entry in entries {
         match entry {
             TreeEntry::Directory(path) => {
-                hash_field(&mut hasher, "directory");
-                hash_field(&mut hasher, &path.text);
+                artifacts::hash_field(&mut hasher, "directory");
+                artifacts::hash_field(&mut hasher, &path.text);
             }
             TreeEntry::File(path, sha256, size) => {
-                hash_field(&mut hasher, "file");
-                hash_field(&mut hasher, &path.text);
+                artifacts::hash_field(&mut hasher, "file");
+                artifacts::hash_field(&mut hasher, &path.text);
                 hasher.update(size.to_be_bytes());
-                hash_field(&mut hasher, &sha256);
+                artifacts::hash_field(&mut hasher, &sha256);
             }
         }
     }
@@ -1623,7 +1668,7 @@ fn collect_tree_entries(root: &Path, directory: &Path, entries: &mut Vec<TreeEnt
             )
         })?;
         let relative = safe_path_from_fs(relative, "source tree path")?;
-        if relative.text == COMPLETION_FILE {
+        if relative.text == artifacts::COMPLETION_FILE {
             continue;
         }
         let file_type = child
@@ -1648,37 +1693,6 @@ fn collect_tree_entries(root: &Path, directory: &Path, entries: &mut Vec<TreeEnt
         }
     }
     Ok(())
-}
-
-fn require_directory(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("required source directory is missing: {}", path.display()))?;
-    if !metadata.file_type().is_dir() {
-        bail!("source path is not a regular directory: {}", path.display());
-    }
-    Ok(())
-}
-
-fn require_file(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("required source file is missing: {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!("source path is not a regular file: {}", path.display());
-    }
-    Ok(())
-}
-
-fn ensure_absent(path: &Path, label: &str) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => bail!(
-            "{label} already exists: {}; remove it after confirming no other worldless-dev process is running",
-            path.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to inspect {label} {}", path.display()))
-        }
-    }
 }
 
 fn remove_owned_directory(parent: &Path, directory: &Path) -> Result<()> {
@@ -1784,15 +1798,5 @@ mod tests {
         prefix_paths.insert(&child, "child").unwrap();
         let parent_file = safe_path_from_slashes("artifacts/a/b", "test").unwrap();
         assert!(prefix_paths.insert(&parent_file, "parent").is_err());
-    }
-
-    #[test]
-    fn completion_record_is_exact_and_deterministic() {
-        let input = "1".repeat(64);
-        let tree = "2".repeat(64);
-        assert_eq!(
-            completion_record(&input, &tree),
-            format!("input-sha256={input}\ntree-sha256={tree}\n")
-        );
     }
 }
