@@ -66,6 +66,12 @@ non-obvious reason, or remove search terms needed to find the owning code?
   concealment instead of adding another layer around it; do not expand into
   unrelated cleanup.
 
+## Apply the supported-scope contract
+
+- Before implementing, reviewing, or testing Minecraft data-pack runtime
+  behavior, read and apply `SUPPORTED_SCOPE.md`; classify the concrete behavior
+  there before deciding its implementation or test contract.
+
 ## Apply the Java compatibility contract
 
 - Before implementing, reviewing, or testing Java-derived behavior, read and

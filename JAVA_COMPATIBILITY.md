@@ -4,6 +4,10 @@ This document is the sole project-wide authority for deciding whether behavior
 derived from Java is compatible. Implementation code remains the owner of each
 concrete behavior choice.
 
+For Minecraft data-pack runtime behavior, first determine whether the behavior
+is in scope under [`SUPPORTED_SCOPE.md`](SUPPORTED_SCOPE.md). This contract also
+applies independently to public Java-compatible component crates.
+
 ## Target and normative sources
 
 Worldless targets Java SE 25, not a particular JDK vendor, distribution, build,
