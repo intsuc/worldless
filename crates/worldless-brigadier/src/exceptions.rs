@@ -1260,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn java_25_float_rendering() {
+    fn java_se_25_float_rendering() {
         assert_eq!(java_f32(i32::MIN as f32), "-2.1474836E9");
         assert_eq!(java_f32(f32::from_bits(0x49ee_577a)), "1952495.2");
         assert_eq!(java_f64(i32::MIN as f64), "-2.147483648E9");

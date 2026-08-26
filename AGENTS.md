@@ -66,6 +66,12 @@ non-obvious reason, or remove search terms needed to find the owning code?
   concealment instead of adding another layer around it; do not expand into
   unrelated cleanup.
 
+## Apply the Java compatibility contract
+
+- Before implementing, reviewing, or testing Java-derived behavior, read and
+  apply `JAVA_COMPATIBILITY.md`; classify compatibility requirements there
+  instead of inferring them from a reference JDK.
+
 ## Verify behavior, not merely tests
 
 1. Derive successful, boundary, and invalid cases from the current contract.

@@ -8,15 +8,10 @@ pub trait Message: Any + fmt::Debug + fmt::Display {
 
     fn equals(&self, other: &dyn Message) -> bool;
 
-    /// Java-compatible `hashCode`; override this whenever [`Self::equals`] is structural.
+    /// Deterministic default permitted by `Object.hashCode`; override it when a
+    /// message type specifies a concrete hash function.
     fn hash_code(&self) -> i32 {
-        let address = self as *const Self as *const () as usize;
-        let folded = if usize::BITS > 32 {
-            address ^ (address >> 32)
-        } else {
-            address
-        };
-        (folded as i32) & i32::MAX
+        0
     }
 
     fn as_any(&self) -> &dyn Any;
@@ -54,5 +49,16 @@ impl Message for LiteralMessage {
 impl fmt::Display for LiteralMessage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_hash_code_is_deterministic() {
+        assert_eq!(LiteralMessage::new("first").hash_code(), 0);
+        assert_eq!(LiteralMessage::new("second").hash_code(), 0);
     }
 }

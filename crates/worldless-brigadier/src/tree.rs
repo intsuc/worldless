@@ -6,7 +6,6 @@ use crate::{
     context::{CommandContext, CommandContextBuilder, ParsedArgument, StringRange},
     exceptions::{BUILT_IN_EXCEPTIONS, BuiltInExceptionProvider, CommandSyntaxException},
     java_case::java_root_lowercase,
-    java_hash_set::{java_hash_set_order, java_utf16_hash_code},
     reader::StringReader,
     suggestion::{SuggestionProvider, Suggestions, SuggestionsBuilder, SuggestionsFuture},
 };
@@ -374,16 +373,16 @@ impl<S: 'static> Node<S> {
                 if child.ptr_eq(sibling) {
                     continue;
                 }
-                let matches = java_hash_set_order(
-                    child
-                        .examples()
-                        .into_iter()
-                        .filter(|example| sibling.is_valid_input(example)),
-                    |example| java_utf16_hash_code(example.encode_utf16()),
-                    |left, right| left == right,
-                    |left, right| Some(left.encode_utf16().cmp(right.encode_utf16())),
-                    |left, right| left.encode_utf16().cmp(right.encode_utf16()),
-                );
+                let mut matches = Vec::new();
+                for example in child
+                    .examples()
+                    .into_iter()
+                    .filter(|example| sibling.is_valid_input(example))
+                {
+                    if !matches.contains(&example) {
+                        matches.push(example);
+                    }
+                }
                 if !matches.is_empty() {
                     consumer(self, child, sibling, &matches);
                 }
@@ -805,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguity_examples_follow_java_hash_set_iteration_order() {
+    fn ambiguity_examples_preserve_first_occurrence_order() {
         let parent = Node::root();
         parent
             .add_child(
@@ -835,12 +834,12 @@ mod tests {
                 (
                     "first".to_owned(),
                     "second".to_owned(),
-                    vec!["0".to_owned(), "-123".to_owned(), "123".to_owned()],
+                    vec!["0".to_owned(), "123".to_owned(), "-123".to_owned()],
                 ),
                 (
                     "second".to_owned(),
                     "first".to_owned(),
-                    vec!["0".to_owned(), "-123".to_owned(), "123".to_owned()],
+                    vec!["0".to_owned(), "123".to_owned(), "-123".to_owned()],
                 ),
             ]
         );

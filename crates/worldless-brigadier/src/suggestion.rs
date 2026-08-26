@@ -1,16 +1,12 @@
 use crate::MessageRef;
 use crate::context::{CommandContext, StringRange};
 use crate::exceptions::CommandSyntaxException;
-use crate::java_case::{java_root_lowercase, java25_preserves_case};
-use crate::java_hash_set::{java_hash_set_order, java_utf16_hash_code};
+use crate::java_case::{java_root_lowercase, java_se_25_preserves_case};
 use std::cmp::Ordering;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
-
-static NEXT_SUGGESTION_IDENTITY_HASH: AtomicI32 = AtomicI32::new(1);
 
 pub type SuggestionsFuture =
     Pin<Box<dyn Future<Output = Result<Suggestions, CommandSyntaxException>>>>;
@@ -34,7 +30,6 @@ pub struct Suggestion {
     text: Vec<u16>,
     tooltip: Option<MessageRef>,
     kind: SuggestionKind,
-    identity_hash: i32,
 }
 
 impl Suggestion {
@@ -60,7 +55,6 @@ impl Suggestion {
             text,
             tooltip,
             kind: SuggestionKind::Text,
-            identity_hash: next_suggestion_identity_hash(),
         }
     }
 
@@ -70,7 +64,6 @@ impl Suggestion {
             text: value.to_string().encode_utf16().collect(),
             tooltip,
             kind: SuggestionKind::Integer(value),
-            identity_hash: next_suggestion_identity_hash(),
         }
     }
 
@@ -158,7 +151,6 @@ impl Suggestion {
             text,
             tooltip: self.tooltip.clone(),
             kind: SuggestionKind::Text,
-            identity_hash: next_suggestion_identity_hash(),
         }
     }
 
@@ -198,22 +190,6 @@ impl Suggestion {
         match self.kind {
             SuggestionKind::Text => base_hash,
             SuggestionKind::Integer(value) => java_objects_hash(&[base_hash, value]),
-        }
-    }
-
-    fn java_hash_map_comparable_order(&self, other: &Self) -> Option<Ordering> {
-        match (self.kind, other.kind) {
-            (SuggestionKind::Text, SuggestionKind::Text) => Some(self.compare_to(other)),
-            _ => None,
-        }
-    }
-
-    fn java_hash_map_tie_break_order(&self, other: &Self) -> Ordering {
-        match (self.kind, other.kind) {
-            (SuggestionKind::Text, SuggestionKind::Integer(_)) => Ordering::Greater,
-            (SuggestionKind::Integer(_), SuggestionKind::Text) => Ordering::Less,
-            _ if self.identity_hash <= other.identity_hash => Ordering::Less,
-            _ => Ordering::Greater,
         }
     }
 }
@@ -358,7 +334,7 @@ impl Suggestions {
             [] => Self::empty(),
             [only] => only.clone(),
             _ => {
-                let texts = collect_java_hash_set(
+                let texts = collect_unique_suggestions(
                     input
                         .iter()
                         .flat_map(|suggestions| suggestions.suggestions.iter().cloned()),
@@ -393,12 +369,12 @@ impl Suggestions {
             .expect("non-empty suggestion collection has an end");
         let range = StringRange::between(start, end);
 
-        let mut expanded = collect_java_hash_set(
+        let mut expanded = collect_unique_suggestions(
             suggestions
                 .into_iter()
                 .map(|suggestion| suggestion.expand_utf16(command, range)),
         );
-        java_stable_sort(&mut expanded);
+        stable_sort(&mut expanded);
 
         Self::new(range, expanded)
     }
@@ -578,14 +554,17 @@ impl SuggestionsBuilder {
     }
 }
 
-fn collect_java_hash_set(input: impl IntoIterator<Item = Suggestion>) -> Vec<Suggestion> {
-    java_hash_set_order(
-        input,
-        Suggestion::java_hash_code,
-        Suggestion::java_equals,
-        Suggestion::java_hash_map_comparable_order,
-        Suggestion::java_hash_map_tie_break_order,
-    )
+fn collect_unique_suggestions(input: impl IntoIterator<Item = Suggestion>) -> Vec<Suggestion> {
+    let mut result = Vec::new();
+    for suggestion in input {
+        if !result
+            .iter()
+            .any(|existing| suggestion.java_equals(existing))
+        {
+            result.push(suggestion);
+        }
+    }
+    result
 }
 
 fn java_objects_hash(values: &[i32]) -> i32 {
@@ -594,8 +573,10 @@ fn java_objects_hash(values: &[i32]) -> i32 {
     })
 }
 
-fn next_suggestion_identity_hash() -> i32 {
-    NEXT_SUGGESTION_IDENTITY_HASH.fetch_add(1, AtomicOrdering::Relaxed)
+fn java_utf16_hash_code(input: impl IntoIterator<Item = u16>) -> i32 {
+    input.into_iter().fold(0_i32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+    })
 }
 
 fn tooltip_equals(left: Option<&MessageRef>, right: Option<&MessageRef>) -> bool {
@@ -606,602 +587,53 @@ fn tooltip_equals(left: Option<&MessageRef>, right: Option<&MessageRef>) -> bool
     }
 }
 
-const JAVA_TIMSORT_MIN_MERGE: usize = 32;
+fn stable_sort(suggestions: &mut [Suggestion]) {
+    let mut order: Vec<_> = (0..suggestions.len()).collect();
+    let mut buffer = order.clone();
+    stable_sort_indices(&mut order, &mut buffer, suggestions);
 
-fn java_stable_sort(suggestions: &mut [Suggestion]) {
-    let mut remaining = suggestions.len();
-    if remaining < 2 {
+    let mut destination = vec![0; order.len()];
+    for (new_index, old_index) in order.into_iter().enumerate() {
+        destination[old_index] = new_index;
+    }
+    for index in 0..destination.len() {
+        while destination[index] != index {
+            let target = destination[index];
+            suggestions.swap(index, target);
+            destination.swap(index, target);
+        }
+    }
+}
+
+fn stable_sort_indices(order: &mut [usize], buffer: &mut [usize], suggestions: &[Suggestion]) {
+    if order.len() < 2 {
         return;
     }
 
-    if remaining < JAVA_TIMSORT_MIN_MERGE {
-        let initial_run = count_run_and_make_ascending(suggestions, 0, remaining);
-        binary_sort(suggestions, 0, remaining, initial_run);
-        return;
-    }
+    let middle = order.len() / 2;
+    let (left_order, right_order) = order.split_at_mut(middle);
+    let (left_buffer, right_buffer) = buffer.split_at_mut(middle);
+    stable_sort_indices(left_order, left_buffer, suggestions);
+    stable_sort_indices(right_order, right_buffer, suggestions);
 
-    let min_run = min_run_length(remaining);
-    let mut lo = 0;
-    let mut sorter = JavaTimSort::new(suggestions);
-    loop {
-        let mut run_len = count_run_and_make_ascending(sorter.values, lo, lo + remaining);
-        if run_len < min_run {
-            let forced = remaining.min(min_run);
-            binary_sort(sorter.values, lo, lo + forced, lo + run_len);
-            run_len = forced;
-        }
-
-        sorter.push_run(lo, run_len);
-        sorter.merge_collapse();
-        lo += run_len;
-        remaining -= run_len;
-        if remaining == 0 {
-            break;
-        }
-    }
-    sorter.merge_force_collapse();
-}
-
-fn binary_sort(values: &mut [Suggestion], lo: usize, hi: usize, mut start: usize) {
-    if start == lo {
-        start += 1;
-    }
-    while start < hi {
-        let pivot = values[start].clone();
-        let mut left = lo;
-        let mut right = start;
-        while left < right {
-            let middle = (left + right) >> 1;
-            if pivot.compare_to_ignore_case(&values[middle]) == Ordering::Less {
-                right = middle;
-            } else {
-                left = middle + 1;
-            }
-        }
-        values[left..=start].rotate_right(1);
-        values[left] = pivot;
-        start += 1;
-    }
-}
-
-fn count_run_and_make_ascending(values: &mut [Suggestion], lo: usize, hi: usize) -> usize {
-    let mut run_hi = lo + 1;
-    if run_hi == hi {
-        return 1;
-    }
-
-    if values[run_hi].compare_to_ignore_case(&values[lo]) == Ordering::Less {
-        run_hi += 1;
-        while run_hi < hi
-            && values[run_hi].compare_to_ignore_case(&values[run_hi - 1]) == Ordering::Less
+    buffer.copy_from_slice(order);
+    let (left, right) = buffer.split_at(middle);
+    let mut left_index = 0;
+    let mut right_index = 0;
+    for output in order {
+        if right_index == right.len()
+            || (left_index < left.len()
+                && suggestions[left[left_index]]
+                    .compare_to_ignore_case(&suggestions[right[right_index]])
+                    != Ordering::Greater)
         {
-            run_hi += 1;
-        }
-        values[lo..run_hi].reverse();
-    } else {
-        run_hi += 1;
-        while run_hi < hi
-            && values[run_hi].compare_to_ignore_case(&values[run_hi - 1]) != Ordering::Less
-        {
-            run_hi += 1;
-        }
-    }
-    run_hi - lo
-}
-
-fn min_run_length(mut length: usize) -> usize {
-    let mut shifted_off = 0;
-    while length >= JAVA_TIMSORT_MIN_MERGE {
-        shifted_off |= length & 1;
-        length >>= 1;
-    }
-    length + shifted_off
-}
-
-struct JavaTimSort<'a> {
-    values: &'a mut [Suggestion],
-    min_gallop: i32,
-    temporary: Vec<Suggestion>,
-    run_base: Vec<usize>,
-    run_len: Vec<usize>,
-}
-
-impl<'a> JavaTimSort<'a> {
-    const MIN_GALLOP: usize = 7;
-    const INITIAL_TEMPORARY_LENGTH: usize = 256;
-
-    fn new(values: &'a mut [Suggestion]) -> Self {
-        let temporary_length = if values.len() < 2 * Self::INITIAL_TEMPORARY_LENGTH {
-            values.len() >> 1
+            *output = left[left_index];
+            left_index += 1;
         } else {
-            Self::INITIAL_TEMPORARY_LENGTH
-        };
-        let stack_length = if values.len() < 120 {
-            5
-        } else if values.len() < 1_542 {
-            10
-        } else if values.len() < 119_151 {
-            24
-        } else {
-            49
-        };
-        Self {
-            values,
-            min_gallop: Self::MIN_GALLOP as i32,
-            temporary: Vec::with_capacity(temporary_length),
-            run_base: Vec::with_capacity(stack_length),
-            run_len: Vec::with_capacity(stack_length),
+            *output = right[right_index];
+            right_index += 1;
         }
     }
-
-    fn push_run(&mut self, base: usize, length: usize) {
-        self.run_base.push(base);
-        self.run_len.push(length);
-    }
-
-    fn merge_collapse(&mut self) {
-        while self.run_len.len() > 1 {
-            let mut index = self.run_len.len() - 2;
-            if (index > 0
-                && self.run_len[index - 1] <= self.run_len[index] + self.run_len[index + 1])
-                || (index > 1
-                    && self.run_len[index - 2] <= self.run_len[index] + self.run_len[index - 1])
-            {
-                if self.run_len[index - 1] < self.run_len[index + 1] {
-                    index -= 1;
-                }
-            } else if self.run_len[index] > self.run_len[index + 1] {
-                break;
-            }
-            self.merge_at(index);
-        }
-    }
-
-    fn merge_force_collapse(&mut self) {
-        while self.run_len.len() > 1 {
-            let mut index = self.run_len.len() - 2;
-            if index > 0 && self.run_len[index - 1] < self.run_len[index + 1] {
-                index -= 1;
-            }
-            self.merge_at(index);
-        }
-    }
-
-    fn merge_at(&mut self, index: usize) {
-        let mut base1 = self.run_base[index];
-        let mut len1 = self.run_len[index];
-        let base2 = self.run_base[index + 1];
-        let mut len2 = self.run_len[index + 1];
-
-        self.run_len[index] = len1 + len2;
-        if self.run_len.len() >= 3 && index == self.run_len.len() - 3 {
-            self.run_base[index + 1] = self.run_base[index + 2];
-            self.run_len[index + 1] = self.run_len[index + 2];
-        }
-        self.run_base.pop();
-        self.run_len.pop();
-
-        let first_of_second = self.values[base2].clone();
-        let skipped = gallop_right(&first_of_second, self.values, base1, len1, 0);
-        base1 += skipped;
-        len1 -= skipped;
-        if len1 == 0 {
-            return;
-        }
-
-        let last_of_first = self.values[base1 + len1 - 1].clone();
-        len2 = gallop_left(&last_of_first, self.values, base2, len2, len2 - 1);
-        if len2 == 0 {
-            return;
-        }
-
-        if len1 <= len2 {
-            self.merge_lo(base1, len1, base2, len2);
-        } else {
-            self.merge_hi(base1, len1, base2, len2);
-        }
-    }
-
-    fn prepare_temporary(&mut self, base: usize, length: usize) {
-        self.ensure_capacity(length);
-        self.temporary.clear();
-        self.temporary
-            .extend(self.values[base..base + length].iter().cloned());
-    }
-
-    fn ensure_capacity(&mut self, minimum: usize) {
-        if self.temporary.capacity() >= minimum {
-            return;
-        }
-
-        let next_power = minimum
-            .checked_add(1)
-            .and_then(usize::checked_next_power_of_two)
-            .unwrap_or(minimum);
-        let new_capacity = next_power.min(self.values.len() >> 1).max(minimum);
-        self.temporary
-            .reserve_exact(new_capacity - self.temporary.capacity());
-    }
-
-    fn merge_lo(&mut self, base1: usize, mut len1: usize, base2: usize, mut len2: usize) {
-        self.prepare_temporary(base1, len1);
-        let mut cursor1 = 0;
-        let mut cursor2 = base2;
-        let mut destination = base1;
-
-        self.values[destination] = self.values[cursor2].clone();
-        destination += 1;
-        cursor2 += 1;
-        len2 -= 1;
-        if len2 == 0 {
-            copy_from_temporary(&self.temporary, cursor1, self.values, destination, len1);
-            return;
-        }
-        if len1 == 1 {
-            array_copy(self.values, cursor2, destination, len2);
-            self.values[destination + len2] = self.temporary[cursor1].clone();
-            return;
-        }
-
-        let mut min_gallop = self.min_gallop;
-        'outer: loop {
-            let mut count1 = 0;
-            let mut count2 = 0;
-
-            loop {
-                if self.values[cursor2].compare_to_ignore_case(&self.temporary[cursor1])
-                    == Ordering::Less
-                {
-                    self.values[destination] = self.values[cursor2].clone();
-                    destination += 1;
-                    cursor2 += 1;
-                    count2 += 1;
-                    count1 = 0;
-                    len2 -= 1;
-                    if len2 == 0 {
-                        break 'outer;
-                    }
-                } else {
-                    self.values[destination] = self.temporary[cursor1].clone();
-                    destination += 1;
-                    cursor1 += 1;
-                    count1 += 1;
-                    count2 = 0;
-                    len1 -= 1;
-                    if len1 == 1 {
-                        break 'outer;
-                    }
-                }
-                if (count1 | count2) >= min_gallop {
-                    break;
-                }
-            }
-
-            loop {
-                let key = self.values[cursor2].clone();
-                count1 = gallop_right(&key, &self.temporary, cursor1, len1, 0) as i32;
-                if count1 != 0 {
-                    let count = count1 as usize;
-                    copy_from_temporary(&self.temporary, cursor1, self.values, destination, count);
-                    destination += count;
-                    cursor1 += count;
-                    len1 -= count;
-                    if len1 <= 1 {
-                        break 'outer;
-                    }
-                }
-                self.values[destination] = self.values[cursor2].clone();
-                destination += 1;
-                cursor2 += 1;
-                len2 -= 1;
-                if len2 == 0 {
-                    break 'outer;
-                }
-
-                let key = self.temporary[cursor1].clone();
-                count2 = gallop_left(&key, self.values, cursor2, len2, 0) as i32;
-                if count2 != 0 {
-                    let count = count2 as usize;
-                    array_copy(self.values, cursor2, destination, count);
-                    destination += count;
-                    cursor2 += count;
-                    len2 -= count;
-                    if len2 == 0 {
-                        break 'outer;
-                    }
-                }
-                self.values[destination] = self.temporary[cursor1].clone();
-                destination += 1;
-                cursor1 += 1;
-                len1 -= 1;
-                if len1 == 1 {
-                    break 'outer;
-                }
-                min_gallop -= 1;
-                if count1 < Self::MIN_GALLOP as i32 && count2 < Self::MIN_GALLOP as i32 {
-                    break;
-                }
-            }
-            min_gallop = min_gallop.max(0) + 2;
-        }
-        self.min_gallop = min_gallop.max(1);
-
-        if len1 == 1 {
-            array_copy(self.values, cursor2, destination, len2);
-            self.values[destination + len2] = self.temporary[cursor1].clone();
-        } else if len1 == 0 {
-            panic!("Comparison method violates its general contract!");
-        } else {
-            copy_from_temporary(&self.temporary, cursor1, self.values, destination, len1);
-        }
-    }
-
-    fn merge_hi(&mut self, base1: usize, mut len1: usize, base2: usize, mut len2: usize) {
-        self.prepare_temporary(base2, len2);
-        let mut cursor1 = (base1 + len1 - 1) as isize;
-        let mut cursor2 = (len2 - 1) as isize;
-        let mut destination = (base2 + len2 - 1) as isize;
-
-        self.values[destination as usize] = self.values[cursor1 as usize].clone();
-        destination -= 1;
-        cursor1 -= 1;
-        len1 -= 1;
-        if len1 == 0 {
-            copy_from_temporary(
-                &self.temporary,
-                0,
-                self.values,
-                (destination - (len2 - 1) as isize) as usize,
-                len2,
-            );
-            return;
-        }
-        if len2 == 1 {
-            destination -= len1 as isize;
-            cursor1 -= len1 as isize;
-            array_copy(
-                self.values,
-                (cursor1 + 1) as usize,
-                (destination + 1) as usize,
-                len1,
-            );
-            self.values[destination as usize] = self.temporary[cursor2 as usize].clone();
-            return;
-        }
-
-        let mut min_gallop = self.min_gallop;
-        'outer: loop {
-            let mut count1 = 0;
-            let mut count2 = 0;
-
-            loop {
-                if self.temporary[cursor2 as usize]
-                    .compare_to_ignore_case(&self.values[cursor1 as usize])
-                    == Ordering::Less
-                {
-                    self.values[destination as usize] = self.values[cursor1 as usize].clone();
-                    destination -= 1;
-                    cursor1 -= 1;
-                    count1 += 1;
-                    count2 = 0;
-                    len1 -= 1;
-                    if len1 == 0 {
-                        break 'outer;
-                    }
-                } else {
-                    self.values[destination as usize] = self.temporary[cursor2 as usize].clone();
-                    destination -= 1;
-                    cursor2 -= 1;
-                    count2 += 1;
-                    count1 = 0;
-                    len2 -= 1;
-                    if len2 == 1 {
-                        break 'outer;
-                    }
-                }
-                if (count1 | count2) >= min_gallop {
-                    break;
-                }
-            }
-
-            loop {
-                let key = self.temporary[cursor2 as usize].clone();
-                count1 = (len1 - gallop_right(&key, self.values, base1, len1, len1 - 1)) as i32;
-                if count1 != 0 {
-                    let count = count1 as usize;
-                    destination -= count as isize;
-                    cursor1 -= count as isize;
-                    len1 -= count;
-                    array_copy(
-                        self.values,
-                        (cursor1 + 1) as usize,
-                        (destination + 1) as usize,
-                        count,
-                    );
-                    if len1 == 0 {
-                        break 'outer;
-                    }
-                }
-                self.values[destination as usize] = self.temporary[cursor2 as usize].clone();
-                destination -= 1;
-                cursor2 -= 1;
-                len2 -= 1;
-                if len2 == 1 {
-                    break 'outer;
-                }
-
-                let key = self.values[cursor1 as usize].clone();
-                count2 = (len2 - gallop_left(&key, &self.temporary, 0, len2, len2 - 1)) as i32;
-                if count2 != 0 {
-                    let count = count2 as usize;
-                    destination -= count as isize;
-                    cursor2 -= count as isize;
-                    len2 -= count;
-                    copy_from_temporary(
-                        &self.temporary,
-                        (cursor2 + 1) as usize,
-                        self.values,
-                        (destination + 1) as usize,
-                        count,
-                    );
-                    if len2 <= 1 {
-                        break 'outer;
-                    }
-                }
-                self.values[destination as usize] = self.values[cursor1 as usize].clone();
-                destination -= 1;
-                cursor1 -= 1;
-                len1 -= 1;
-                if len1 == 0 {
-                    break 'outer;
-                }
-                min_gallop -= 1;
-                if count1 < Self::MIN_GALLOP as i32 && count2 < Self::MIN_GALLOP as i32 {
-                    break;
-                }
-            }
-            min_gallop = min_gallop.max(0) + 2;
-        }
-        self.min_gallop = min_gallop.max(1);
-
-        if len2 == 1 {
-            destination -= len1 as isize;
-            cursor1 -= len1 as isize;
-            array_copy(
-                self.values,
-                (cursor1 + 1) as usize,
-                (destination + 1) as usize,
-                len1,
-            );
-            self.values[destination as usize] = self.temporary[cursor2 as usize].clone();
-        } else if len2 == 0 {
-            panic!("Comparison method violates its general contract!");
-        } else {
-            copy_from_temporary(
-                &self.temporary,
-                0,
-                self.values,
-                (destination - (len2 - 1) as isize) as usize,
-                len2,
-            );
-        }
-    }
-}
-
-fn gallop_left(
-    key: &Suggestion,
-    values: &[Suggestion],
-    base: usize,
-    length: usize,
-    hint: usize,
-) -> usize {
-    let mut last_offset = 0_isize;
-    let mut offset = 1_isize;
-    if key.compare_to_ignore_case(&values[base + hint]) == Ordering::Greater {
-        let maximum = (length - hint) as isize;
-        while offset < maximum
-            && key.compare_to_ignore_case(&values[base + hint + offset as usize])
-                == Ordering::Greater
-        {
-            last_offset = offset;
-            offset = offset.saturating_mul(2).saturating_add(1);
-        }
-        offset = offset.min(maximum);
-        last_offset += hint as isize;
-        offset += hint as isize;
-    } else {
-        let maximum = (hint + 1) as isize;
-        while offset < maximum
-            && key.compare_to_ignore_case(&values[base + hint - offset as usize])
-                != Ordering::Greater
-        {
-            last_offset = offset;
-            offset = offset.saturating_mul(2).saturating_add(1);
-        }
-        offset = offset.min(maximum);
-        let previous_last = last_offset;
-        last_offset = hint as isize - offset;
-        offset = hint as isize - previous_last;
-    }
-
-    last_offset += 1;
-    while last_offset < offset {
-        let middle = last_offset + ((offset - last_offset) >> 1);
-        if key.compare_to_ignore_case(&values[base + middle as usize]) == Ordering::Greater {
-            last_offset = middle + 1;
-        } else {
-            offset = middle;
-        }
-    }
-    offset as usize
-}
-
-fn gallop_right(
-    key: &Suggestion,
-    values: &[Suggestion],
-    base: usize,
-    length: usize,
-    hint: usize,
-) -> usize {
-    let mut offset = 1_isize;
-    let mut last_offset = 0_isize;
-    if key.compare_to_ignore_case(&values[base + hint]) == Ordering::Less {
-        let maximum = (hint + 1) as isize;
-        while offset < maximum
-            && key.compare_to_ignore_case(&values[base + hint - offset as usize]) == Ordering::Less
-        {
-            last_offset = offset;
-            offset = offset.saturating_mul(2).saturating_add(1);
-        }
-        offset = offset.min(maximum);
-        let previous_last = last_offset;
-        last_offset = hint as isize - offset;
-        offset = hint as isize - previous_last;
-    } else {
-        let maximum = (length - hint) as isize;
-        while offset < maximum
-            && key.compare_to_ignore_case(&values[base + hint + offset as usize]) != Ordering::Less
-        {
-            last_offset = offset;
-            offset = offset.saturating_mul(2).saturating_add(1);
-        }
-        offset = offset.min(maximum);
-        last_offset += hint as isize;
-        offset += hint as isize;
-    }
-
-    last_offset += 1;
-    while last_offset < offset {
-        let middle = last_offset + ((offset - last_offset) >> 1);
-        if key.compare_to_ignore_case(&values[base + middle as usize]) == Ordering::Less {
-            offset = middle;
-        } else {
-            last_offset = middle + 1;
-        }
-    }
-    offset as usize
-}
-
-fn array_copy(values: &mut [Suggestion], source: usize, destination: usize, length: usize) {
-    if destination > source && destination < source + length {
-        for offset in (0..length).rev() {
-            values[destination + offset] = values[source + offset].clone();
-        }
-    } else {
-        for offset in 0..length {
-            values[destination + offset] = values[source + offset].clone();
-        }
-    }
-}
-
-fn copy_from_temporary(
-    temporary: &[Suggestion],
-    source: usize,
-    values: &mut [Suggestion],
-    destination: usize,
-    length: usize,
-) {
-    values[destination..destination + length].clone_from_slice(&temporary[source..source + length]);
 }
 
 fn utf16_to_string(units: &[u16], operation: &str) -> String {
@@ -1277,13 +709,13 @@ fn java_compare_code_point_ignore_case(left: u32, right: u32) -> Ordering {
 }
 
 fn java_simple_uppercase(unit: u16) -> u16 {
-    // Mojang Java 25's Character(char) tables differ from Rust's scalar mappings here.
+    // Java SE 25 uses Unicode 16.0, while Rust may use a newer Unicode release.
     match unit {
         0x1f80..=0x1f87 | 0x1f90..=0x1f97 | 0x1fa0..=0x1fa7 => return unit + 8,
         0x1fb3 => return 0x1fbc,
         0x1fc3 => return 0x1fcc,
         0x1ff3 => return 0x1ffc,
-        _ if java25_preserves_case(u32::from(unit)) => return unit,
+        _ if java_se_25_preserves_case(u32::from(unit)) => return unit,
         _ => {}
     }
     let Some(character) = char::from_u32(unit.into()) else {
@@ -1304,7 +736,7 @@ fn java_simple_uppercase_code_point(code_point: u32) -> u32 {
     if let Ok(unit) = u16::try_from(code_point) {
         return u32::from(java_simple_uppercase(unit));
     }
-    if java25_preserves_case(code_point) {
+    if java_se_25_preserves_case(code_point) {
         return code_point;
     }
     let Some(character) = char::from_u32(code_point) else {
@@ -1322,8 +754,8 @@ fn java_simple_uppercase_code_point(code_point: u32) -> u32 {
 }
 
 fn java_simple_lowercase(unit: u16) -> u16 {
-    // These mappings were added after the Unicode table used by Mojang Java 25.
-    if java25_preserves_case(u32::from(unit)) {
+    // These mappings were added after Unicode 16.0.
+    if java_se_25_preserves_case(u32::from(unit)) {
         return unit;
     }
     let Some(character) = char::from_u32(unit.into()) else {
@@ -1347,7 +779,7 @@ fn java_simple_lowercase_code_point(code_point: u32) -> u32 {
     if let Ok(unit) = u16::try_from(code_point) {
         return u32::from(java_simple_lowercase(unit));
     }
-    if java25_preserves_case(code_point) {
+    if java_se_25_preserves_case(code_point) {
         return code_point;
     }
     let Some(character) = char::from_u32(code_point) else {
@@ -1383,14 +815,6 @@ mod tests {
 
     fn texts(suggestions: &Suggestions) -> Vec<String> {
         suggestions.list().iter().map(Suggestion::text).collect()
-    }
-
-    fn timsort_item(id: usize, specification: &str) -> Suggestion {
-        let range = at(id);
-        match specification.strip_prefix('i') {
-            Some(value) => IntegerSuggestion::new(range, value.parse().unwrap()).into_suggestion(),
-            None => suggestion(range, specification),
-        }
     }
 
     #[test]
@@ -1624,18 +1048,33 @@ mod tests {
             .suggest("3a")
             .suggest("a3")
             .build();
-        assert_eq!(
-            texts(&result),
-            [
-                "11", "2", "22", "33", "3a", "4", "6", "8", "30", "32", "a", "a3", "b", "c"
-            ]
+        assert!(
+            result
+                .list()
+                .windows(2)
+                .all(|pair| { pair[0].compare_to_ignore_case(&pair[1]) != Ordering::Greater })
         );
+
+        let mut actual = texts(&result);
+        actual.sort();
+        let mut expected = vec![
+            "11", "22", "33", "a", "b", "c", "2", "4", "6", "8", "30", "32", "3a", "a3",
+        ];
+        expected.sort();
+        assert_eq!(actual, expected);
+
+        let integers: Vec<_> = result
+            .list()
+            .iter()
+            .filter_map(Suggestion::integer_value)
+            .collect();
+        assert_eq!(integers, [2, 4, 6, 8, 30, 32]);
     }
 
     #[test]
-    fn create_uses_java_hash_set_iteration_before_sorting() {
+    fn create_uses_deterministic_encounter_order_for_unconstrained_ties() {
         let case_tie = Suggestions::create("", [suggestion(at(0), "ab"), suggestion(at(0), "AB")]);
-        assert_eq!(texts(&case_tie), ["AB", "ab"]);
+        assert_eq!(texts(&case_tie), ["ab", "AB"]);
 
         let mixed = Suggestions::create(
             "",
@@ -1645,7 +1084,29 @@ mod tests {
                 suggestion(at(0), "3a"),
             ],
         );
-        assert_eq!(texts(&mixed), ["3a", "4", "11"]);
+        assert_eq!(texts(&mixed), ["4", "11", "3a"]);
+    }
+
+    #[test]
+    fn encounter_order_dedup_uses_incoming_equals() {
+        let text_then_integer = Suggestions::create(
+            "",
+            [
+                suggestion(at(0), "1"),
+                IntegerSuggestion::new(at(0), 1).into_suggestion(),
+            ],
+        );
+        assert_eq!(text_then_integer.list().len(), 2);
+
+        let integer_then_text = Suggestions::create(
+            "",
+            [
+                IntegerSuggestion::new(at(0), 1).into_suggestion(),
+                suggestion(at(0), "1"),
+            ],
+        );
+        assert_eq!(integer_then_text.list().len(), 1);
+        assert_eq!(integer_then_text.list()[0].integer_value(), Some(1));
     }
 
     #[test]
@@ -1676,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_case_mapping_matches_mojang_java_25() {
+    fn java_se_25_unicode_16_simple_case_mapping() {
         const FNV_PRIME: u64 = 1_099_511_628_211;
 
         fn mix(hash: u64, value: u32) -> u64 {
@@ -1690,121 +1151,6 @@ mod tests {
             hash = mix(hash, java_simple_lowercase_code_point(code_point));
         }
         assert_eq!(hash, 14_675_530_581_949_953_150);
-    }
-
-    #[test]
-    fn sort_mixed_long_matches_java_25_object_timsort() {
-        let input = [
-            "i22", "i8", "i30", "i22", "i2", "i3", "i30", "i4", "a", "A", "b", "a", "i2", "i8",
-            "i2", "a3", "3a", "i3", "i32", "i4", "i22", "b", "i1", "i3", "i32", "i2", "3a", "i4",
-            "c", "c", "b", "i2", "i2", "i1", "3a", "i2", "i30", "i30", "i32", "b", "b", "c", "A",
-            "i22", "i32", "A", "i4", "b", "b", "i2", "i11", "i4", "A", "i22", "3a", "b", "i3",
-            "i3", "i4", "i1", "i22", "c", "a3", "A", "a3", "i22", "i8", "i1", "b", "c", "b", "b",
-            "i8", "i1", "A", "i32", "i1", "a", "c", "A",
-        ];
-        let mut values: Vec<_> = input
-            .iter()
-            .enumerate()
-            .map(|(id, specification)| timsort_item(id, specification))
-            .collect();
-
-        java_stable_sort(&mut values);
-
-        let ids: Vec<_> = values
-            .iter()
-            .map(|suggestion| suggestion.range().start())
-            .collect();
-        assert_eq!(
-            ids,
-            [
-                22, 33, 59, 67, 73, 76, 4, 12, 14, 25, 31, 32, 35, 49, 5, 17, 23, 56, 57, 46, 51,
-                50, 43, 53, 44, 54, 7, 19, 27, 58, 1, 13, 66, 72, 0, 3, 20, 60, 65, 2, 6, 36, 37,
-                18, 24, 38, 75, 16, 26, 34, 8, 9, 11, 42, 45, 52, 63, 74, 77, 79, 15, 62, 64, 10,
-                21, 30, 39, 40, 47, 48, 55, 68, 70, 71, 28, 29, 41, 61, 69, 78,
-            ]
-        );
-    }
-
-    #[test]
-    fn randomized_sort_matches_java_25_object_timsort_digest() {
-        const TEXTS: &[&str] = &[
-            "1", "2", "3", "4", "8", "10", "11", "12", "20", "22", "30", "32", "3a", "a3", "a",
-            "A", "b", "B", "c", "C", "00", "01", "9z",
-        ];
-        const MULTIPLIER: u64 = 6_364_136_223_846_793_005;
-        const INCREMENT: u64 = 1_442_695_040_888_963_407;
-        const FNV_PRIME: u64 = 1_099_511_628_211;
-
-        fn next(state: &mut u64) -> u64 {
-            *state = state.wrapping_mul(MULTIPLIER).wrapping_add(INCREMENT);
-            *state
-        }
-
-        fn mix(hash: u64, value: u64) -> u64 {
-            (hash ^ value).wrapping_mul(FNV_PRIME)
-        }
-
-        let mut state = 0x5eed_1234;
-        let mut hash = 0xcbf2_9ce4_8422_2325;
-        let mut failures = 0;
-        for trial in 0..4_096 {
-            let length = 32 + ((next(&mut state) >> 1) % 225) as usize;
-            let mut values = Vec::with_capacity(length);
-            for id in 0..length {
-                let text = TEXTS[((next(&mut state) >> 1) % TEXTS.len() as u64) as usize];
-                let integer = ((next(&mut state) >> 17) & 1) != 0
-                    && text.bytes().all(|byte| byte.is_ascii_digit());
-                let value = if integer {
-                    IntegerSuggestion::new(at(id), text.parse().unwrap()).into_suggestion()
-                } else {
-                    suggestion(at(id), text)
-                };
-                values.push(value);
-            }
-
-            hash = mix(hash, trial);
-            hash = mix(hash, length as u64);
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                java_stable_sort(&mut values);
-            }))
-            .is_err()
-            {
-                failures += 1;
-                hash = mix(hash, u64::MAX);
-            } else {
-                hash = mix(hash, 0);
-                for value in values {
-                    hash = mix(hash, value.range().start() as u64 + 1);
-                }
-            }
-        }
-
-        assert_eq!(failures, 1);
-        assert_eq!(hash, 5_921_293_081_399_281_092);
-    }
-
-    #[test]
-    #[should_panic(expected = "Comparison method violates its general contract!")]
-    fn non_transitive_comparison_fails_when_java_25_object_timsort_fails() {
-        const TEXTS: &[&str] = &["2", "10", "11"];
-        const MULTIPLIER: u64 = 6_364_136_223_846_793_005;
-        const INCREMENT: u64 = 1_442_695_040_888_963_407;
-
-        let mut state = 0x19a5_c0de_u64;
-        let mut values = Vec::with_capacity(128);
-        for id in 0..128 {
-            state = state.wrapping_mul(MULTIPLIER).wrapping_add(INCREMENT);
-            let text = TEXTS[((state >> 1) % TEXTS.len() as u64) as usize];
-            state = state.wrapping_mul(MULTIPLIER).wrapping_add(INCREMENT);
-            let value = if ((state >> 17) & 1) != 0 {
-                IntegerSuggestion::new(at(id), text.parse().unwrap()).into_suggestion()
-            } else {
-                suggestion(at(id), text)
-            };
-            values.push(value);
-        }
-
-        java_stable_sort(&mut values);
     }
 
     #[test]
@@ -1845,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_uses_mojang_java_character_data() {
+    fn lowercase_uses_java_se_25_unicode_16_data() {
         let input = String::from_utf16(&[0xa7ce, b'A' as u16]).unwrap();
         let builder = SuggestionsBuilder::new(input, 0);
         assert_eq!(
