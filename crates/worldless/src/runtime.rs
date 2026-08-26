@@ -1,7 +1,10 @@
 use std::{collections::VecDeque, error::Error, fmt};
 
 use crate::{
-    program::{Command, Function, Modifier, Program, Scoreboard, ScoreboardCommand, StoreKind},
+    program::{
+        Command, Function, Modifier, Program, ScoreCondition, Scoreboard, ScoreboardCommand,
+        StoreKind,
+    },
     resource::Identifier,
 };
 
@@ -147,8 +150,10 @@ enum QueueEntry<'a> {
         next_modifier: usize,
         stores: Vec<StoreAction>,
         return_run: bool,
+        active: bool,
+        forked: bool,
     },
-    ExecuteScoreboard {
+    ExecuteOrdinary {
         frame: Frame<'a>,
         instruction: usize,
         stores: Vec<StoreAction>,
@@ -167,7 +172,7 @@ impl QueueEntry<'_> {
             Self::Call(frame)
             | Self::Step(frame)
             | Self::Prepare { frame, .. }
-            | Self::ExecuteScoreboard { frame, .. } => frame.depth,
+            | Self::ExecuteOrdinary { frame, .. } => frame.depth,
             Self::Fallthrough { depth, .. } => *depth,
         }
     }
@@ -236,6 +241,8 @@ pub(crate) fn execute(
                     next_modifier: 0,
                     stores: Vec::new(),
                     return_run: false,
+                    active: true,
+                    forked: false,
                 });
             }
             QueueEntry::Prepare {
@@ -244,11 +251,15 @@ pub(crate) fn execute(
                 mut next_modifier,
                 stores,
                 return_run,
+                active,
+                forked,
             } => {
                 let function = frame.function;
                 let compiled = &function.instructions[instruction];
                 let mut frame = Some(frame);
                 let mut stores = Some(stores);
+                let mut active = active;
+                let mut forked = forked;
 
                 let ready = loop {
                     let Some(modifier) = compiled.modifiers.get(next_modifier) else {
@@ -262,8 +273,14 @@ pub(crate) fn execute(
                             objective,
                         } => {
                             quota.increment();
+                            if !active {
+                                continue;
+                            }
                             if !scoreboard.contains_objective(objective) {
-                                if !return_run {
+                                if forked {
+                                    active = false;
+                                    continue;
+                                } else if !return_run {
                                     schedule_next_instruction(
                                         &mut queue,
                                         frame.take().expect("the frame has not been queued"),
@@ -280,16 +297,35 @@ pub(crate) fn execute(
                                     objective: objective.clone(),
                                 });
                         }
+                        Modifier::Condition(condition) => {
+                            quota.increment();
+                            forked = true;
+                            if active {
+                                active = scoreboard.evaluate_condition(condition).unwrap_or(false);
+                            }
+                        }
                         Modifier::ReturnRun => {
                             let frame = frame.take().expect("the frame has not been queued");
-                            discard_at_depth_or_higher(&mut queue, frame.discard_depth);
-                            queue.push_front(QueueEntry::Prepare {
-                                frame,
-                                instruction,
-                                next_modifier,
-                                stores: stores.take().expect("the stores have not been queued"),
-                                return_run: true,
-                            });
+                            if active {
+                                discard_at_depth_or_higher(&mut queue, frame.discard_depth);
+                                queue.push_front(QueueEntry::Prepare {
+                                    frame,
+                                    instruction,
+                                    next_modifier,
+                                    stores: stores.take().expect("the stores have not been queued"),
+                                    return_run: true,
+                                    active: true,
+                                    forked,
+                                });
+                            } else if return_run {
+                                queue.push_front(QueueEntry::Fallthrough {
+                                    depth: frame.depth,
+                                    discard_depth: frame.discard_depth,
+                                    result_consumer: frame.result_consumer,
+                                });
+                            } else {
+                                schedule_next_instruction(&mut queue, frame);
+                            }
                             break false;
                         }
                     }
@@ -300,6 +336,19 @@ pub(crate) fn execute(
                 }
                 let frame = frame.expect("a ready command retains its frame");
                 let stores = stores.expect("a ready command retains its stores");
+
+                if !active {
+                    if return_run {
+                        queue.push_front(QueueEntry::Fallthrough {
+                            depth: frame.depth,
+                            discard_depth: frame.discard_depth,
+                            result_consumer: frame.result_consumer,
+                        });
+                    } else {
+                        schedule_next_instruction(&mut queue, frame);
+                    }
+                    continue;
+                }
 
                 match &compiled.command {
                     Command::Function(id) => execute_function_command(
@@ -324,8 +373,8 @@ pub(crate) fn execute(
                         );
                         discard_at_depth_or_higher(&mut queue, frame.discard_depth);
                     }
-                    Command::Scoreboard(_) => {
-                        queue.push_front(QueueEntry::ExecuteScoreboard {
+                    Command::Scoreboard(_) | Command::Condition(_) => {
+                        queue.push_front(QueueEntry::ExecuteOrdinary {
                             frame,
                             instruction,
                             stores,
@@ -334,19 +383,21 @@ pub(crate) fn execute(
                     }
                 }
             }
-            QueueEntry::ExecuteScoreboard {
+            QueueEntry::ExecuteOrdinary {
                 frame,
                 instruction,
                 stores,
                 return_run,
             } => {
                 quota.increment();
-                let Command::Scoreboard(command) =
-                    &frame.function.instructions[instruction].command
-                else {
-                    unreachable!("only scoreboard commands are queued for ordinary execution");
+                let command = &frame.function.instructions[instruction].command;
+                let result = match command {
+                    Command::Scoreboard(command) => execute_scoreboard_command(scoreboard, command),
+                    Command::Condition(condition) => execute_condition(scoreboard, condition),
+                    Command::Function(_) | Command::Return { .. } => {
+                        unreachable!("only ordinary commands are queued for ordinary execution")
+                    }
                 };
-                let result = execute_scoreboard_command(scoreboard, command);
                 ResultConsumer::ignoring(stores).accept(result, scoreboard, &mut top_level_result);
 
                 if return_run {
@@ -444,6 +495,35 @@ fn execute_scoreboard_command(
         ScoreboardCommand::GetScore { holder, objective } => scoreboard
             .score(holder, objective)
             .map_or(CommandResult::FAILURE, CommandResult::success),
+        ScoreboardCommand::AddScore {
+            holder,
+            objective,
+            value,
+        } => scoreboard
+            .add_score(holder, objective, *value)
+            .map_or(CommandResult::FAILURE, CommandResult::success),
+        ScoreboardCommand::RemoveScore {
+            holder,
+            objective,
+            value,
+        } => scoreboard
+            .remove_score(holder, objective, *value)
+            .map_or(CommandResult::FAILURE, CommandResult::success),
+        ScoreboardCommand::Operation {
+            target,
+            operation,
+            source,
+        } => scoreboard
+            .apply_operation(target, *operation, source)
+            .map_or(CommandResult::FAILURE, CommandResult::success),
+    }
+}
+
+fn execute_condition(scoreboard: &Scoreboard, condition: &ScoreCondition) -> CommandResult {
+    if scoreboard.evaluate_condition(condition) == Some(true) {
+        CommandResult::success(1)
+    } else {
+        CommandResult::FAILURE
     }
 }
 

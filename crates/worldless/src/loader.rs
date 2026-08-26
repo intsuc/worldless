@@ -18,8 +18,9 @@ use worldless_brigadier::{
 
 use crate::{
     program::{
-        Command as CompiledCommand, Function, Instruction, Modifier, Program, ScoreboardCommand,
-        StoreKind,
+        Command as CompiledCommand, Function, Instruction, Modifier, Program, ScoreComparison,
+        ScoreCondition, ScorePredicate, ScoreRange, ScoreReference, ScoreboardCommand,
+        ScoreboardOperation, StoreKind,
     },
     resource::{Identifier, is_allowed_in_identifier},
 };
@@ -746,6 +747,44 @@ impl CommandCompiler {
                     objective,
                 }))
         });
+        let add_score: Command<LoweringSource> = Rc::new(|context| {
+            let holder = score_holder(context, "targets");
+            let objective = command_string(context, "objective");
+            let value = IntegerArgumentType::get_integer(context, "score")
+                .expect("the add executor is attached below its integer argument");
+            context
+                .source()
+                .record(CompiledCommand::Scoreboard(ScoreboardCommand::AddScore {
+                    holder,
+                    objective,
+                    value,
+                }))
+        });
+        let remove_score: Command<LoweringSource> = Rc::new(|context| {
+            let holder = score_holder(context, "targets");
+            let objective = command_string(context, "objective");
+            let value = IntegerArgumentType::get_integer(context, "score")
+                .expect("the remove executor is attached below its integer argument");
+            context.source().record(CompiledCommand::Scoreboard(
+                ScoreboardCommand::RemoveScore {
+                    holder,
+                    objective,
+                    value,
+                },
+            ))
+        });
+        let operate_score: Command<LoweringSource> = Rc::new(|context| {
+            let target = score_reference(context, "targets", "targetObjective");
+            let operation = scoreboard_operation(context, "operation");
+            let source = score_reference(context, "source", "sourceObjective");
+            context
+                .source()
+                .record(CompiledCommand::Scoreboard(ScoreboardCommand::Operation {
+                    target,
+                    operation,
+                    source,
+                }))
+        });
         let scoreboard = LiteralArgumentBuilder::literal("scoreboard")
             .then(
                 LiteralArgumentBuilder::literal("objectives")
@@ -807,7 +846,52 @@ impl CommandCompiler {
                             )
                             .expect("the players get literal can contain a score holder"),
                     )
-                    .expect("the players literal can contain the get literal"),
+                    .expect("the players literal can contain the get literal")
+                    .then(score_delta_branch("add", add_score))
+                    .expect("the players literal can contain the add literal")
+                    .then(score_delta_branch("remove", remove_score))
+                    .expect("the players literal can contain the remove literal")
+                    .then(
+                        LiteralArgumentBuilder::literal("operation")
+                            .then(
+                                RequiredArgumentBuilder::argument("targets", ScoreHolderArgument)
+                                    .then(
+                                        RequiredArgumentBuilder::argument(
+                                            "targetObjective",
+                                            StringArgumentType::word(),
+                                        )
+                                        .then(
+                                            RequiredArgumentBuilder::argument(
+                                                "operation",
+                                                ScoreboardOperationArgument,
+                                            )
+                                            .then(
+                                                RequiredArgumentBuilder::argument(
+                                                    "source",
+                                                    ScoreHolderArgument,
+                                                )
+                                                .then(
+                                                    RequiredArgumentBuilder::argument(
+                                                        "sourceObjective",
+                                                        StringArgumentType::word(),
+                                                    )
+                                                    .executes(operate_score),
+                                                )
+                                                .expect(
+                                                    "an operation source can contain an objective",
+                                                ),
+                                            )
+                                            .expect(
+                                                "an operation can contain a source score holder",
+                                            ),
+                                        )
+                                        .expect("a target objective can contain an operation"),
+                                    )
+                                    .expect("an operation target can contain an objective"),
+                            )
+                            .expect("the operation literal can contain a target score holder"),
+                    )
+                    .expect("the players literal can contain the operation literal"),
             )
             .expect("the scoreboard literal can contain players commands");
         dispatcher
@@ -832,10 +916,18 @@ impl CommandCompiler {
                         execute.clone(),
                     ))
                     .expect("the store literal can contain the result literal")
-                    .then(store_score_branch("success", StoreKind::Success, execute))
+                    .then(store_score_branch(
+                        "success",
+                        StoreKind::Success,
+                        execute.clone(),
+                    ))
                     .expect("the store literal can contain the success literal"),
             )
-            .expect("the execute literal can contain the store literal");
+            .expect("the execute literal can contain the store literal")
+            .then(execute_score_condition_branch("if", true, execute.clone()))
+            .expect("the execute literal can contain the if literal")
+            .then(execute_score_condition_branch("unless", false, execute))
+            .expect("the execute literal can contain the unless literal");
         dispatcher
             .register(execute_command)
             .expect("the command tree contains no conflicting execute literal");
@@ -856,6 +948,192 @@ impl CommandCompiler {
             .map_err(|error| error.to_string())?;
         let instruction = sink.borrow_mut().take();
         instruction.ok_or_else(|| "command did not produce an instruction".to_owned())
+    }
+}
+
+fn score_delta_branch(
+    literal: &'static str,
+    command: Command<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    LiteralArgumentBuilder::literal(literal)
+        .then(
+            RequiredArgumentBuilder::argument("targets", ScoreHolderArgument)
+                .then(
+                    RequiredArgumentBuilder::argument("objective", StringArgumentType::word())
+                        .then(
+                            RequiredArgumentBuilder::argument(
+                                "score",
+                                IntegerArgumentType::integer_range(0, i32::MAX),
+                            )
+                            .executes(command),
+                        )
+                        .expect("an objective can contain a non-negative score"),
+                )
+                .expect("a score holder can contain an objective"),
+        )
+        .expect("a score operation can contain a score holder")
+}
+
+fn execute_score_condition_branch(
+    literal: &'static str,
+    expected: bool,
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    LiteralArgumentBuilder::literal(literal)
+        .then(
+            LiteralArgumentBuilder::literal("score")
+                .then(
+                    RequiredArgumentBuilder::argument("target", ScoreHolderArgument)
+                        .then(
+                            RequiredArgumentBuilder::argument(
+                                "targetObjective",
+                                StringArgumentType::word(),
+                            )
+                            .then(score_comparison_condition_branch(
+                                "=",
+                                ScoreComparison::Equal,
+                                expected,
+                                execute.clone(),
+                            ))
+                            .expect("a target objective can contain equality comparison")
+                            .then(score_comparison_condition_branch(
+                                "<",
+                                ScoreComparison::LessThan,
+                                expected,
+                                execute.clone(),
+                            ))
+                            .expect("a target objective can contain less-than comparison")
+                            .then(score_comparison_condition_branch(
+                                "<=",
+                                ScoreComparison::LessThanOrEqual,
+                                expected,
+                                execute.clone(),
+                            ))
+                            .expect("a target objective can contain less-than-or-equal comparison")
+                            .then(score_comparison_condition_branch(
+                                ">",
+                                ScoreComparison::GreaterThan,
+                                expected,
+                                execute.clone(),
+                            ))
+                            .expect("a target objective can contain greater-than comparison")
+                            .then(score_comparison_condition_branch(
+                                ">=",
+                                ScoreComparison::GreaterThanOrEqual,
+                                expected,
+                                execute.clone(),
+                            ))
+                            .expect(
+                                "a target objective can contain greater-than-or-equal comparison",
+                            )
+                            .then(score_matches_condition_branch(expected, execute))
+                            .expect("a target objective can contain a range match"),
+                        )
+                        .expect("a target score holder can contain an objective"),
+                )
+                .expect("the score literal can contain a target score holder"),
+        )
+        .expect("a conditional can contain the score literal")
+}
+
+fn score_comparison_condition_branch(
+    literal: &'static str,
+    comparison: ScoreComparison,
+    expected: bool,
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let terminal: Command<LoweringSource> = Rc::new(move |context| {
+        context
+            .source()
+            .record(CompiledCommand::Condition(score_comparison_condition(
+                context, expected, comparison,
+            )))
+    });
+    let modifier = Rc::new(move |context: &CommandContext<LoweringSource>| {
+        let condition = score_comparison_condition(context, expected, comparison);
+        Ok(vec![Rc::new(
+            context
+                .source()
+                .with_modifier(Modifier::Condition(condition)),
+        )])
+    });
+
+    LiteralArgumentBuilder::literal(literal)
+        .then(
+            RequiredArgumentBuilder::argument("source", ScoreHolderArgument)
+                .then(
+                    RequiredArgumentBuilder::argument(
+                        "sourceObjective",
+                        StringArgumentType::word(),
+                    )
+                    .executes(terminal)
+                    .fork(execute, modifier)
+                    .expect("a complete comparison can redirect to execute"),
+                )
+                .expect("a comparison source can contain an objective"),
+        )
+        .expect("a comparison can contain a source score holder")
+}
+
+fn score_matches_condition_branch(
+    expected: bool,
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let terminal: Command<LoweringSource> = Rc::new(move |context| {
+        context
+            .source()
+            .record(CompiledCommand::Condition(score_matches_condition(
+                context, expected,
+            )))
+    });
+    let modifier = Rc::new(move |context: &CommandContext<LoweringSource>| {
+        let condition = score_matches_condition(context, expected);
+        Ok(vec![Rc::new(
+            context
+                .source()
+                .with_modifier(Modifier::Condition(condition)),
+        )])
+    });
+
+    LiteralArgumentBuilder::literal("matches")
+        .then(
+            RequiredArgumentBuilder::argument("range", ScoreRangeArgument)
+                .executes(terminal)
+                .fork(execute, modifier)
+                .expect("a complete range match can redirect to execute"),
+        )
+        .expect("matches can contain an integer range")
+}
+
+fn score_comparison_condition(
+    context: &CommandContext<LoweringSource>,
+    expected: bool,
+    comparison: ScoreComparison,
+) -> ScoreCondition {
+    ScoreCondition {
+        expected,
+        predicate: ScorePredicate::Compare {
+            left: score_reference(context, "target", "targetObjective"),
+            comparison,
+            right: score_reference(context, "source", "sourceObjective"),
+        },
+    }
+}
+
+fn score_matches_condition(
+    context: &CommandContext<LoweringSource>,
+    expected: bool,
+) -> ScoreCondition {
+    let range = context
+        .argument::<ScoreRange>("range")
+        .map(|range| *range)
+        .expect("the score condition is attached below its range argument");
+    ScoreCondition {
+        expected,
+        predicate: ScorePredicate::Matches {
+            score: score_reference(context, "target", "targetObjective"),
+            range,
+        },
     }
 }
 
@@ -909,6 +1187,27 @@ fn score_holder(context: &CommandContext<LoweringSource>, name: &str) -> String 
         .expect("the command executor is attached below the requested score holder argument")
 }
 
+fn score_reference(
+    context: &CommandContext<LoweringSource>,
+    holder: &str,
+    objective: &str,
+) -> ScoreReference {
+    ScoreReference {
+        holder: score_holder(context, holder),
+        objective: command_string(context, objective),
+    }
+}
+
+fn scoreboard_operation(
+    context: &CommandContext<LoweringSource>,
+    name: &str,
+) -> ScoreboardOperation {
+    context
+        .argument::<ScoreboardOperation>(name)
+        .map(|operation| *operation)
+        .expect("the scoreboard executor is attached below its operation argument")
+}
+
 #[derive(Clone, Copy)]
 struct ScoreHolderArgument;
 
@@ -938,6 +1237,121 @@ impl ArgumentType<LoweringSource> for ScoreHolderArgument {
 
     fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
         left == right
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScoreboardOperationArgument;
+
+impl ArgumentType<LoweringSource> for ScoreboardOperationArgument {
+    type Value = ScoreboardOperation;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let start = reader.cursor();
+        while reader.can_read() && reader.peek() != b' ' as u16 {
+            reader.skip();
+        }
+        let operation = match reader.substring(start, reader.cursor()).as_str() {
+            "=" => ScoreboardOperation::Assign,
+            "+=" => ScoreboardOperation::Add,
+            "-=" => ScoreboardOperation::Subtract,
+            "*=" => ScoreboardOperation::Multiply,
+            "/=" => ScoreboardOperation::Divide,
+            "%=" => ScoreboardOperation::Modulo,
+            "<" => ScoreboardOperation::Min,
+            ">" => ScoreboardOperation::Max,
+            "><" => ScoreboardOperation::Swap,
+            _ => {
+                reader.set_cursor(start);
+                return Err(SimpleCommandExceptionType::new(LiteralMessage::new(
+                    "invalid scoreboard operation",
+                ))
+                .create_with_context(reader));
+            }
+        };
+        Ok(operation)
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["=", "+=", "><"].into_iter().map(str::to_owned).collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScoreRangeArgument;
+
+impl ArgumentType<LoweringSource> for ScoreRangeArgument {
+    type Value = ScoreRange;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let start = reader.cursor();
+        let parsed = (|| {
+            let min = parse_score_range_bound(reader)?;
+            let max = if reader.can_read_n(2)
+                && reader.peek() == b'.' as u16
+                && reader.peek_offset(1) == b'.' as u16
+            {
+                reader.skip();
+                reader.skip();
+                parse_score_range_bound(reader)?
+            } else {
+                min
+            };
+
+            if min.is_none() && max.is_none() {
+                return Err("empty score range");
+            }
+            if min.zip(max).is_some_and(|(min, max)| min > max) {
+                return Err("swapped score range bounds");
+            }
+            Ok(ScoreRange { min, max })
+        })();
+
+        parsed.map_err(|message| {
+            reader.set_cursor(start);
+            SimpleCommandExceptionType::new(LiteralMessage::new(message))
+                .create_with_context(reader)
+        })
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["0..5", "0", "-5", "-100..", "..100"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+fn parse_score_range_bound(reader: &mut StringReader) -> Result<Option<i32>, &'static str> {
+    let start = reader.cursor();
+    while reader.can_read() && is_allowed_score_range_number(reader) {
+        reader.skip();
+    }
+    if start == reader.cursor() {
+        return Ok(None);
+    }
+    reader
+        .substring(start, reader.cursor())
+        .parse()
+        .map(Some)
+        .map_err(|_| "invalid integer in score range")
+}
+
+fn is_allowed_score_range_number(reader: &StringReader) -> bool {
+    match reader.peek() {
+        unit if matches!(unit, 0x30..=0x39) || unit == b'-' as u16 => true,
+        unit if unit == b'.' as u16 => {
+            !reader.can_read_n(2) || reader.peek_offset(1) != b'.' as u16
+        }
+        _ => false,
     }
 }
 

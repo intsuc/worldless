@@ -1,8 +1,9 @@
 //! A worldless execution engine for the computation-only subset of Minecraft
 //! data packs.
 //!
-//! The current slice supports function calls and returns, a minimal persistent
-//! scoreboard, and `execute store score`/`return run` result propagation.
+//! The current slice supports function calls and returns, persistent named
+//! scoreboard arithmetic and score-only `execute` conditions, and
+//! `execute store score`/`return run` result propagation.
 //! Functions can be compiled from an expanded directory data pack or in-memory
 //! source. Construction is atomic: an invalid supported function rejects the
 //! whole program instead of leaving a partially populated VM.
