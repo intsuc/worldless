@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use worldless::{ExecutionError, FunctionOutcome, LoadError, Vm};
+use worldless::{CompileError, ExecutionError, FunctionOutcome, LoadError, Vm};
 
 static NEXT_PACK: AtomicU64 = AtomicU64::new(0);
 
@@ -58,15 +58,15 @@ impl Drop for TestPack {
 
 #[test]
 fn executes_nested_paths_and_return_run() {
-    let pack = TestPack::new();
-    pack.write_function(
-        "example:main",
-        "function example:child\nreturn run fun\\\nction example:math/answer\nreturn 99\n",
-    );
-    pack.write_function("example:child", "return 7\n");
-    pack.write_function("example:math/answer", "return 42\n");
-
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    let mut vm = Vm::from_functions([
+        (
+            "example:main",
+            "function example:child\nreturn run fun\\\nction example:math/answer\nreturn 99\n",
+        ),
+        ("example:child", "return 7\n"),
+        ("example:math/answer", "return 42\n"),
+    ])
+    .unwrap();
     assert_eq!(
         vm.execute_function("example:main", 8).unwrap(),
         FunctionOutcome::Returned {
@@ -78,11 +78,11 @@ fn executes_nested_paths_and_return_run() {
 
 #[test]
 fn a_normal_child_return_does_not_return_from_its_parent() {
-    let pack = TestPack::new();
-    pack.write_function("example:main", "function example:child\nreturn 5\n");
-    pack.write_function("example:child", "return 99\n");
-
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    let mut vm = Vm::from_functions([
+        ("example:main", "function example:child\nreturn 5\n"),
+        ("example:child", "return 99\n"),
+    ])
+    .unwrap();
     assert_eq!(
         vm.execute_function("example:main", 5).unwrap(),
         FunctionOutcome::Returned {
@@ -94,12 +94,12 @@ fn a_normal_child_return_does_not_return_from_its_parent() {
 
 #[test]
 fn reports_failure_and_fallthrough_distinctly() {
-    let pack = TestPack::new();
-    pack.write_function("example:failure", "return fail\n");
-    pack.write_function("example:empty", "# nothing to execute\n");
-    pack.write_function("example:", "return 8\n");
-
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    let mut vm = Vm::from_functions([
+        ("example:failure", "return fail\n"),
+        ("example:empty", "# nothing to execute\n"),
+        ("example:", "return 8\n"),
+    ])
+    .unwrap();
     assert_eq!(
         vm.execute_function("example:failure", 2).unwrap(),
         FunctionOutcome::Returned {
@@ -122,12 +122,12 @@ fn reports_failure_and_fallthrough_distinctly() {
 
 #[test]
 fn return_run_converts_child_fallthrough_to_failure() {
-    let pack = TestPack::new();
-    pack.write_function("example:main", "return run function example:target\n");
-    pack.write_function("example:target", "function example:child\n");
-    pack.write_function("example:child", "return 9\n");
-
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    let mut vm = Vm::from_functions([
+        ("example:main", "return run function example:target\n"),
+        ("example:target", "function example:child\n"),
+        ("example:child", "return 9\n"),
+    ])
+    .unwrap();
     assert_eq!(
         vm.execute_function("example:main", 4).unwrap(),
         FunctionOutcome::Returned {
@@ -139,9 +139,7 @@ fn return_run_converts_child_fallthrough_to_failure() {
 
 #[test]
 fn enforces_the_minecraft_queue_limit_without_rust_recursion() {
-    let pack = TestPack::new();
-    pack.write_function("example:loop", "function example:loop\n");
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    let mut vm = Vm::from_functions([("example:loop", "function example:loop\n")]).unwrap();
 
     assert_eq!(
         vm.execute_function("example:loop", 10),
@@ -151,9 +149,7 @@ fn enforces_the_minecraft_queue_limit_without_rust_recursion() {
 
 #[test]
 fn reaching_the_limit_before_the_first_command_is_an_error() {
-    let pack = TestPack::new();
-    pack.write_function("example:main", "return 1\n");
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    let mut vm = Vm::from_functions([("example:main", "return 1\n")]).unwrap();
 
     assert_eq!(
         vm.execute_function("example:main", 1),
@@ -170,9 +166,11 @@ fn reaching_the_limit_before_the_first_command_is_an_error() {
 
 #[test]
 fn unresolved_nested_calls_fail_without_stopping_the_function() {
-    let pack = TestPack::new();
-    pack.write_function("example:main", "function example:missing\nreturn 6\n");
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    let mut vm = Vm::from_functions([
+        ("example:main", "function example:missing\nreturn 6\n"),
+        ("example:only_missing", "function example:missing\n"),
+    ])
+    .unwrap();
 
     assert_eq!(
         vm.execute_function("example:main", 3).unwrap(),
@@ -182,8 +180,6 @@ fn unresolved_nested_calls_fail_without_stopping_the_function() {
         }
     );
 
-    pack.write_function("example:only_missing", "function example:missing\n");
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
     assert_eq!(
         vm.execute_function("example:only_missing", 3).unwrap(),
         FunctionOutcome::FellThrough
@@ -192,12 +188,11 @@ fn unresolved_nested_calls_fail_without_stopping_the_function() {
 
 #[test]
 fn unresolved_return_run_discards_the_current_frame() {
-    let pack = TestPack::new();
-    pack.write_function(
+    let mut vm = Vm::from_functions([(
         "example:main",
         "return run function example:missing\nreturn 6\n",
-    );
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    )])
+    .unwrap();
 
     assert_eq!(
         vm.execute_function("example:main", 3).unwrap(),
@@ -249,7 +244,7 @@ fn accepts_official_compatible_format_encodings() {
 }
 
 #[test]
-fn rejects_unsupported_pack_and_function_features() {
+fn rejects_unsupported_pack_features() {
     let pack = TestPack::new();
     fs::write(
         pack.root().join("pack.mcmeta"),
@@ -260,28 +255,57 @@ fn rejects_unsupported_pack_and_function_features() {
         Vm::load_directory(pack.root()),
         Err(LoadError::UnsupportedPack { .. })
     ));
-
-    fs::write(
-        pack.root().join("pack.mcmeta"),
-        r#"{"pack":{"description":"test","min_format":118,"max_format":118}}"#,
-    )
-    .unwrap();
-    pack.write_function("example:macro", "$return $(value)\n");
-    assert!(matches!(
-        Vm::load_directory(pack.root()),
-        Err(LoadError::InvalidFunction { .. })
-    ));
 }
 
 #[test]
-fn ignores_old_plural_and_invalid_resource_paths() {
+fn reports_in_memory_compilation_errors() {
+    assert_eq!(
+        Vm::from_functions([("Upper:main", "return 1\n")]).unwrap_err(),
+        CompileError::InvalidFunctionIdentifier {
+            input: "Upper:main".to_owned()
+        }
+    );
+    assert_eq!(
+        Vm::from_functions([("foo", "return 1\n"), (":foo", "return 2\n")]).unwrap_err(),
+        CompileError::DuplicateFunction {
+            id: "minecraft:foo".to_owned()
+        }
+    );
+    assert_eq!(
+        Vm::from_functions([("example:macro", "\n$return $(value)\n")]).unwrap_err(),
+        CompileError::InvalidFunction {
+            id: "example:macro".to_owned(),
+            line: 2,
+            reason: "function macros are not supported".to_owned()
+        }
+    );
+}
+
+#[test]
+fn directory_loader_reports_invalid_function_paths() {
+    let pack = TestPack::new();
+    pack.write_function("example:macro", "$return $(value)\n");
+    let expected_path = pack.root().join("data/example/function/macro.mcfunction");
+    match Vm::load_directory(pack.root()).unwrap_err() {
+        LoadError::InvalidFunction { path, line, reason } => {
+            assert_eq!(path, expected_path);
+            assert_eq!(line, 1);
+            assert_eq!(reason, "function macros are not supported");
+        }
+        error => panic!("expected an invalid function error, got {error}"),
+    }
+}
+
+#[test]
+fn maps_nested_and_empty_paths_while_ignoring_invalid_resource_paths() {
     let pack = TestPack::new();
     let plural = pack
         .root()
         .join("data/example/functions/not_loaded.mcfunction");
     fs::create_dir_all(plural.parent().unwrap()).unwrap();
     fs::write(plural, "return 1\n").unwrap();
-    pack.write_function("example:valid", "return 2\n");
+    pack.write_function("example:nested/valid", "return 2\n");
+    pack.write_function("example:", "return 3\n");
     let invalid = pack.root().join("data/example/function/Upper.mcfunction");
     fs::write(invalid, "not a supported command\n").unwrap();
 
@@ -291,10 +315,17 @@ fn ignores_old_plural_and_invalid_resource_paths() {
         Err(ExecutionError::UnknownFunction { .. })
     ));
     assert_eq!(
-        vm.execute_function("example:valid", 2).unwrap(),
+        vm.execute_function("example:nested/valid", 2).unwrap(),
         FunctionOutcome::Returned {
             success: true,
             value: 2
+        }
+    );
+    assert_eq!(
+        vm.execute_function("example:", 2).unwrap(),
+        FunctionOutcome::Returned {
+            success: true,
+            value: 3
         }
     );
 }

@@ -1,10 +1,10 @@
 //! A worldless execution engine for the computation-only subset of Minecraft
 //! data packs.
 //!
-//! The current slice loads one expanded directory data pack for the repository's
-//! target Minecraft version and executes plain functions containing `function`
-//! and `return` commands. Loading is atomic: an invalid supported function
-//! rejects the whole pack instead of leaving a partially populated VM.
+//! The current slice compiles plain functions containing `function` and `return`
+//! commands from either an expanded directory data pack or in-memory source.
+//! Construction is atomic: an invalid supported function rejects the whole
+//! program instead of leaving a partially populated VM.
 
 mod loader;
 mod program;
@@ -13,7 +13,7 @@ mod runtime;
 
 use std::path::Path;
 
-pub use loader::LoadError;
+pub use loader::{CompileError, LoadError};
 pub use runtime::{ExecutionError, FunctionOutcome};
 
 use program::Program;
@@ -25,6 +25,21 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Compiles functions without reading a data pack from the file system.
+    ///
+    /// Each item is a function identifier and its source. Identifiers without a
+    /// namespace use `minecraft`; duplicate identifiers after that normalization
+    /// are rejected. This entry point does not process pack metadata or resource
+    /// paths.
+    pub fn from_functions<I, N, S>(functions: I) -> Result<Self, CompileError>
+    where
+        I: IntoIterator<Item = (N, S)>,
+        N: AsRef<str>,
+        S: AsRef<str>,
+    {
+        loader::compile_functions(functions).map(|program| Self { program })
+    }
+
     /// Loads one expanded data pack from `path`.
     pub fn load_directory(path: impl AsRef<Path>) -> Result<Self, LoadError> {
         loader::load_directory(path.as_ref()).map(|program| Self { program })

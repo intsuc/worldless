@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     error::Error,
     fmt, fs, io,
     path::{Path, PathBuf},
@@ -49,6 +49,43 @@ pub enum LoadError {
         reason: String,
     },
 }
+
+/// An error encountered while compiling in-memory function source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompileError {
+    InvalidFunctionIdentifier {
+        input: String,
+    },
+    DuplicateFunction {
+        id: String,
+    },
+    InvalidFunction {
+        id: String,
+        line: usize,
+        reason: String,
+    },
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidFunctionIdentifier { input } => {
+                write!(formatter, "invalid function identifier `{input}`")
+            }
+            Self::DuplicateFunction { id } => {
+                write!(formatter, "duplicate function `{id}`")
+            }
+            Self::InvalidFunction { id, line, reason } => {
+                write!(
+                    formatter,
+                    "invalid function `{id}` at line {line}: {reason}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for CompileError {}
 
 impl fmt::Display for LoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -121,12 +158,54 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
             let id = Identifier::from_parts(namespace, function_path)
                 .expect("removing a valid suffix preserves an identifier path");
             let contents = read_to_string(&path)?;
-            let instructions = parse_function(&path, &contents, &compiler)?;
+            let instructions = parse_function(&contents, &compiler).map_err(|error| {
+                LoadError::InvalidFunction {
+                    path: path.clone(),
+                    line: error.line,
+                    reason: error.reason,
+                }
+            })?;
             functions.insert(id, Function { instructions });
         }
     }
 
     Ok(Program::new(functions))
+}
+
+pub(crate) fn compile_functions<I, N, S>(functions: I) -> Result<Program, CompileError>
+where
+    I: IntoIterator<Item = (N, S)>,
+    N: AsRef<str>,
+    S: AsRef<str>,
+{
+    let compiler = CommandCompiler::new();
+    let mut compiled = HashMap::new();
+    for (raw_id, source) in functions {
+        let raw_id = raw_id.as_ref();
+        let id =
+            Identifier::parse(raw_id).ok_or_else(|| CompileError::InvalidFunctionIdentifier {
+                input: raw_id.to_owned(),
+            })?;
+        match compiled.entry(id) {
+            Entry::Occupied(entry) => {
+                return Err(CompileError::DuplicateFunction {
+                    id: entry.key().to_string(),
+                });
+            }
+            Entry::Vacant(entry) => {
+                let id = entry.key().to_string();
+                let instructions = parse_function(source.as_ref(), &compiler).map_err(|error| {
+                    CompileError::InvalidFunction {
+                        id,
+                        line: error.line,
+                        reason: error.reason,
+                    }
+                })?;
+                entry.insert(Function { instructions });
+            }
+        }
+    }
+    Ok(Program::new(compiled))
 }
 
 fn validate_pack_metadata(root: &Path) -> Result<(), LoadError> {
@@ -439,11 +518,16 @@ fn parse_integer_range(path: &Path, field: &str, value: &Value) -> Result<(i32, 
     }
 }
 
+#[derive(Debug)]
+struct FunctionParseError {
+    line: usize,
+    reason: String,
+}
+
 fn parse_function(
-    path: &Path,
     contents: &str,
     compiler: &CommandCompiler,
-) -> Result<Vec<Instruction>, LoadError> {
+) -> Result<Vec<Instruction>, FunctionParseError> {
     let lines = java_lines(contents);
     let mut instructions = Vec::new();
     let mut index = 0;
@@ -458,7 +542,6 @@ fn parse_function(
                 index += 1;
                 if index == lines.len() {
                     return Err(invalid_function(
-                        path,
                         line_number,
                         "line continuation at end of file",
                     ));
@@ -466,13 +549,13 @@ fn parse_function(
                 let continued = java_trim(lines[index]);
                 line.push_str(continued);
                 command_length += utf16_length(continued);
-                check_command_length(path, line_number, command_length)?;
+                check_command_length(line_number, command_length)?;
                 if !line.ends_with('\\') {
                     break;
                 }
             }
         }
-        check_command_length(path, line_number, command_length)?;
+        check_command_length(line_number, command_length)?;
 
         if line.is_empty() || line.starts_with('#') {
             index += 1;
@@ -484,11 +567,10 @@ fn parse_function(
             } else {
                 "commands in functions must not start with `/`"
             };
-            return Err(invalid_function(path, line_number, reason));
+            return Err(invalid_function(line_number, reason));
         }
         if line.starts_with('$') {
             return Err(invalid_function(
-                path,
                 line_number,
                 "function macros are not supported",
             ));
@@ -496,17 +578,16 @@ fn parse_function(
 
         let kind = compiler
             .compile(&line)
-            .map_err(|reason| invalid_function(path, line_number, reason))?;
+            .map_err(|reason| invalid_function(line_number, reason))?;
         instructions.push(Instruction { kind });
         index += 1;
     }
     Ok(instructions)
 }
 
-fn check_command_length(path: &Path, line: usize, length: usize) -> Result<(), LoadError> {
+fn check_command_length(line: usize, length: usize) -> Result<(), FunctionParseError> {
     if length > MAX_COMMAND_LENGTH {
         Err(invalid_function(
-            path,
             line,
             format!("command is {length} UTF-16 code units; maximum is {MAX_COMMAND_LENGTH}"),
         ))
@@ -844,9 +925,8 @@ fn invalid_pack(path: &Path, reason: impl Into<String>) -> LoadError {
     }
 }
 
-fn invalid_function(path: &Path, line: usize, reason: impl Into<String>) -> LoadError {
-    LoadError::InvalidFunction {
-        path: path.to_owned(),
+fn invalid_function(line: usize, reason: impl Into<String>) -> FunctionParseError {
+    FunctionParseError {
         line,
         reason: reason.into(),
     }
@@ -871,11 +951,10 @@ mod tests {
 
     #[test]
     fn command_length_uses_utf16_code_units() {
-        let path = Path::new("test.mcfunction");
         let within = "\u{1f600}".repeat(MAX_COMMAND_LENGTH / 2);
-        assert!(check_command_length(path, 1, utf16_length(&within)).is_ok());
+        assert!(check_command_length(1, utf16_length(&within)).is_ok());
         let beyond = format!("{within}a");
-        assert!(check_command_length(path, 1, utf16_length(&beyond)).is_err());
+        assert!(check_command_length(1, utf16_length(&beyond)).is_err());
     }
 
     #[test]
@@ -932,9 +1011,7 @@ mod tests {
     #[test]
     fn continuation_precedes_comment_handling_and_requires_a_following_line() {
         let compiler = CommandCompiler::new();
-        let path = Path::new("test.mcfunction");
         let instructions = parse_function(
-            path,
             "# consumes the next line\\\nreturn 1\nreturn 2\n",
             &compiler,
         )
@@ -948,6 +1025,6 @@ mod tests {
                 }
             }]
         ));
-        assert!(parse_function(path, "return 1\\", &compiler).is_err());
+        assert!(parse_function("return 1\\", &compiler).is_err());
     }
 }
