@@ -173,7 +173,7 @@ fn unresolved_nested_calls_fail_without_stopping_the_function() {
     .unwrap();
 
     assert_eq!(
-        vm.execute_function("example:main", 3).unwrap(),
+        vm.execute_function("example:main", 2).unwrap(),
         FunctionOutcome::Returned {
             success: true,
             value: 6
@@ -181,7 +181,7 @@ fn unresolved_nested_calls_fail_without_stopping_the_function() {
     );
 
     assert_eq!(
-        vm.execute_function("example:only_missing", 3).unwrap(),
+        vm.execute_function("example:only_missing", 2).unwrap(),
         FunctionOutcome::FellThrough
     );
 }

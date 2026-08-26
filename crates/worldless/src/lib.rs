@@ -1,10 +1,11 @@
 //! A worldless execution engine for the computation-only subset of Minecraft
 //! data packs.
 //!
-//! The current slice compiles plain functions containing `function` and `return`
-//! commands from either an expanded directory data pack or in-memory source.
-//! Construction is atomic: an invalid supported function rejects the whole
-//! program instead of leaving a partially populated VM.
+//! The current slice supports function calls and returns, a minimal persistent
+//! scoreboard, and `execute store score`/`return run` result propagation.
+//! Functions can be compiled from an expanded directory data pack or in-memory
+//! source. Construction is atomic: an invalid supported function rejects the
+//! whole program instead of leaving a partially populated VM.
 
 mod loader;
 mod program;
@@ -16,12 +17,13 @@ use std::path::Path;
 pub use loader::{CompileError, LoadError};
 pub use runtime::{ExecutionError, FunctionOutcome};
 
-use program::Program;
+use program::{Program, Scoreboard};
 
 /// A loaded worldless data-pack program.
 #[derive(Debug)]
 pub struct Vm {
     program: Program,
+    scoreboard: Scoreboard,
 }
 
 impl Vm {
@@ -37,12 +39,12 @@ impl Vm {
         N: AsRef<str>,
         S: AsRef<str>,
     {
-        loader::compile_functions(functions).map(|program| Self { program })
+        loader::compile_functions(functions).map(Self::new)
     }
 
     /// Loads one expanded data pack from `path`.
     pub fn load_directory(path: impl AsRef<Path>) -> Result<Self, LoadError> {
-        loader::load_directory(path.as_ref()).map(|program| Self { program })
+        loader::load_directory(path.as_ref()).map(Self::new)
     }
 
     /// Executes a function without a physical Minecraft world.
@@ -56,6 +58,13 @@ impl Vm {
         id: &str,
         command_limit: usize,
     ) -> Result<FunctionOutcome, ExecutionError> {
-        runtime::execute(&self.program, id, command_limit)
+        runtime::execute(&self.program, &mut self.scoreboard, id, command_limit)
+    }
+
+    fn new(program: Program) -> Self {
+        Self {
+            program,
+            scoreboard: Scoreboard::default(),
+        }
     }
 }

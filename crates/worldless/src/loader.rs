@@ -10,14 +10,17 @@ use std::{
 use serde_json::{Map, Value};
 use worldless_brigadier::{
     Command, CommandDispatcher, LiteralMessage, SINGLE_SUCCESS, StringReader,
-    arguments::{ArgumentType, IntegerArgumentType},
+    arguments::{ArgumentType, IntegerArgumentType, StringArgumentType},
     builder::{LiteralArgumentBuilder, RequiredArgumentBuilder},
     context::CommandContext,
     exceptions::{CommandSyntaxException, SimpleCommandExceptionType},
 };
 
 use crate::{
-    program::{Function, Instruction, InstructionKind, Program},
+    program::{
+        Command as CompiledCommand, Function, Instruction, Modifier, Program, ScoreboardCommand,
+        StoreKind,
+    },
     resource::{Identifier, is_allowed_in_identifier},
 };
 
@@ -576,10 +579,10 @@ fn parse_function(
             ));
         }
 
-        let kind = compiler
+        let instruction = compiler
             .compile(&line)
             .map_err(|reason| invalid_function(line_number, reason))?;
-        instructions.push(Instruction { kind });
+        instructions.push(instruction);
         index += 1;
     }
     Ok(instructions)
@@ -625,22 +628,29 @@ fn java_lines(contents: &str) -> Vec<&str> {
     lines
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum LoweringMode {
-    Normal,
-    ReturnRun,
-}
-
 #[derive(Clone)]
 struct LoweringSource {
-    sink: Rc<RefCell<Option<InstructionKind>>>,
-    mode: LoweringMode,
+    sink: Rc<RefCell<Option<Instruction>>>,
+    modifiers: Vec<Modifier>,
 }
 
 impl LoweringSource {
-    fn record(&self, kind: InstructionKind) -> Result<i32, CommandSyntaxException> {
+    fn with_modifier(&self, modifier: Modifier) -> Self {
+        let mut modifiers = self.modifiers.clone();
+        modifiers.push(modifier);
+        Self {
+            sink: Rc::clone(&self.sink),
+            modifiers,
+        }
+    }
+
+    fn record(&self, command: CompiledCommand) -> Result<i32, CommandSyntaxException> {
         let mut sink = self.sink.borrow_mut();
-        if sink.replace(kind).is_some() {
+        let instruction = Instruction {
+            modifiers: self.modifiers.clone(),
+            command,
+        };
+        if sink.replace(instruction).is_some() {
             return Err(syntax_error("command produced more than one instruction"));
         }
         Ok(SINGLE_SUCCESS)
@@ -659,11 +669,9 @@ impl CommandCompiler {
             let id = context
                 .argument::<Identifier>("name")
                 .expect("the function executor is attached below its name argument");
-            let kind = match context.source().mode {
-                LoweringMode::Normal => InstructionKind::Call((*id).clone()),
-                LoweringMode::ReturnRun => InstructionKind::ReturnRunCall((*id).clone()),
-            };
-            context.source().record(kind)
+            context
+                .source()
+                .record(CompiledCommand::Function((*id).clone()))
         });
         let function_name =
             RequiredArgumentBuilder::argument("name", IdentifierArgument).executes(function);
@@ -676,17 +684,15 @@ impl CommandCompiler {
             .expect("the command tree contains no conflicting function literal");
 
         let return_value: Command<LoweringSource> = Rc::new(|context| {
-            reject_return_run_mode(context)?;
             let value = IntegerArgumentType::get_integer(context, "value")
                 .expect("the return executor is attached below its integer argument");
-            context.source().record(InstructionKind::Return {
+            context.source().record(CompiledCommand::Return {
                 success: true,
                 value,
             })
         });
         let return_fail: Command<LoweringSource> = Rc::new(|context| {
-            reject_return_run_mode(context)?;
-            context.source().record(InstructionKind::Return {
+            context.source().record(CompiledCommand::Return {
                 success: false,
                 value: 0,
             })
@@ -694,15 +700,7 @@ impl CommandCompiler {
         let return_run = LiteralArgumentBuilder::literal("run")
             .redirect_with_modifier(
                 dispatcher.root(),
-                Rc::new(|context| {
-                    if context.source().mode == LoweringMode::ReturnRun {
-                        return Err(syntax_error("nested `return run` is not supported"));
-                    }
-                    Ok(Rc::new(LoweringSource {
-                        sink: Rc::clone(&context.source().sink),
-                        mode: LoweringMode::ReturnRun,
-                    }))
-                }),
+                Rc::new(|context| Ok(Rc::new(context.source().with_modifier(Modifier::ReturnRun)))),
             )
             .expect("the return run literal has no children");
         let return_command = LiteralArgumentBuilder::literal("return")
@@ -719,17 +717,140 @@ impl CommandCompiler {
             .register(return_command)
             .expect("the command tree contains no conflicting return literal");
 
+        let add_objective: Command<LoweringSource> = Rc::new(|context| {
+            let objective = command_string(context, "objective");
+            context.source().record(CompiledCommand::Scoreboard(
+                ScoreboardCommand::AddObjective { objective },
+            ))
+        });
+        let set_score: Command<LoweringSource> = Rc::new(|context| {
+            let holder = score_holder(context, "targets");
+            let objective = command_string(context, "objective");
+            let value = IntegerArgumentType::get_integer(context, "score")
+                .expect("the set executor is attached below its integer argument");
+            context
+                .source()
+                .record(CompiledCommand::Scoreboard(ScoreboardCommand::SetScore {
+                    holder,
+                    objective,
+                    value,
+                }))
+        });
+        let get_score: Command<LoweringSource> = Rc::new(|context| {
+            let holder = score_holder(context, "target");
+            let objective = command_string(context, "objective");
+            context
+                .source()
+                .record(CompiledCommand::Scoreboard(ScoreboardCommand::GetScore {
+                    holder,
+                    objective,
+                }))
+        });
+        let scoreboard = LiteralArgumentBuilder::literal("scoreboard")
+            .then(
+                LiteralArgumentBuilder::literal("objectives")
+                    .then(
+                        LiteralArgumentBuilder::literal("add")
+                            .then(
+                                RequiredArgumentBuilder::argument(
+                                    "objective",
+                                    StringArgumentType::word(),
+                                )
+                                .then(
+                                    LiteralArgumentBuilder::literal("dummy")
+                                        .executes(add_objective),
+                                )
+                                .expect("an objective name can contain the dummy criterion"),
+                            )
+                            .expect("the objectives add literal can contain an objective name"),
+                    )
+                    .expect("the objectives literal can contain the add literal"),
+            )
+            .expect("the scoreboard literal can contain objectives commands")
+            .then(
+                LiteralArgumentBuilder::literal("players")
+                    .then(
+                        LiteralArgumentBuilder::literal("set")
+                            .then(
+                                RequiredArgumentBuilder::argument("targets", ScoreHolderArgument)
+                                    .then(
+                                        RequiredArgumentBuilder::argument(
+                                            "objective",
+                                            StringArgumentType::word(),
+                                        )
+                                        .then(
+                                            RequiredArgumentBuilder::argument(
+                                                "score",
+                                                IntegerArgumentType::integer(),
+                                            )
+                                            .executes(set_score),
+                                        )
+                                        .expect("an objective can contain a score"),
+                                    )
+                                    .expect("a score holder can contain an objective"),
+                            )
+                            .expect("the players set literal can contain a score holder"),
+                    )
+                    .expect("the players literal can contain the set literal")
+                    .then(
+                        LiteralArgumentBuilder::literal("get")
+                            .then(
+                                RequiredArgumentBuilder::argument("target", ScoreHolderArgument)
+                                    .then(
+                                        RequiredArgumentBuilder::argument(
+                                            "objective",
+                                            StringArgumentType::word(),
+                                        )
+                                        .executes(get_score),
+                                    )
+                                    .expect("a score holder can contain an objective"),
+                            )
+                            .expect("the players get literal can contain a score holder"),
+                    )
+                    .expect("the players literal can contain the get literal"),
+            )
+            .expect("the scoreboard literal can contain players commands");
+        dispatcher
+            .register(scoreboard)
+            .expect("the command tree contains no conflicting scoreboard literal");
+
+        let execute = dispatcher
+            .register(LiteralArgumentBuilder::literal("execute"))
+            .expect("the command tree contains no conflicting execute literal");
+        let execute_command = LiteralArgumentBuilder::literal("execute")
+            .then(
+                LiteralArgumentBuilder::literal("run")
+                    .redirect(dispatcher.root())
+                    .expect("the execute run literal has no children"),
+            )
+            .expect("the execute literal can contain the run literal")
+            .then(
+                LiteralArgumentBuilder::literal("store")
+                    .then(store_score_branch(
+                        "result",
+                        StoreKind::Result,
+                        execute.clone(),
+                    ))
+                    .expect("the store literal can contain the result literal")
+                    .then(store_score_branch("success", StoreKind::Success, execute))
+                    .expect("the store literal can contain the success literal"),
+            )
+            .expect("the execute literal can contain the store literal");
+        dispatcher
+            .register(execute_command)
+            .expect("the command tree contains no conflicting execute literal");
+
         Self { dispatcher }
     }
 
-    fn compile(&self, command: &str) -> Result<InstructionKind, String> {
+    fn compile(&self, command: &str) -> Result<Instruction, String> {
         let sink = Rc::new(RefCell::new(None));
         self.dispatcher
             .execute(
                 command,
                 LoweringSource {
                     sink: Rc::clone(&sink),
-                    mode: LoweringMode::Normal,
+                    modifiers: Vec::new(),
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -738,15 +859,85 @@ impl CommandCompiler {
     }
 }
 
-fn reject_return_run_mode(
-    context: &CommandContext<LoweringSource>,
-) -> Result<(), CommandSyntaxException> {
-    if context.source().mode == LoweringMode::ReturnRun {
-        Err(syntax_error(
-            "`return run` only supports the `function` command",
-        ))
-    } else {
-        Ok(())
+fn store_score_branch(
+    literal: &'static str,
+    kind: StoreKind,
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    LiteralArgumentBuilder::literal(literal)
+        .then(
+            LiteralArgumentBuilder::literal("score")
+                .then(
+                    RequiredArgumentBuilder::argument("targets", ScoreHolderArgument)
+                        .then(
+                            RequiredArgumentBuilder::argument(
+                                "objective",
+                                StringArgumentType::word(),
+                            )
+                            .redirect_with_modifier(
+                                execute,
+                                Rc::new(move |context| {
+                                    let holder = score_holder(context, "targets");
+                                    let objective = command_string(context, "objective");
+                                    Ok(Rc::new(context.source().with_modifier(
+                                        Modifier::StoreScore {
+                                            kind,
+                                            holder,
+                                            objective,
+                                        },
+                                    )))
+                                }),
+                            )
+                            .expect("the store objective has no children"),
+                        )
+                        .expect("a store score holder can contain an objective"),
+                )
+                .expect("the score literal can contain a score holder"),
+        )
+        .expect("a store mode can contain the score literal")
+}
+
+fn command_string(context: &CommandContext<LoweringSource>, name: &str) -> String {
+    StringArgumentType::get_string(context, name)
+        .expect("the command executor is attached below the requested string argument")
+}
+
+fn score_holder(context: &CommandContext<LoweringSource>, name: &str) -> String {
+    context
+        .argument::<String>(name)
+        .map(|holder| (*holder).clone())
+        .expect("the command executor is attached below the requested score holder argument")
+}
+
+#[derive(Clone, Copy)]
+struct ScoreHolderArgument;
+
+impl ArgumentType<LoweringSource> for ScoreHolderArgument {
+    type Value = String;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let start = reader.cursor();
+        while reader.can_read() && reader.peek() != b' ' as u16 {
+            reader.skip();
+        }
+        let holder = reader.substring(start, reader.cursor());
+        if holder.starts_with('#') {
+            Ok(holder)
+        } else {
+            reader.set_cursor(start);
+            Err(SimpleCommandExceptionType::new(LiteralMessage::new(
+                "only score holders whose names start with `#` are supported",
+            ))
+            .create_with_context(reader))
+        }
+    }
+
+    fn examples(&self) -> Vec<String> {
+        vec!["#value".to_owned()]
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
     }
 }
 
@@ -976,36 +1167,148 @@ mod tests {
     #[test]
     fn compiler_lowers_only_the_supported_command_set() {
         let compiler = CommandCompiler::new();
+        let instruction = compiler.compile("function example:child").unwrap();
+        assert!(instruction.modifiers.is_empty());
+        assert!(matches!(instruction.command, CompiledCommand::Function(_)));
+
+        let instruction = compiler.compile("return -7").unwrap();
+        assert!(instruction.modifiers.is_empty());
         assert!(matches!(
-            compiler.compile("function example:child"),
-            Ok(InstructionKind::Call(_))
-        ));
-        assert!(matches!(
-            compiler.compile("return -7"),
-            Ok(InstructionKind::Return {
+            instruction.command,
+            CompiledCommand::Return {
                 success: true,
                 value: -7
-            })
+            }
         ));
+
+        let instruction = compiler.compile("return fail").unwrap();
+        assert!(instruction.modifiers.is_empty());
         assert!(matches!(
-            compiler.compile("return fail"),
-            Ok(InstructionKind::Return {
+            instruction.command,
+            CompiledCommand::Return {
                 success: false,
                 value: 0
-            })
+            }
+        ));
+
+        let instruction = compiler
+            .compile("return run return run function example:child")
+            .unwrap();
+        assert!(matches!(
+            instruction.modifiers.as_slice(),
+            [Modifier::ReturnRun, Modifier::ReturnRun]
+        ));
+        assert!(matches!(instruction.command, CompiledCommand::Function(_)));
+
+        assert!(matches!(
+            compiler
+                .compile("scoreboard objectives add values dummy")
+                .unwrap()
+                .command,
+            CompiledCommand::Scoreboard(ScoreboardCommand::AddObjective { ref objective })
+                if objective == "values"
         ));
         assert!(matches!(
-            compiler.compile("return run function example:child"),
-            Ok(InstructionKind::ReturnRunCall(_))
-        ));
-        assert!(compiler.compile("return run return 1").is_err());
-        assert!(
             compiler
-                .compile("return run return run function a:b")
-                .is_err()
-        );
+                .compile("scoreboard players set #value values -7")
+                .unwrap()
+                .command,
+            CompiledCommand::Scoreboard(ScoreboardCommand::SetScore {
+                ref holder,
+                ref objective,
+                value: -7
+            }) if holder == "#value" && objective == "values"
+        ));
+        assert!(matches!(
+            compiler
+                .compile("return run scoreboard players get #value values")
+                .unwrap(),
+            Instruction {
+                ref modifiers,
+                command: CompiledCommand::Scoreboard(ScoreboardCommand::GetScore {
+                    ref holder,
+                    ref objective
+                })
+            } if matches!(modifiers.as_slice(), [Modifier::ReturnRun])
+                && holder == "#value"
+                && objective == "values"
+        ));
+
         assert!(compiler.compile("function #example:tag").is_err());
         assert!(compiler.compile("scoreboard objectives list").is_err());
+        assert!(
+            compiler
+                .compile("scoreboard objectives add values trigger")
+                .is_err()
+        );
+        assert!(
+            compiler
+                .compile("scoreboard players set Player values 1")
+                .is_err()
+        );
+        assert!(
+            compiler
+                .compile("scoreboard players get @s values")
+                .is_err()
+        );
+        assert!(compiler.compile("scoreboard players get * values").is_err());
+    }
+
+    #[test]
+    fn compiler_preserves_result_action_order() {
+        let compiler = CommandCompiler::new();
+        let instruction = compiler
+            .compile(
+                "execute store result score #first values store success score #second values run return run scoreboard players get #source values",
+            )
+            .unwrap();
+        assert!(matches!(
+            instruction.modifiers.as_slice(),
+            [
+                Modifier::StoreScore {
+                    kind: StoreKind::Result,
+                    holder: first,
+                    objective: first_objective
+                },
+                Modifier::StoreScore {
+                    kind: StoreKind::Success,
+                    holder: second,
+                    objective: second_objective
+                },
+                Modifier::ReturnRun
+            ] if first == "#first"
+                && first_objective == "values"
+                && second == "#second"
+                && second_objective == "values"
+        ));
+        assert!(matches!(
+            instruction.command,
+            CompiledCommand::Scoreboard(ScoreboardCommand::GetScore {
+                ref holder,
+                ref objective
+            }) if holder == "#source" && objective == "values"
+        ));
+
+        let instruction = compiler
+            .compile(
+                "return run execute store success score #result values run function example:child",
+            )
+            .unwrap();
+        assert!(matches!(
+            instruction.modifiers.as_slice(),
+            [
+                Modifier::ReturnRun,
+                Modifier::StoreScore {
+                    kind: StoreKind::Success,
+                    ..
+                }
+            ]
+        ));
+        assert!(
+            compiler
+                .compile("execute store result score Player values run return 1")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1019,11 +1322,12 @@ mod tests {
         assert!(matches!(
             instructions.as_slice(),
             [Instruction {
-                kind: InstructionKind::Return {
+                modifiers,
+                command: CompiledCommand::Return {
                     success: true,
                     value: 2
                 }
-            }]
+            }] if modifiers.is_empty()
         ));
         assert!(parse_function("return 1\\", &compiler).is_err());
     }
