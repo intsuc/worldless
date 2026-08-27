@@ -3,16 +3,17 @@
 //!
 //! The current slice supports function calls and returns, persistent named
 //! scoreboard arithmetic, command storage and NBT data operations, number
-//! providers and `compute`, function macros and tags, supported `execute`
-//! conditions, and result propagation. Supported resources can be compiled
-//! from an expanded directory data pack or in-memory source. Construction is
-//! atomic: an invalid supported resource rejects the whole program instead of
-//! leaving a partially populated VM.
+//! providers, worldless loot predicates and `compute`, function macros and
+//! tags, supported `execute` conditions, and result propagation. Supported
+//! resources can be compiled from an expanded directory data pack or in-memory
+//! source. Construction is atomic: an invalid supported resource rejects the
+//! whole program instead of leaving a partially populated VM.
 
 mod loader;
 mod macro_function;
 mod nbt;
 mod number_provider;
+mod predicate;
 mod program;
 mod resource;
 mod resource_json;
@@ -77,20 +78,25 @@ impl Vm {
     /// Compiles all resource kinds currently consumed by Worldless without
     /// reading a data pack from the file system.
     ///
-    /// Number-provider sources use the JSON representation from
-    /// `data/<namespace>/number_provider`. Number-provider tags use the tag JSON
-    /// representation from `data/<namespace>/tags/number_provider`.
+    /// Number-provider and predicate sources use the JSON representations from
+    /// `data/<namespace>/number_provider` and `data/<namespace>/predicate`.
+    /// Their tag sources use the corresponding `data/<namespace>/tags/...`
+    /// representations.
     pub fn from_resources(
         functions: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
         function_tags: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
         number_providers: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
         number_provider_tags: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+        predicates: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+        predicate_tags: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
     ) -> Result<Self, CompileError> {
         loader::compile_resources(
             functions,
             function_tags,
             number_providers,
             number_provider_tags,
+            predicates,
+            predicate_tags,
         )
         .map(Self::new)
     }

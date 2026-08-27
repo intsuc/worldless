@@ -7,8 +7,9 @@ use crate::{
     number_provider::LegacyRandom,
     program::{
         Command, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation, DataSource,
-        FunctionArguments, Instruction, Modifier, Program, ResolvedFunctions, ScoreCondition,
-        Scoreboard, ScoreboardCommand, StorageCondition, StorageNumberType, StoreKind,
+        FunctionArguments, Instruction, Modifier, PredicateCondition, Program, ResolvedFunctions,
+        ScoreCondition, Scoreboard, ScoreboardCommand, StorageCondition, StorageNumberType,
+        StoreKind,
     },
     resource::{FunctionReference, Identifier},
 };
@@ -296,13 +297,11 @@ pub(crate) fn execute(
     })?;
     let definition = find_function(program, &id)?;
     let mut compiler = None;
-    let function =
-        instantiate_function(definition, None, &mut compiler, program.number_providers()).map_err(
-            |reason| ExecutionError::FunctionInstantiationFailed {
-                id: id.to_string(),
-                reason,
-            },
-        )?;
+    let function = instantiate_function(definition, None, &mut compiler, program.loot_registry())
+        .map_err(|reason| ExecutionError::FunctionInstantiationFailed {
+        id: id.to_string(),
+        reason,
+    })?;
     let mut queue = VecDeque::from([QueueEntry::Call(Frame {
         function,
         next_instruction: 0,
@@ -426,6 +425,24 @@ pub(crate) fn execute(
                             forked = true;
                             if active {
                                 active = storage_condition_matches(command_storage, condition);
+                            }
+                        }
+                        Modifier::PredicateCondition(condition) => {
+                            quota.increment();
+                            forked = true;
+                            if active {
+                                active = program
+                                    .loot_registry()
+                                    .test_predicate(
+                                        &condition.predicate,
+                                        scoreboard,
+                                        command_storage,
+                                        random,
+                                    )
+                                    .map_err(|reason| {
+                                        ExecutionError::NumberProviderEvaluationFailed { reason }
+                                    })?
+                                    == condition.expected;
                             }
                         }
                         Modifier::FunctionCondition {
@@ -574,6 +591,7 @@ pub(crate) fn execute(
                     Command::Scoreboard(_)
                     | Command::Condition(_)
                     | Command::StorageCondition(_)
+                    | Command::PredicateCondition(_)
                     | Command::Data(_)
                     | Command::Compute(_) => {
                         queue.push_front(QueueEntry::ExecuteOrdinary {
@@ -601,6 +619,13 @@ pub(crate) fn execute(
                     Command::StorageCondition(condition) => {
                         Ok(execute_storage_condition(command_storage, condition))
                     }
+                    Command::PredicateCondition(condition) => execute_predicate_condition(
+                        program,
+                        scoreboard,
+                        command_storage,
+                        random,
+                        condition,
+                    ),
                     Command::Data(command) => {
                         execute_data_command(program, scoreboard, command_storage, random, command)
                     }
@@ -827,7 +852,7 @@ fn instantiate_resolved_prefix(
     let mut instances = Vec::new();
     match functions {
         ResolvedFunctions::Single(function) => {
-            match instantiate_function(function, arguments, compiler, program.number_providers()) {
+            match instantiate_function(function, arguments, compiler, program.loot_registry()) {
                 Ok(instance) => instances.push(instance),
                 Err(_) => return (instances, true),
             }
@@ -837,12 +862,7 @@ fn instantiate_resolved_prefix(
                 let function = program
                     .function(id)
                     .expect("resolved function tags contain loaded functions");
-                match instantiate_function(
-                    function,
-                    arguments,
-                    compiler,
-                    program.number_providers(),
-                ) {
+                match instantiate_function(function, arguments, compiler, program.loot_registry()) {
                     Ok(instance) => instances.push(instance),
                     Err(_) => return (instances, true),
                 }
@@ -1032,6 +1052,26 @@ fn execute_condition(scoreboard: &Scoreboard, condition: &ScoreCondition) -> Com
     }
 }
 
+fn execute_predicate_condition(
+    program: &Program,
+    scoreboard: &Scoreboard,
+    command_storage: &CommandStorage,
+    random: &mut LegacyRandom,
+    condition: &PredicateCondition,
+) -> Result<CommandResult, String> {
+    let matches = program.loot_registry().test_predicate(
+        &condition.predicate,
+        scoreboard,
+        command_storage,
+        random,
+    )? == condition.expected;
+    Ok(if matches {
+        CommandResult::success(1)
+    } else {
+        CommandResult::FAILURE
+    })
+}
+
 fn execute_compute_command(
     program: &Program,
     scoreboard: &Scoreboard,
@@ -1039,7 +1079,7 @@ fn execute_compute_command(
     random: &mut LegacyRandom,
     command: &ComputeCommand,
 ) -> Result<CommandResult, String> {
-    let providers = program.number_providers();
+    let providers = program.loot_registry();
     let value = match command.mode {
         ComputeMode::Float { scale } => providers
             .get_float(&command.provider, scoreboard, command_storage, random)
@@ -1257,7 +1297,7 @@ fn resolve_data_source(
                 .collect()
         }
         DataSource::Compute { provider, integer } => {
-            let providers = program.number_providers();
+            let providers = program.loot_registry();
             Ok(vec![if *integer {
                 Tag::Int(providers.get_int(provider, scoreboard, command_storage, random)?)
             } else {
@@ -1294,14 +1334,14 @@ fn instantiate_function(
     function: &Function,
     arguments: Option<&crate::nbt::CompoundTag>,
     compiler: &mut Option<CommandCompiler>,
-    number_providers: &Arc<crate::number_provider::NumberProviderRegistry>,
+    loot_registry: &Arc<crate::number_provider::LootRegistry>,
 ) -> Result<Arc<[Instruction]>, String> {
     match function {
         Function::Plain(instructions) => Ok(Arc::clone(instructions)),
         Function::Macro(function) => function.instantiate(arguments, |command| {
             compiler
                 .get_or_insert_with(|| {
-                    CommandCompiler::with_number_providers(Arc::clone(number_providers))
+                    CommandCompiler::with_loot_registry(Arc::clone(loot_registry))
                 })
                 .compile_utf16(command)
         }),

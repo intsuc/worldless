@@ -24,14 +24,19 @@ use crate::{
     macro_function::{Function, FunctionBuilder, MAX_COMMAND_LENGTH},
     nbt::{CompoundTag, JavaString, NbtPath, Tag, parse_compound, parse_path, parse_tag},
     number_provider::{
-        NumberProviderReference, NumberProviderRegistry, RegistryValidationError, parse_inline_tag,
-        parse_json as parse_number_provider_json,
+        LootRegistry, NumberProviderReference, RegistryResource, RegistryValidationError,
+        parse_inline_tag as parse_inline_number_provider, parse_json as parse_number_provider_json,
+    },
+    predicate::{
+        PredicateReference, parse_inline_tag as parse_inline_predicate,
+        parse_json as parse_predicate_json,
     },
     program::{
         Command as CompiledCommand, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation,
-        DataSource, DataStringSubstring, FunctionArguments, Instruction, Modifier, Program,
-        ScoreComparison, ScoreCondition, ScorePredicate, ScoreRange, ScoreReference,
-        ScoreboardCommand, ScoreboardOperation, StorageCondition, StorageNumberType, StoreKind,
+        DataSource, DataStringSubstring, FunctionArguments, Instruction, Modifier,
+        PredicateCondition, Program, ScoreComparison, ScoreCondition, ScorePredicate, ScoreRange,
+        ScoreReference, ScoreboardCommand, ScoreboardOperation, StorageCondition,
+        StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier, is_allowed_in_identifier},
     resource_json,
@@ -75,7 +80,11 @@ pub enum LoadError {
         path: PathBuf,
         reason: String,
     },
-    UnsupportedResource {
+    InvalidPredicate {
+        path: PathBuf,
+        reason: String,
+    },
+    InvalidPredicateTag {
         path: PathBuf,
         reason: String,
     },
@@ -122,6 +131,26 @@ pub enum CompileError {
         id: String,
     },
     InvalidNumberProviderTag {
+        id: String,
+        reason: String,
+    },
+    InvalidPredicateIdentifier {
+        input: String,
+    },
+    DuplicatePredicate {
+        id: String,
+    },
+    InvalidPredicate {
+        id: String,
+        reason: String,
+    },
+    InvalidPredicateTagIdentifier {
+        input: String,
+    },
+    DuplicatePredicateTag {
+        id: String,
+    },
+    InvalidPredicateTag {
         id: String,
         reason: String,
     },
@@ -172,6 +201,24 @@ impl fmt::Display for CompileError {
             Self::InvalidNumberProviderTag { id, reason } => {
                 write!(formatter, "invalid number provider tag `{id}`: {reason}")
             }
+            Self::InvalidPredicateIdentifier { input } => {
+                write!(formatter, "invalid predicate identifier `{input}`")
+            }
+            Self::DuplicatePredicate { id } => {
+                write!(formatter, "duplicate predicate `{id}`")
+            }
+            Self::InvalidPredicate { id, reason } => {
+                write!(formatter, "invalid predicate `{id}`: {reason}")
+            }
+            Self::InvalidPredicateTagIdentifier { input } => {
+                write!(formatter, "invalid predicate tag identifier `{input}`")
+            }
+            Self::DuplicatePredicateTag { id } => {
+                write!(formatter, "duplicate predicate tag `{id}`")
+            }
+            Self::InvalidPredicateTag { id, reason } => {
+                write!(formatter, "invalid predicate tag `{id}`: {reason}")
+            }
         }
     }
 }
@@ -216,13 +263,14 @@ impl fmt::Display for LoadError {
                 "invalid number provider tag {}: {reason}",
                 path.display()
             ),
-            Self::UnsupportedResource { path, reason } => {
-                write!(
-                    formatter,
-                    "unsupported resource {}: {reason}",
-                    path.display()
-                )
+            Self::InvalidPredicate { path, reason } => {
+                write!(formatter, "invalid predicate {}: {reason}", path.display())
             }
+            Self::InvalidPredicateTag { path, reason } => write!(
+                formatter,
+                "invalid predicate tag {}: {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -250,27 +298,16 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
     let mut number_provider_paths = HashMap::new();
     let mut unresolved_number_provider_tags = HashMap::new();
     let mut number_provider_tag_paths = HashMap::new();
+    let mut predicates = HashMap::new();
+    let mut predicate_paths = HashMap::new();
+    let mut unresolved_predicate_tags = HashMap::new();
+    let mut predicate_tag_paths = HashMap::new();
     for namespace_dir in &namespace_dirs {
         let Some(namespace) = namespace_dir.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
         if Identifier::from_parts(namespace, "").is_none() {
             continue;
-        }
-
-        if namespace == "minecraft" {
-            let predicate_root = namespace_dir.join("predicate");
-            for path in regular_files_recursive(&predicate_root)? {
-                if resource_path(&predicate_root, &path).as_deref()
-                    == Some("block/fast_cooking.json")
-                {
-                    return Err(LoadError::UnsupportedResource {
-                        path,
-                        reason: "overrides the predicate used by vanilla cooking number providers"
-                            .to_owned(),
-                    });
-                }
-            }
         }
 
         let provider_root = namespace_dir.join("number_provider");
@@ -324,9 +361,60 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
             number_provider_tag_paths.insert(id.clone(), path);
             unresolved_number_provider_tags.insert(id, tag);
         }
+
+        let predicate_root = namespace_dir.join("predicate");
+        for path in regular_files_recursive(&predicate_root)? {
+            let Some(relative) = resource_path(&predicate_root, &path) else {
+                continue;
+            };
+            if !relative.ends_with(".json") {
+                continue;
+            }
+            let full_resource_path = format!("predicate/{relative}");
+            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
+                continue;
+            }
+            let predicate_path = &relative[..relative.len() - ".json".len()];
+            let id = Identifier::from_parts(namespace, predicate_path)
+                .expect("removing a valid suffix preserves an identifier path");
+            let contents = read_to_string(&path)?;
+            let predicate =
+                parse_predicate_json(&contents).map_err(|reason| LoadError::InvalidPredicate {
+                    path: path.clone(),
+                    reason,
+                })?;
+            predicate_paths.insert(id.clone(), path);
+            predicates.insert(id, predicate);
+        }
+
+        let tag_root = namespace_dir.join("tags/predicate");
+        for path in regular_files_recursive(&tag_root)? {
+            let Some(relative) = resource_path(&tag_root, &path) else {
+                continue;
+            };
+            if !relative.ends_with(".json") {
+                continue;
+            }
+            let full_resource_path = format!("tags/predicate/{relative}");
+            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
+                continue;
+            }
+            let tag_path = &relative[..relative.len() - ".json".len()];
+            let id = Identifier::from_parts(namespace, tag_path)
+                .expect("removing a valid suffix preserves an identifier path");
+            let contents = read_to_string(&path)?;
+            let tag =
+                parse_resource_tag(&contents).map_err(|reason| LoadError::InvalidPredicateTag {
+                    path: path.clone(),
+                    reason,
+                })?;
+            predicate_tag_paths.insert(id.clone(), path);
+            unresolved_predicate_tags.insert(id, tag);
+        }
     }
 
-    let mut provider_ids = NumberProviderRegistry::empty().provider_ids();
+    let empty_loot_registry = LootRegistry::empty();
+    let mut provider_ids = empty_loot_registry.number_provider_ids();
     provider_ids.extend(number_providers.keys().cloned());
     let number_provider_tags = resolve_resource_tags(
         &provider_ids,
@@ -341,19 +429,49 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
             .clone(),
         reason: error.reason,
     })?;
-    let number_providers = Arc::new(
-        NumberProviderRegistry::new(number_providers, number_provider_tags).map_err(
-            |RegistryValidationError { provider, reason }| LoadError::InvalidNumberProvider {
-                path: number_provider_paths
-                    .get(&provider)
-                    .expect("supported built-in number providers are valid")
-                    .clone(),
-                reason,
+    let mut predicate_ids = empty_loot_registry.predicate_ids();
+    predicate_ids.extend(predicates.keys().cloned());
+    let predicate_tags = resolve_resource_tags(
+        &predicate_ids,
+        &unresolved_predicate_tags,
+        "predicate",
+        "predicate tag",
+    )
+    .map_err(|error| LoadError::InvalidPredicateTag {
+        path: predicate_tag_paths
+            .get(&error.tag)
+            .expect("every unresolved directory tag has a source path")
+            .clone(),
+        reason: error.reason,
+    })?;
+    let loot_registry = Arc::new(
+        LootRegistry::new(
+            number_providers,
+            number_provider_tags,
+            predicates,
+            predicate_tags,
+        )
+        .map_err(
+            |RegistryValidationError { resource, reason }| match resource {
+                RegistryResource::NumberProvider(id) => LoadError::InvalidNumberProvider {
+                    path: number_provider_paths
+                        .get(&id)
+                        .expect("validation errors are attributed to supplied resources")
+                        .clone(),
+                    reason,
+                },
+                RegistryResource::Predicate(id) => LoadError::InvalidPredicate {
+                    path: predicate_paths
+                        .get(&id)
+                        .expect("validation errors are attributed to supplied resources")
+                        .clone(),
+                    reason,
+                },
             },
         )?,
     );
 
-    let compiler = CommandCompiler::with_number_providers(Arc::clone(&number_providers));
+    let compiler = CommandCompiler::with_loot_registry(Arc::clone(&loot_registry));
     let mut functions = HashMap::new();
     let mut unresolved_function_tags = HashMap::new();
     let mut function_tag_paths = HashMap::new();
@@ -431,7 +549,7 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
             .clone(),
         reason: error.reason,
     })?;
-    Ok(Program::new(functions, function_tags, number_providers))
+    Ok(Program::new(functions, function_tags, loot_registry))
 }
 
 pub(crate) fn compile_functions<I, N, S>(functions: I) -> Result<Program, CompileError>
@@ -442,6 +560,8 @@ where
 {
     compile_resources(
         functions,
+        std::iter::empty::<(&'static str, &'static str)>(),
+        std::iter::empty::<(&'static str, &'static str)>(),
         std::iter::empty::<(&'static str, &'static str)>(),
         std::iter::empty::<(&'static str, &'static str)>(),
         std::iter::empty::<(&'static str, &'static str)>(),
@@ -465,15 +585,38 @@ where
         function_tags,
         std::iter::empty::<(&'static str, &'static str)>(),
         std::iter::empty::<(&'static str, &'static str)>(),
+        std::iter::empty::<(&'static str, &'static str)>(),
+        std::iter::empty::<(&'static str, &'static str)>(),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn compile_resources<FI, FN, FS, FTI, FTN, FTS, NPI, NPN, NPS, NPTI, NPTN, NPTS>(
+pub(crate) fn compile_resources<
+    FI,
+    FN,
+    FS,
+    FTI,
+    FTN,
+    FTS,
+    NPI,
+    NPN,
+    NPS,
+    NPTI,
+    NPTN,
+    NPTS,
+    PI,
+    PN,
+    PS,
+    PTI,
+    PTN,
+    PTS,
+>(
     functions: FI,
     function_tags: FTI,
     number_providers: NPI,
     number_provider_tags: NPTI,
+    predicates: PI,
+    predicate_tags: PTI,
 ) -> Result<Program, CompileError>
 where
     FI: IntoIterator<Item = (FN, FS)>,
@@ -488,6 +631,12 @@ where
     NPTI: IntoIterator<Item = (NPTN, NPTS)>,
     NPTN: AsRef<str>,
     NPTS: AsRef<str>,
+    PI: IntoIterator<Item = (PN, PS)>,
+    PN: AsRef<str>,
+    PS: AsRef<str>,
+    PTI: IntoIterator<Item = (PTN, PTS)>,
+    PTN: AsRef<str>,
+    PTS: AsRef<str>,
 {
     let mut providers = HashMap::new();
     for (raw_id, source) in number_providers {
@@ -534,7 +683,54 @@ where
             }
         }
     }
-    let mut provider_ids = NumberProviderRegistry::empty().provider_ids();
+
+    let mut parsed_predicates = HashMap::new();
+    for (raw_id, source) in predicates {
+        let raw_id = raw_id.as_ref();
+        let id =
+            Identifier::parse(raw_id).ok_or_else(|| CompileError::InvalidPredicateIdentifier {
+                input: raw_id.to_owned(),
+            })?;
+        match parsed_predicates.entry(id) {
+            Entry::Occupied(entry) => {
+                return Err(CompileError::DuplicatePredicate {
+                    id: entry.key().to_string(),
+                });
+            }
+            Entry::Vacant(entry) => {
+                let id = entry.key().to_string();
+                let predicate = parse_predicate_json(source.as_ref())
+                    .map_err(|reason| CompileError::InvalidPredicate { id, reason })?;
+                entry.insert(predicate);
+            }
+        }
+    }
+
+    let mut unresolved_predicate_tags = HashMap::new();
+    for (raw_id, source) in predicate_tags {
+        let raw_id = raw_id.as_ref();
+        let id = Identifier::parse(raw_id).ok_or_else(|| {
+            CompileError::InvalidPredicateTagIdentifier {
+                input: raw_id.to_owned(),
+            }
+        })?;
+        match unresolved_predicate_tags.entry(id) {
+            Entry::Occupied(entry) => {
+                return Err(CompileError::DuplicatePredicateTag {
+                    id: entry.key().to_string(),
+                });
+            }
+            Entry::Vacant(entry) => {
+                let id = entry.key().to_string();
+                let tag = parse_resource_tag(source.as_ref())
+                    .map_err(|reason| CompileError::InvalidPredicateTag { id, reason })?;
+                entry.insert(tag);
+            }
+        }
+    }
+
+    let empty_loot_registry = LootRegistry::empty();
+    let mut provider_ids = empty_loot_registry.number_provider_ids();
     provider_ids.extend(providers.keys().cloned());
     let provider_tags = resolve_resource_tags(
         &provider_ids,
@@ -546,15 +742,39 @@ where
         id: error.tag.to_string(),
         reason: error.reason,
     })?;
-    let number_providers = Arc::new(
-        NumberProviderRegistry::new(providers, provider_tags).map_err(
-            |RegistryValidationError { provider, reason }| CompileError::InvalidNumberProvider {
-                id: provider.to_string(),
-                reason,
+    let mut predicate_ids = empty_loot_registry.predicate_ids();
+    predicate_ids.extend(parsed_predicates.keys().cloned());
+    let resolved_predicate_tags = resolve_resource_tags(
+        &predicate_ids,
+        &unresolved_predicate_tags,
+        "predicate",
+        "predicate tag",
+    )
+    .map_err(|error| CompileError::InvalidPredicateTag {
+        id: error.tag.to_string(),
+        reason: error.reason,
+    })?;
+    let loot_registry = Arc::new(
+        LootRegistry::new(
+            providers,
+            provider_tags,
+            parsed_predicates,
+            resolved_predicate_tags,
+        )
+        .map_err(
+            |RegistryValidationError { resource, reason }| match resource {
+                RegistryResource::NumberProvider(id) => CompileError::InvalidNumberProvider {
+                    id: id.to_string(),
+                    reason,
+                },
+                RegistryResource::Predicate(id) => CompileError::InvalidPredicate {
+                    id: id.to_string(),
+                    reason,
+                },
             },
         )?,
     );
-    let compiler = CommandCompiler::with_number_providers(Arc::clone(&number_providers));
+    let compiler = CommandCompiler::with_loot_registry(Arc::clone(&loot_registry));
     let mut compiled = HashMap::new();
     for (raw_id, source) in functions {
         let raw_id = raw_id.as_ref();
@@ -611,7 +831,7 @@ where
                 id: error.tag.to_string(),
                 reason: error.reason,
             })?;
-    Ok(Program::new(compiled, function_tags, number_providers))
+    Ok(Program::new(compiled, function_tags, loot_registry))
 }
 
 #[derive(Debug)]
@@ -1355,10 +1575,10 @@ pub(crate) struct CommandCompiler {
 impl CommandCompiler {
     #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::with_number_providers(Arc::new(NumberProviderRegistry::empty()))
+        Self::with_loot_registry(Arc::new(LootRegistry::empty()))
     }
 
-    pub(crate) fn with_number_providers(number_providers: Arc<NumberProviderRegistry>) -> Self {
+    pub(crate) fn with_loot_registry(loot_registry: Arc<LootRegistry>) -> Self {
         let dispatcher = CommandDispatcher::new();
 
         let function_without_arguments: Command<LoweringSource> = Rc::new(|context| {
@@ -1641,11 +1861,11 @@ impl CommandCompiler {
             .expect("the command tree contains no conflicting scoreboard literal");
 
         dispatcher
-            .register(compute_command_branch(Arc::clone(&number_providers)))
+            .register(compute_command_branch(Arc::clone(&loot_registry)))
             .expect("the command tree contains no conflicting compute literal");
 
         dispatcher
-            .register(data_command_branch(Arc::clone(&number_providers)))
+            .register(data_command_branch(Arc::clone(&loot_registry)))
             .expect("the command tree contains no conflicting data literal");
 
         let execute = dispatcher
@@ -1666,9 +1886,19 @@ impl CommandCompiler {
                     .expect("the store literal can contain the success literal"),
             )
             .expect("the execute literal can contain the store literal")
-            .then(execute_condition_branch("if", true, execute.clone()))
+            .then(execute_condition_branch(
+                "if",
+                true,
+                execute.clone(),
+                Arc::clone(&loot_registry),
+            ))
             .expect("the execute literal can contain the if literal")
-            .then(execute_condition_branch("unless", false, execute))
+            .then(execute_condition_branch(
+                "unless",
+                false,
+                execute,
+                loot_registry,
+            ))
             .expect("the execute literal can contain the unless literal");
         dispatcher
             .register(execute_command)
@@ -1702,7 +1932,7 @@ impl CommandCompiler {
 }
 
 fn compute_command_branch(
-    number_providers: Arc<NumberProviderRegistry>,
+    loot_registry: Arc<LootRegistry>,
 ) -> LiteralArgumentBuilder<LoweringSource> {
     let float: Command<LoweringSource> = Rc::new(|context| {
         context
@@ -1730,15 +1960,16 @@ fn compute_command_branch(
                 mode: ComputeMode::Integer,
             }))
     });
-    let provider = RequiredArgumentBuilder::argument(
-        "provider",
-        NumberProviderArgument::new(number_providers),
-    )
-    .executes(float)
-    .then(RequiredArgumentBuilder::argument("scale", FloatArgumentType::float()).executes(scaled))
-    .expect("a compute provider can contain a scale")
-    .then(LiteralArgumentBuilder::literal("integer").executes(integer))
-    .expect("a compute provider can contain the integer literal");
+    let provider =
+        RequiredArgumentBuilder::argument("provider", NumberProviderArgument::new(loot_registry))
+            .executes(float)
+            .then(
+                RequiredArgumentBuilder::argument("scale", FloatArgumentType::float())
+                    .executes(scaled),
+            )
+            .expect("a compute provider can contain a scale")
+            .then(LiteralArgumentBuilder::literal("integer").executes(integer))
+            .expect("a compute provider can contain the integer literal");
 
     LiteralArgumentBuilder::literal("compute")
         .then(
@@ -1751,9 +1982,7 @@ fn compute_command_branch(
 
 type ModifyOperationFactory = fn(&CommandContext<LoweringSource>) -> DataModifyOperation;
 
-fn data_command_branch(
-    number_providers: Arc<NumberProviderRegistry>,
-) -> LiteralArgumentBuilder<LoweringSource> {
+fn data_command_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuilder<LoweringSource> {
     let merge: Command<LoweringSource> = Rc::new(|context| {
         context
             .source()
@@ -1860,38 +2089,36 @@ fn data_command_branch(
                 .expect("data remove can contain storage"),
         )
         .expect("data can contain remove")
-        .then(data_modify_branch(number_providers))
+        .then(data_modify_branch(loot_registry))
         .expect("data can contain modify")
 }
 
-fn data_modify_branch(
-    number_providers: Arc<NumberProviderRegistry>,
-) -> LiteralArgumentBuilder<LoweringSource> {
+fn data_modify_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuilder<LoweringSource> {
     let target_path = RequiredArgumentBuilder::argument("targetPath", NbtPathArgument)
-        .then(modify_insert_branch(Arc::clone(&number_providers)))
+        .then(modify_insert_branch(Arc::clone(&loot_registry)))
         .expect("a modify target path can contain insert")
         .then(modify_operation_branch(
             "prepend",
             |_| DataModifyOperation::Insert(0),
-            Arc::clone(&number_providers),
+            Arc::clone(&loot_registry),
         ))
         .expect("a modify target path can contain prepend")
         .then(modify_operation_branch(
             "append",
             |_| DataModifyOperation::Insert(-1),
-            Arc::clone(&number_providers),
+            Arc::clone(&loot_registry),
         ))
         .expect("a modify target path can contain append")
         .then(modify_operation_branch(
             "set",
             |_| DataModifyOperation::Set,
-            Arc::clone(&number_providers),
+            Arc::clone(&loot_registry),
         ))
         .expect("a modify target path can contain set")
         .then(modify_operation_branch(
             "merge",
             |_| DataModifyOperation::Merge,
-            number_providers,
+            loot_registry,
         ))
         .expect("a modify target path can contain merge");
 
@@ -1909,7 +2136,7 @@ fn data_modify_branch(
 }
 
 fn modify_insert_branch(
-    number_providers: Arc<NumberProviderRegistry>,
+    loot_registry: Arc<LootRegistry>,
 ) -> LiteralArgumentBuilder<LoweringSource> {
     LiteralArgumentBuilder::literal("insert")
         .then(modify_sources(
@@ -1920,7 +2147,7 @@ fn modify_insert_branch(
                         .expect("insert sources are attached below the index argument"),
                 )
             },
-            number_providers,
+            loot_registry,
         ))
         .expect("insert can contain an index and source")
 }
@@ -1928,12 +2155,12 @@ fn modify_insert_branch(
 fn modify_operation_branch(
     literal: &'static str,
     operation: ModifyOperationFactory,
-    number_providers: Arc<NumberProviderRegistry>,
+    loot_registry: Arc<LootRegistry>,
 ) -> LiteralArgumentBuilder<LoweringSource> {
     match modify_sources(
         LiteralArgumentBuilder::literal(literal),
         operation,
-        number_providers,
+        loot_registry,
     ) {
         ArgumentBuilder::Literal(builder) => builder,
         ArgumentBuilder::Required(_) => unreachable!("a literal operation remains a literal"),
@@ -1943,7 +2170,7 @@ fn modify_operation_branch(
 fn modify_sources(
     parent: impl Into<ArgumentBuilder<LoweringSource>>,
     operation: ModifyOperationFactory,
-    number_providers: Arc<NumberProviderRegistry>,
+    loot_registry: Arc<LootRegistry>,
 ) -> ArgumentBuilder<LoweringSource> {
     parent
         .into()
@@ -1953,13 +2180,13 @@ fn modify_sources(
         .expect("a modify operation can contain a storage source")
         .then(modify_storage_source("string", operation, true))
         .expect("a modify operation can contain a string storage source")
-        .then(modify_compute_source(operation, number_providers))
+        .then(modify_compute_source(operation, loot_registry))
         .expect("a modify operation can contain a computed source")
 }
 
 fn modify_compute_source(
     operation: ModifyOperationFactory,
-    number_providers: Arc<NumberProviderRegistry>,
+    loot_registry: Arc<LootRegistry>,
 ) -> LiteralArgumentBuilder<LoweringSource> {
     let float: Command<LoweringSource> = Rc::new(move |context| {
         record_data_modify(
@@ -1981,13 +2208,11 @@ fn modify_compute_source(
             },
         )
     });
-    let provider = RequiredArgumentBuilder::argument(
-        "provider",
-        NumberProviderArgument::new(number_providers),
-    )
-    .executes(float)
-    .then(LiteralArgumentBuilder::literal("integer").executes(integer))
-    .expect("a data compute provider can contain the integer literal");
+    let provider =
+        RequiredArgumentBuilder::argument("provider", NumberProviderArgument::new(loot_registry))
+            .executes(float)
+            .then(LiteralArgumentBuilder::literal("integer").executes(integer))
+            .expect("a data compute provider can contain the integer literal");
 
     LiteralArgumentBuilder::literal("compute")
         .then(
@@ -2158,6 +2383,7 @@ fn execute_condition_branch(
     literal: &'static str,
     expected: bool,
     execute: worldless_brigadier::tree::Node<LoweringSource>,
+    loot_registry: Arc<LootRegistry>,
 ) -> LiteralArgumentBuilder<LoweringSource> {
     LiteralArgumentBuilder::literal(literal)
         .then(
@@ -2237,8 +2463,56 @@ fn execute_condition_branch(
                 .expect("the function literal can contain a function name"),
         )
         .expect("a conditional can contain the function literal")
+        .then(predicate_condition_branch(
+            expected,
+            execute.clone(),
+            loot_registry,
+        ))
+        .expect("a conditional can contain the predicate literal")
         .then(storage_data_condition_branch(expected, execute))
         .expect("a conditional can contain storage data")
+}
+
+fn predicate_condition_branch(
+    expected: bool,
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+    loot_registry: Arc<LootRegistry>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let terminal: Command<LoweringSource> = Rc::new(move |context| {
+        context
+            .source()
+            .record(CompiledCommand::PredicateCondition(predicate_condition(
+                context, expected,
+            )))
+    });
+    let modifier = Rc::new(move |context: &CommandContext<LoweringSource>| {
+        Ok(vec![Rc::new(context.source().with_modifier(
+            Modifier::PredicateCondition(predicate_condition(context, expected)),
+        ))])
+    });
+
+    LiteralArgumentBuilder::literal("predicate")
+        .then(
+            RequiredArgumentBuilder::argument("predicate", PredicateArgument::new(loot_registry))
+                .executes(terminal)
+                .fork(execute, modifier)
+                .expect("a complete predicate condition can redirect to execute"),
+        )
+        .expect("the predicate literal can contain a predicate")
+}
+
+fn predicate_condition(
+    context: &CommandContext<LoweringSource>,
+    expected: bool,
+) -> PredicateCondition {
+    let predicate = context
+        .argument::<PredicateReference>("predicate")
+        .map(|predicate| (*predicate).clone())
+        .expect("the predicate condition is attached below its predicate argument");
+    PredicateCondition {
+        expected,
+        predicate,
+    }
 }
 
 fn storage_data_condition_branch(
@@ -2627,11 +2901,11 @@ impl ArgumentType<LoweringSource> for StorageIdentifierArgument {
 
 #[derive(Clone)]
 struct NumberProviderArgument {
-    registry: Arc<NumberProviderRegistry>,
+    registry: Arc<LootRegistry>,
 }
 
 impl NumberProviderArgument {
-    fn new(registry: Arc<NumberProviderRegistry>) -> Self {
+    fn new(registry: Arc<LootRegistry>) -> Self {
         Self { registry }
     }
 }
@@ -2647,7 +2921,7 @@ impl ArgumentType<LoweringSource> for NumberProviderArgument {
         if reader.cursor() != start {
             let raw = reader.substring(start, reader.cursor());
             if let Some(identifier) = Identifier::parse(&raw) {
-                if self.registry.contains(&identifier) {
+                if self.registry.contains_number_provider(&identifier) {
                     return Ok(NumberProviderReference::Named(identifier));
                 }
                 return Err(SimpleCommandExceptionType::new(LiteralMessage::new(format!(
@@ -2659,7 +2933,7 @@ impl ArgumentType<LoweringSource> for NumberProviderArgument {
         }
 
         let value = parse_nbt_argument(reader, parse_tag)?;
-        parse_inline_tag(&value, &self.registry)
+        parse_inline_number_provider(&value, &self.registry)
             .map(|provider| NumberProviderReference::Inline(Box::new(provider)))
             .map_err(|reason| {
                 SimpleCommandExceptionType::new(LiteralMessage::new(reason))
@@ -2669,6 +2943,60 @@ impl ArgumentType<LoweringSource> for NumberProviderArgument {
 
     fn examples(&self) -> Vec<String> {
         ["foo", "foo:bar", "+1", "{type:constant,value:1}"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+#[derive(Clone)]
+struct PredicateArgument {
+    registry: Arc<LootRegistry>,
+}
+
+impl PredicateArgument {
+    fn new(registry: Arc<LootRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+impl ArgumentType<LoweringSource> for PredicateArgument {
+    type Value = PredicateReference;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let start = reader.cursor();
+        while reader.can_read() && is_allowed_in_identifier(reader.peek()) {
+            reader.skip();
+        }
+        if reader.cursor() != start {
+            let raw = reader.substring(start, reader.cursor());
+            if let Some(identifier) = Identifier::parse(&raw) {
+                if self.registry.contains_predicate(&identifier) {
+                    return Ok(PredicateReference::Named(identifier));
+                }
+                return Err(SimpleCommandExceptionType::new(LiteralMessage::new(format!(
+                    "predicate `{identifier}` does not exist or is outside Worldless scope"
+                )))
+                .create_with_context(reader));
+            }
+            reader.set_cursor(start);
+        }
+
+        let value = parse_nbt_argument(reader, parse_tag)?;
+        parse_inline_predicate(&value, &self.registry)
+            .map(|predicate| PredicateReference::Inline(Box::new(predicate)))
+            .map_err(|reason| {
+                SimpleCommandExceptionType::new(LiteralMessage::new(reason))
+                    .create_with_context(reader)
+            })
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["foo", "foo:bar", "012", "{type:all_of,terms:[]}"]
             .into_iter()
             .map(str::to_owned)
             .collect()

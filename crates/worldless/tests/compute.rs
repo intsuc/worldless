@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use worldless::{CompileError, ExecutionError, FunctionOutcome, LoadError, Vm};
+use worldless::{CompileError, ExecutionError, FunctionOutcome, Vm};
 
 const LIMIT: usize = 512;
 static NEXT_PACK: AtomicU64 = AtomicU64::new(0);
@@ -69,6 +69,8 @@ fn compile_with_tags(
         std::iter::empty::<(&str, &str)>(),
         providers.iter().copied(),
         provider_tags.iter().copied(),
+        std::iter::empty::<(&str, &str)>(),
+        std::iter::empty::<(&str, &str)>(),
     )
     .unwrap()
 }
@@ -126,6 +128,8 @@ fn resource_or_inline_parsing_is_identifier_first_and_modes_match_minecraft() {
 
     let error = Vm::from_resources(
         [("example:missing", "return run compute default 1\n")],
+        std::iter::empty::<(&str, &str)>(),
+        std::iter::empty::<(&str, &str)>(),
         std::iter::empty::<(&str, &str)>(),
         std::iter::empty::<(&str, &str)>(),
         std::iter::empty::<(&str, &str)>(),
@@ -666,19 +670,24 @@ fn directory_loader_reads_number_provider_resources_and_tags() {
 }
 
 #[test]
-fn directory_loader_rejects_an_override_of_the_vanilla_fast_cooking_predicate() {
+fn directory_loader_applies_a_worldless_override_of_the_fast_cooking_predicate() {
     let pack = TestPack::new();
-    let relative_path = "data/minecraft/predicate/block/fast_cooking.json";
-    pack.write(relative_path, r#"{"type":"minecraft:all_of","terms":[]}"#);
-    let expected_path = pack.root().join(relative_path);
+    pack.write(
+        "data/minecraft/predicate/block/fast_cooking.json",
+        r#"{"type":"minecraft:all_of","terms":[]}"#,
+    );
+    pack.write(
+        "data/example/function/burn_time.mcfunction",
+        "return run compute default minecraft:cooking/time_bamboo\n",
+    );
+    pack.write(
+        "data/example/function/speed.mcfunction",
+        "return run compute default minecraft:cooking/speed_default integer\n",
+    );
 
-    match Vm::load_directory(pack.root()).unwrap_err() {
-        LoadError::UnsupportedResource { path, reason } => {
-            assert_eq!(path, expected_path);
-            assert!(reason.contains("vanilla cooking number providers"));
-        }
-        error => panic!("expected an unsupported resource error, got {error}"),
-    }
+    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    assert_function(&mut vm, "example:burn_time", returned(true, 25));
+    assert_function(&mut vm, "example:speed", returned(true, 2));
 }
 
 #[test]
@@ -767,6 +776,8 @@ fn vanilla_number_providers_have_their_default_context_projection() {
         std::iter::empty::<(&str, &str)>(),
         std::iter::empty::<(&str, &str)>(),
         std::iter::empty::<(&str, &str)>(),
+        std::iter::empty::<(&str, &str)>(),
+        std::iter::empty::<(&str, &str)>(),
     )
     .unwrap();
 
@@ -795,12 +806,12 @@ fn invalid_references_shapes_and_out_of_scope_contexts_are_rejected() {
         (
             "example:conditional",
             r#"{"type":"conditional"}"#,
-            "loot-predicate subsystem",
+            "missing field `condition`",
         ),
         (
             "example:dispatcher_with_case",
             r#"{"type":"number_dispatcher","cases":[{"condition":"example:predicate","number_provider":1}],"default":0}"#,
-            "loot-predicate subsystem",
+            "does not exist",
         ),
         (
             "example:environment",
@@ -817,6 +828,8 @@ fn invalid_references_shapes_and_out_of_scope_contexts_are_rejected() {
             std::iter::empty::<(&str, &str)>(),
             std::iter::empty::<(&str, &str)>(),
             [(id, provider)],
+            std::iter::empty::<(&str, &str)>(),
+            std::iter::empty::<(&str, &str)>(),
             std::iter::empty::<(&str, &str)>(),
         )
         .unwrap_err();
@@ -841,6 +854,8 @@ fn invalid_references_shapes_and_out_of_scope_contexts_are_rejected() {
             ),
         ],
         std::iter::empty::<(&str, &str)>(),
+        std::iter::empty::<(&str, &str)>(),
+        std::iter::empty::<(&str, &str)>(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -856,6 +871,8 @@ fn invalid_references_shapes_and_out_of_scope_contexts_are_rejected() {
             r#"{"type":"sum","operands":"minecraft:cooking/time_bamboo"}"#,
         )],
         std::iter::empty::<(&str, &str)>(),
+        std::iter::empty::<(&str, &str)>(),
+        std::iter::empty::<(&str, &str)>(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -868,6 +885,8 @@ fn invalid_references_shapes_and_out_of_scope_contexts_are_rejected() {
         std::iter::empty::<(&str, &str)>(),
         std::iter::empty::<(&str, &str)>(),
         [("example:bad", r#"{"values":["example:missing"]}"#)],
+        std::iter::empty::<(&str, &str)>(),
+        std::iter::empty::<(&str, &str)>(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -883,6 +902,8 @@ fn invalid_references_shapes_and_out_of_scope_contexts_are_rejected() {
     ] {
         let error = Vm::from_resources(
             [("example:invalid", source)],
+            std::iter::empty::<(&str, &str)>(),
+            std::iter::empty::<(&str, &str)>(),
             std::iter::empty::<(&str, &str)>(),
             std::iter::empty::<(&str, &str)>(),
             std::iter::empty::<(&str, &str)>(),

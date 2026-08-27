@@ -4,6 +4,10 @@ use serde_json::Value;
 
 use crate::{
     nbt::{CommandStorage, JavaString, NbtPath, Tag},
+    predicate::{
+        LootPredicate, PredicateReference, PredicateSet, builtin_predicates,
+        parse_reference as parse_predicate_reference,
+    },
     program::Scoreboard,
     resource::Identifier,
     resource_json,
@@ -41,9 +45,11 @@ pub(crate) enum NumberProvider {
     Maximum(NumberProviderSet),
     Average(NumberProviderSet),
     NumberDispatcher {
+        cases: Vec<NumberDispatcherCase>,
         default: NumberProviderReference,
     },
-    DefaultContextConditional {
+    Conditional {
+        condition: PredicateReference,
         on_true: NumberProviderReference,
         on_false: NumberProviderReference,
     },
@@ -61,8 +67,14 @@ pub(crate) enum NumberProviderSet {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WeightedProvider {
-    provider: NumberProviderReference,
-    weight: i32,
+    pub(crate) provider: NumberProviderReference,
+    pub(crate) weight: i32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct NumberDispatcherCase {
+    pub(crate) condition: PredicateReference,
+    pub(crate) number_provider: NumberProviderReference,
 }
 
 #[derive(Debug)]
@@ -91,7 +103,7 @@ impl LegacyRandom {
         (self.seed >> (48 - bits)) as i32
     }
 
-    fn next_float(&mut self) -> f32 {
+    pub(crate) fn next_float(&mut self) -> f32 {
         self.next_bits(24) as f32 * 5.960_464_5e-8
     }
 
@@ -122,42 +134,80 @@ impl Default for LegacyRandom {
 }
 
 #[derive(Debug)]
-pub(crate) struct NumberProviderRegistry {
+pub(crate) struct LootRegistry {
     providers: HashMap<Identifier, NumberProvider>,
-    tags: HashMap<Identifier, Vec<Identifier>>,
+    provider_tags: HashMap<Identifier, Vec<Identifier>>,
+    predicates: HashMap<Identifier, LootPredicate>,
+    predicate_tags: HashMap<Identifier, Vec<Identifier>>,
 }
 
-impl NumberProviderRegistry {
+impl LootRegistry {
     pub(crate) fn new(
         providers: HashMap<Identifier, NumberProvider>,
-        tags: HashMap<Identifier, Vec<Identifier>>,
+        provider_tags: HashMap<Identifier, Vec<Identifier>>,
+        predicates: HashMap<Identifier, LootPredicate>,
+        predicate_tags: HashMap<Identifier, Vec<Identifier>>,
     ) -> Result<Self, RegistryValidationError> {
+        let user_resources = providers
+            .keys()
+            .cloned()
+            .map(RegistryResource::NumberProvider)
+            .chain(predicates.keys().cloned().map(RegistryResource::Predicate))
+            .collect::<HashSet<_>>();
         let mut all_providers = builtin_providers();
         all_providers.extend(providers);
+        let mut all_predicates = builtin_predicates();
+        all_predicates.extend(predicates);
         let registry = Self {
             providers: all_providers,
-            tags,
+            provider_tags,
+            predicates: all_predicates,
+            predicate_tags,
         };
-        registry.validate()?;
+        registry.validate(&user_resources)?;
         Ok(registry)
     }
 
     pub(crate) fn empty() -> Self {
-        Self::new(HashMap::new(), HashMap::new())
-            .expect("the supported built-in number providers are valid")
+        Self::new(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .expect("the supported built-in loot resources are valid")
     }
 
-    pub(crate) fn contains(&self, id: &Identifier) -> bool {
+    pub(crate) fn contains_number_provider(&self, id: &Identifier) -> bool {
         self.providers.contains_key(id)
     }
 
-    pub(crate) fn provider_ids(&self) -> HashSet<Identifier> {
+    pub(crate) fn number_provider_ids(&self) -> HashSet<Identifier> {
         self.providers.keys().cloned().collect()
     }
 
-    pub(crate) fn validate_inline(&self, provider: &NumberProvider) -> Result<(), String> {
+    pub(crate) fn contains_predicate(&self, id: &Identifier) -> bool {
+        self.predicates.contains_key(id)
+    }
+
+    pub(crate) fn predicate_ids(&self) -> HashSet<Identifier> {
+        self.predicates.keys().cloned().collect()
+    }
+
+    pub(crate) fn validate_inline_number_provider(
+        &self,
+        provider: &NumberProvider,
+    ) -> Result<(), String> {
         let mut dependencies = Vec::new();
-        self.collect_dependencies(provider, &mut dependencies)
+        self.collect_number_provider_dependencies(provider, &mut dependencies)
+    }
+
+    pub(crate) fn validate_inline_predicate(
+        &self,
+        predicate: &LootPredicate,
+    ) -> Result<(), String> {
+        let mut dependencies = Vec::new();
+        self.collect_predicate_dependencies(predicate, &mut dependencies)
     }
 
     pub(crate) fn get_float(
@@ -167,7 +217,7 @@ impl NumberProviderRegistry {
         command_storage: &CommandStorage,
         random: &mut LegacyRandom,
     ) -> Result<f32, String> {
-        self.resolve(provider)
+        self.resolve_number_provider(provider)
             .get_float(self, scoreboard, command_storage, random)
     }
 
@@ -178,11 +228,14 @@ impl NumberProviderRegistry {
         command_storage: &CommandStorage,
         random: &mut LegacyRandom,
     ) -> Result<i32, String> {
-        self.resolve(provider)
+        self.resolve_number_provider(provider)
             .get_int(self, scoreboard, command_storage, random)
     }
 
-    fn resolve<'a>(&'a self, provider: &'a NumberProviderReference) -> &'a NumberProvider {
+    pub(crate) fn resolve_number_provider<'a>(
+        &'a self,
+        provider: &'a NumberProviderReference,
+    ) -> &'a NumberProvider {
         match provider {
             NumberProviderReference::Named(id) => self
                 .providers
@@ -192,16 +245,18 @@ impl NumberProviderRegistry {
         }
     }
 
-    fn values<'a>(
+    fn number_provider_values<'a>(
         &'a self,
         providers: &'a NumberProviderSet,
     ) -> Box<dyn Iterator<Item = &'a NumberProvider> + 'a> {
         match providers {
-            NumberProviderSet::Direct(providers) => {
-                Box::new(providers.iter().map(|provider| self.resolve(provider)))
-            }
+            NumberProviderSet::Direct(providers) => Box::new(
+                providers
+                    .iter()
+                    .map(|provider| self.resolve_number_provider(provider)),
+            ),
             NumberProviderSet::Tag(tag) => Box::new(
-                self.tags
+                self.provider_tags
                     .get(tag)
                     .expect("number provider tags are validated before execution")
                     .iter()
@@ -214,60 +269,130 @@ impl NumberProviderRegistry {
         }
     }
 
-    fn validate(&self) -> Result<(), RegistryValidationError> {
+    pub(crate) fn resolve_predicate<'a>(
+        &'a self,
+        predicate: &'a PredicateReference,
+    ) -> &'a LootPredicate {
+        match predicate {
+            PredicateReference::Named(id) => self
+                .predicates
+                .get(id)
+                .expect("predicate references are validated before execution"),
+            PredicateReference::Inline(predicate) => predicate,
+        }
+    }
+
+    pub(crate) fn predicate_values<'a>(
+        &'a self,
+        predicates: &'a PredicateSet,
+    ) -> Box<dyn Iterator<Item = &'a LootPredicate> + 'a> {
+        match predicates {
+            PredicateSet::Direct(predicates) => Box::new(
+                predicates
+                    .iter()
+                    .map(|predicate| self.resolve_predicate(predicate)),
+            ),
+            PredicateSet::Tag(tag) => Box::new(
+                self.predicate_tags
+                    .get(tag)
+                    .expect("predicate tags are validated before execution")
+                    .iter()
+                    .map(|id| {
+                        self.predicates
+                            .get(id)
+                            .expect("predicate tags contain validated predicates")
+                    }),
+            ),
+        }
+    }
+
+    pub(crate) fn test_predicate(
+        &self,
+        predicate: &PredicateReference,
+        scoreboard: &Scoreboard,
+        command_storage: &CommandStorage,
+        random: &mut LegacyRandom,
+    ) -> Result<bool, String> {
+        self.resolve_predicate(predicate)
+            .test(self, scoreboard, command_storage, random)
+    }
+
+    fn validate(
+        &self,
+        user_resources: &HashSet<RegistryResource>,
+    ) -> Result<(), RegistryValidationError> {
         let mut graph = HashMap::new();
-        let mut ids = self.providers.keys().cloned().collect::<Vec<_>>();
-        ids.sort_by_key(ToString::to_string);
-        for id in &ids {
-            let mut dependencies = Vec::new();
-            self.collect_dependencies(
-                self.providers
-                    .get(id)
-                    .expect("the identifier came from the provider map"),
-                &mut dependencies,
+        let mut resources = self
+            .providers
+            .keys()
+            .cloned()
+            .map(RegistryResource::NumberProvider)
+            .chain(
+                self.predicates
+                    .keys()
+                    .cloned()
+                    .map(RegistryResource::Predicate),
             )
+            .collect::<Vec<_>>();
+        resources.sort_by_key(RegistryResource::sort_key);
+        for resource in &resources {
+            let mut dependencies = Vec::new();
+            match resource {
+                RegistryResource::NumberProvider(id) => self.collect_number_provider_dependencies(
+                    self.providers
+                        .get(id)
+                        .expect("the identifier came from the provider map"),
+                    &mut dependencies,
+                ),
+                RegistryResource::Predicate(id) => self.collect_predicate_dependencies(
+                    self.predicates
+                        .get(id)
+                        .expect("the identifier came from the predicate map"),
+                    &mut dependencies,
+                ),
+            }
             .map_err(|reason| RegistryValidationError {
-                provider: id.clone(),
+                resource: resource.clone(),
                 reason,
             })?;
-            dependencies.sort_by_key(ToString::to_string);
+            dependencies.sort_by_key(RegistryResource::sort_key);
             dependencies.dedup();
-            graph.insert(id.clone(), dependencies);
+            graph.insert(resource.clone(), dependencies);
         }
 
         let mut remaining = graph
             .iter()
-            .map(|(id, dependencies)| (id.clone(), dependencies.len()))
+            .map(|(resource, dependencies)| (resource.clone(), dependencies.len()))
             .collect::<HashMap<_, _>>();
-        let mut dependents = ids
+        let mut dependents = resources
             .iter()
             .cloned()
-            .map(|id| (id, Vec::new()))
+            .map(|resource| (resource, Vec::new()))
             .collect::<HashMap<_, _>>();
-        for (id, dependencies) in &graph {
+        for (resource, dependencies) in &graph {
             for dependency in dependencies {
                 dependents
                     .get_mut(dependency)
-                    .expect("all provider dependencies are validated")
-                    .push(id.clone());
+                    .expect("all loot resource dependencies are validated")
+                    .push(resource.clone());
             }
         }
 
-        let mut ready = ids
+        let mut ready = resources
             .iter()
-            .filter(|id| remaining.get(*id) == Some(&0))
+            .filter(|resource| remaining.get(*resource) == Some(&0))
             .cloned()
             .collect::<Vec<_>>();
         let mut next = 0;
-        while let Some(id) = ready.get(next).cloned() {
+        while let Some(resource) = ready.get(next).cloned() {
             next += 1;
             for dependent in dependents
-                .get(&id)
-                .expect("every provider owns a dependents list")
+                .get(&resource)
+                .expect("every loot resource owns a dependents list")
             {
                 let count = remaining
                     .get_mut(dependent)
-                    .expect("every dependent is a provider");
+                    .expect("every dependent is a loot resource");
                 *count -= 1;
                 if *count == 0 {
                     ready.push(dependent.clone());
@@ -275,23 +400,33 @@ impl NumberProviderRegistry {
             }
         }
 
-        if ready.len() != ids.len() {
-            let provider = ids
+        if ready.len() != resources.len() {
+            let resource = resources
                 .into_iter()
-                .find(|id| remaining.get(id).is_some_and(|count| *count != 0))
-                .expect("a cyclic graph retains at least one provider");
+                .filter(|resource| user_resources.contains(resource))
+                .find(|resource| remaining.get(resource).is_some_and(|count| *count != 0))
+                .or_else(|| {
+                    remaining
+                        .iter()
+                        .find_map(|(resource, count)| (*count != 0).then(|| resource.clone()))
+                })
+                .expect("a cyclic graph retains at least one loot resource");
             return Err(RegistryValidationError {
-                provider: provider.clone(),
-                reason: format!("cyclic number provider reference involving `{provider}`"),
+                reason: format!(
+                    "cyclic loot resource reference involving {} `{}`",
+                    resource.kind(),
+                    resource.id()
+                ),
+                resource,
             });
         }
         Ok(())
     }
 
-    fn collect_dependencies(
+    fn collect_number_provider_dependencies(
         &self,
         provider: &NumberProvider,
-        dependencies: &mut Vec<Identifier>,
+        dependencies: &mut Vec<RegistryResource>,
     ) -> Result<(), String> {
         let providers = match provider {
             NumberProvider::Sum(providers)
@@ -303,60 +438,137 @@ impl NumberProviderRegistry {
             | NumberProvider::Storage { .. }
             | NumberProvider::Score { .. } => return Ok(()),
             NumberProvider::Uniform { min, max } => {
-                self.collect_reference_dependencies(min, dependencies)?;
-                return self.collect_reference_dependencies(max, dependencies);
+                self.collect_number_provider_reference_dependencies(min, dependencies)?;
+                return self.collect_number_provider_reference_dependencies(max, dependencies);
             }
             NumberProvider::Binomial { n, p } => {
-                self.collect_reference_dependencies(n, dependencies)?;
-                return self.collect_reference_dependencies(p, dependencies);
+                self.collect_number_provider_reference_dependencies(n, dependencies)?;
+                return self.collect_number_provider_reference_dependencies(p, dependencies);
             }
             NumberProvider::WeightedList { distribution, .. } => {
                 for entry in distribution {
-                    self.collect_reference_dependencies(&entry.provider, dependencies)?;
+                    self.collect_number_provider_reference_dependencies(
+                        &entry.provider,
+                        dependencies,
+                    )?;
                 }
                 return Ok(());
             }
-            NumberProvider::NumberDispatcher { default } => {
-                return self.collect_reference_dependencies(default, dependencies);
+            NumberProvider::NumberDispatcher { cases, default } => {
+                for case in cases {
+                    self.collect_predicate_reference_dependencies(&case.condition, dependencies)?;
+                    self.collect_number_provider_reference_dependencies(
+                        &case.number_provider,
+                        dependencies,
+                    )?;
+                }
+                return self.collect_number_provider_reference_dependencies(default, dependencies);
             }
-            NumberProvider::DefaultContextConditional { on_true, on_false } => {
-                self.collect_reference_dependencies(on_true, dependencies)?;
-                return self.collect_reference_dependencies(on_false, dependencies);
+            NumberProvider::Conditional {
+                condition,
+                on_true,
+                on_false,
+            } => {
+                self.collect_predicate_reference_dependencies(condition, dependencies)?;
+                self.collect_number_provider_reference_dependencies(on_true, dependencies)?;
+                return self.collect_number_provider_reference_dependencies(on_false, dependencies);
             }
         };
 
         match providers {
             NumberProviderSet::Direct(values) => {
                 for value in values {
-                    self.collect_reference_dependencies(value, dependencies)?;
+                    self.collect_number_provider_reference_dependencies(value, dependencies)?;
                 }
             }
             NumberProviderSet::Tag(tag) => {
                 let values = self
-                    .tags
+                    .provider_tags
                     .get(tag)
                     .ok_or_else(|| format!("number provider tag `#{tag}` does not exist"))?;
-                dependencies.extend(values.iter().cloned());
+                dependencies.extend(values.iter().cloned().map(RegistryResource::NumberProvider));
             }
         }
         Ok(())
     }
 
-    fn collect_reference_dependencies(
+    fn collect_predicate_dependencies(
+        &self,
+        predicate: &LootPredicate,
+        dependencies: &mut Vec<RegistryResource>,
+    ) -> Result<(), String> {
+        match predicate {
+            LootPredicate::AllOf(predicates) | LootPredicate::AnyOf(predicates) => {
+                match predicates {
+                    PredicateSet::Direct(values) => {
+                        for value in values {
+                            self.collect_predicate_reference_dependencies(value, dependencies)?;
+                        }
+                    }
+                    PredicateSet::Tag(tag) => {
+                        let values = self
+                            .predicate_tags
+                            .get(tag)
+                            .ok_or_else(|| format!("predicate tag `#{tag}` does not exist"))?;
+                        dependencies
+                            .extend(values.iter().cloned().map(RegistryResource::Predicate));
+                    }
+                }
+                Ok(())
+            }
+            LootPredicate::Inverted(predicate) => {
+                self.collect_predicate_reference_dependencies(predicate, dependencies)
+            }
+            LootPredicate::RandomChance { chance } => {
+                self.collect_number_provider_reference_dependencies(chance, dependencies)
+            }
+            LootPredicate::ValueCheck { value, range } => {
+                self.collect_number_provider_reference_dependencies(value, dependencies)?;
+                if let Some(min) = &range.min {
+                    self.collect_number_provider_reference_dependencies(min, dependencies)?;
+                }
+                if let Some(max) = &range.max {
+                    self.collect_number_provider_reference_dependencies(max, dependencies)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn collect_number_provider_reference_dependencies(
         &self,
         provider: &NumberProviderReference,
-        dependencies: &mut Vec<Identifier>,
+        dependencies: &mut Vec<RegistryResource>,
     ) -> Result<(), String> {
         match provider {
             NumberProviderReference::Named(id) => {
                 if !self.providers.contains_key(id) {
                     return Err(format!("number provider `{id}` does not exist"));
                 }
-                dependencies.push(id.clone());
+                dependencies.push(RegistryResource::NumberProvider(id.clone()));
                 Ok(())
             }
             NumberProviderReference::Inline(provider) => {
-                self.collect_dependencies(provider, dependencies)
+                self.collect_number_provider_dependencies(provider, dependencies)
+            }
+        }
+    }
+
+    fn collect_predicate_reference_dependencies(
+        &self,
+        predicate: &PredicateReference,
+        dependencies: &mut Vec<RegistryResource>,
+    ) -> Result<(), String> {
+        match predicate {
+            PredicateReference::Named(id) => {
+                if !self.predicates.contains_key(id) {
+                    return Err(format!("predicate `{id}` does not exist"));
+                }
+                dependencies.push(RegistryResource::Predicate(id.clone()));
+                Ok(())
+            }
+            PredicateReference::Inline(predicate) => {
+                self.collect_predicate_dependencies(predicate, dependencies)
             }
         }
     }
@@ -365,7 +577,7 @@ impl NumberProviderRegistry {
 impl NumberProvider {
     fn get_float(
         &self,
-        registry: &NumberProviderRegistry,
+        registry: &LootRegistry,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
         random: &mut LegacyRandom,
@@ -373,13 +585,13 @@ impl NumberProvider {
         match self {
             Self::Constant(value) => Ok(*value),
             Self::Uniform { min, max } => {
-                let min = registry.resolve(min).get_float(
+                let min = registry.resolve_number_provider(min).get_float(
                     registry,
                     scoreboard,
                     command_storage,
                     random,
                 )?;
-                let max = registry.resolve(max).get_float(
+                let max = registry.resolve_number_provider(max).get_float(
                     registry,
                     scoreboard,
                     command_storage,
@@ -407,21 +619,21 @@ impl NumberProvider {
                 .map_or(0.0, |value| value as f32 * *scale)),
             Self::Sum(providers) => {
                 let mut value = 0.0;
-                for provider in registry.values(providers) {
+                for provider in registry.number_provider_values(providers) {
                     value += provider.get_float(registry, scoreboard, command_storage, random)?;
                 }
                 Ok(value)
             }
             Self::Product(providers) => {
                 let mut value = 1.0;
-                for provider in registry.values(providers) {
+                for provider in registry.number_provider_values(providers) {
                     value *= provider.get_float(registry, scoreboard, command_storage, random)?;
                 }
                 Ok(value)
             }
             Self::Minimum(providers) => {
                 let mut value = f32::MAX;
-                for provider in registry.values(providers) {
+                for provider in registry.number_provider_values(providers) {
                     value = java_min(
                         value,
                         provider.get_float(registry, scoreboard, command_storage, random)?,
@@ -431,7 +643,7 @@ impl NumberProvider {
             }
             Self::Maximum(providers) => {
                 let mut value = -f32::MAX;
-                for provider in registry.values(providers) {
+                for provider in registry.number_provider_values(providers) {
                     value = java_max(
                         value,
                         provider.get_float(registry, scoreboard, command_storage, random)?,
@@ -442,50 +654,87 @@ impl NumberProvider {
             Self::Average(providers) => {
                 let mut sum = 0.0_f32;
                 let mut count = 0_u32;
-                for provider in registry.values(providers) {
+                for provider in registry.number_provider_values(providers) {
                     sum += provider.get_float(registry, scoreboard, command_storage, random)?;
                     count += 1;
                 }
                 Ok(if count == 0 { 0.0 } else { sum / count as f32 })
             }
-            Self::NumberDispatcher { default } => {
-                registry
-                    .resolve(default)
-                    .get_float(registry, scoreboard, command_storage, random)
+            Self::NumberDispatcher { cases, default } => {
+                let mut selected = default;
+                for case in cases {
+                    if registry.test_predicate(
+                        &case.condition,
+                        scoreboard,
+                        command_storage,
+                        random,
+                    )? {
+                        selected = &case.number_provider;
+                        break;
+                    }
+                }
+                registry.resolve_number_provider(selected).get_float(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    random,
+                )
             }
-            Self::DefaultContextConditional { on_false, .. } => registry
-                .resolve(on_false)
-                .get_float(registry, scoreboard, command_storage, random),
+            Self::Conditional {
+                condition,
+                on_true,
+                on_false,
+            } => {
+                let selected =
+                    if registry.test_predicate(condition, scoreboard, command_storage, random)? {
+                        on_true
+                    } else {
+                        on_false
+                    };
+                registry.resolve_number_provider(selected).get_float(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    random,
+                )
+            }
             Self::WeightedList {
                 distribution,
                 total_weight,
             } => {
                 let selected = random.next_int(*total_weight)?;
                 let provider = select_weighted(distribution, selected);
-                registry
-                    .resolve(provider)
-                    .get_float(registry, scoreboard, command_storage, random)
+                registry.resolve_number_provider(provider).get_float(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    random,
+                )
             }
         }
     }
 
     fn get_int(
         &self,
-        registry: &NumberProviderRegistry,
+        registry: &LootRegistry,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
         random: &mut LegacyRandom,
     ) -> Result<i32, String> {
         match self {
             Self::Uniform { min, max } => {
-                let min =
-                    registry
-                        .resolve(min)
-                        .get_int(registry, scoreboard, command_storage, random)?;
-                let max =
-                    registry
-                        .resolve(max)
-                        .get_int(registry, scoreboard, command_storage, random)?;
+                let min = registry.resolve_number_provider(min).get_int(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    random,
+                )?;
+                let max = registry.resolve_number_provider(max).get_int(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    random,
+                )?;
                 if min >= max {
                     Ok(min)
                 } else {
@@ -494,14 +743,18 @@ impl NumberProvider {
                 }
             }
             Self::Binomial { n, p } => {
-                let n =
-                    registry
-                        .resolve(n)
-                        .get_int(registry, scoreboard, command_storage, random)?;
-                let p =
-                    registry
-                        .resolve(p)
-                        .get_float(registry, scoreboard, command_storage, random)?;
+                let n = registry.resolve_number_provider(n).get_int(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    random,
+                )?;
+                let p = registry.resolve_number_provider(p).get_float(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    random,
+                )?;
                 let mut result = 0;
                 for _ in 0..n.max(0) {
                     if random.next_float() < p {
@@ -516,7 +769,7 @@ impl NumberProvider {
                 .unwrap_or(0)),
             Self::Sum(providers) => {
                 let mut value = 0_i64;
-                for provider in registry.values(providers) {
+                for provider in registry.number_provider_values(providers) {
                     value = value.wrapping_add(i64::from(provider.get_int(
                         registry,
                         scoreboard,
@@ -528,7 +781,7 @@ impl NumberProvider {
             }
             Self::Product(providers) => {
                 let mut value = 1_i64;
-                for provider in registry.values(providers) {
+                for provider in registry.number_provider_values(providers) {
                     value = value.wrapping_mul(i64::from(provider.get_int(
                         registry,
                         scoreboard,
@@ -540,7 +793,7 @@ impl NumberProvider {
             }
             Self::Minimum(providers) => {
                 let mut value = i32::MAX;
-                for provider in registry.values(providers) {
+                for provider in registry.number_provider_values(providers) {
                     value = value.min(provider.get_int(
                         registry,
                         scoreboard,
@@ -552,7 +805,7 @@ impl NumberProvider {
             }
             Self::Maximum(providers) => {
                 let mut value = -i32::MAX;
-                for provider in registry.values(providers) {
+                for provider in registry.number_provider_values(providers) {
                     value = value.max(provider.get_int(
                         registry,
                         scoreboard,
@@ -565,7 +818,7 @@ impl NumberProvider {
             Self::Average(providers) => {
                 let mut sum = 0_i64;
                 let mut count = 0_i64;
-                for provider in registry.values(providers) {
+                for provider in registry.number_provider_values(providers) {
                     sum = sum.wrapping_add(i64::from(provider.get_int(
                         registry,
                         scoreboard,
@@ -580,15 +833,43 @@ impl NumberProvider {
                     Ok(saturated_i64_to_i32(sum / count))
                 }
             }
-            Self::NumberDispatcher { default } => {
-                registry
-                    .resolve(default)
-                    .get_int(registry, scoreboard, command_storage, random)
+            Self::NumberDispatcher { cases, default } => {
+                let mut selected = default;
+                for case in cases {
+                    if registry.test_predicate(
+                        &case.condition,
+                        scoreboard,
+                        command_storage,
+                        random,
+                    )? {
+                        selected = &case.number_provider;
+                        break;
+                    }
+                }
+                registry.resolve_number_provider(selected).get_int(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    random,
+                )
             }
-            Self::DefaultContextConditional { on_false, .. } => {
-                registry
-                    .resolve(on_false)
-                    .get_int(registry, scoreboard, command_storage, random)
+            Self::Conditional {
+                condition,
+                on_true,
+                on_false,
+            } => {
+                let selected =
+                    if registry.test_predicate(condition, scoreboard, command_storage, random)? {
+                        on_true
+                    } else {
+                        on_false
+                    };
+                registry.resolve_number_provider(selected).get_int(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    random,
+                )
             }
             Self::WeightedList {
                 distribution,
@@ -596,9 +877,12 @@ impl NumberProvider {
             } => {
                 let selected = random.next_int(*total_weight)?;
                 let provider = select_weighted(distribution, selected);
-                registry
-                    .resolve(provider)
-                    .get_int(registry, scoreboard, command_storage, random)
+                registry.resolve_number_provider(provider).get_int(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    random,
+                )
             }
             Self::Constant(_) | Self::Score { .. } => self
                 .get_float(registry, scoreboard, command_storage, random)
@@ -620,9 +904,37 @@ fn select_weighted(
     unreachable!("weighted provider selection is below the validated total weight")
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RegistryResource {
+    NumberProvider(Identifier),
+    Predicate(Identifier),
+}
+
+impl RegistryResource {
+    fn sort_key(&self) -> (u8, String) {
+        match self {
+            Self::NumberProvider(id) => (0, id.to_string()),
+            Self::Predicate(id) => (1, id.to_string()),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::NumberProvider(_) => "number provider",
+            Self::Predicate(_) => "predicate",
+        }
+    }
+
+    pub(crate) fn id(&self) -> &Identifier {
+        match self {
+            Self::NumberProvider(id) | Self::Predicate(id) => id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RegistryValidationError {
-    pub(crate) provider: Identifier,
+    pub(crate) resource: RegistryResource,
     pub(crate) reason: String,
 }
 
@@ -633,10 +945,10 @@ pub(crate) fn parse_json(contents: &str) -> Result<NumberProvider, String> {
 
 pub(crate) fn parse_inline_tag(
     value: &Tag,
-    registry: &NumberProviderRegistry,
+    registry: &LootRegistry,
 ) -> Result<NumberProvider, String> {
     let provider = parse_direct(Input::Nbt(value), "provider")?;
-    registry.validate_inline(&provider)?;
+    registry.validate_inline_number_provider(&provider)?;
     Ok(provider)
 }
 
@@ -689,9 +1001,7 @@ fn parse_direct(input: Input<'_>, path: &str) -> Result<NumberProvider, String> 
         )?)),
         "weighted_list" => parse_weighted_list(input, path),
         "number_dispatcher" => parse_number_dispatcher(input, path),
-        "conditional" => Err(format!(
-            "number provider type `{provider_type}` requires the unsupported loot-predicate subsystem"
-        )),
+        "conditional" => parse_conditional(input, path),
         "enchantment_level" | "environment_attribute" => Err(format!(
             "number provider type `{provider_type}` depends on a physical-world loot context"
         )),
@@ -706,20 +1016,55 @@ fn parse_number_dispatcher(input: Input<'_>, path: &str) -> Result<NumberProvide
     let cases = required_field(input, path, "cases")?
         .list()
         .ok_or_else(|| format!("`{cases_path}` must be a list"))?;
-    if !cases.is_empty() {
-        return Err(format!(
-            "`{cases_path}` requires the unsupported loot-predicate subsystem"
-        ));
+    let mut parsed_cases = Vec::with_capacity(cases.len());
+    for (index, case) in cases.into_iter().enumerate() {
+        let case_path = format!("{cases_path}[{index}]");
+        if !case.is_object() {
+            return Err(format!("`{case_path}` must be an object"));
+        }
+        parsed_cases.push(NumberDispatcherCase {
+            condition: parse_predicate_reference(
+                required_field(case, &case_path, "condition")?,
+                &format!("{case_path}.condition"),
+            )?,
+            number_provider: parse_reference(
+                required_field(case, &case_path, "number_provider")?,
+                &format!("{case_path}.number_provider"),
+            )?,
+        });
     }
     let default = input.field("default").map_or_else(
-        || {
-            Ok(NumberProviderReference::Inline(Box::new(
-                NumberProvider::Constant(0.0),
-            )))
-        },
+        || Ok(constant_zero_reference()),
         |default| parse_reference(default, &format!("{path}.default")),
     )?;
-    Ok(NumberProvider::NumberDispatcher { default })
+    Ok(NumberProvider::NumberDispatcher {
+        cases: parsed_cases,
+        default,
+    })
+}
+
+fn parse_conditional(input: Input<'_>, path: &str) -> Result<NumberProvider, String> {
+    let condition = parse_predicate_reference(
+        required_field(input, path, "condition")?,
+        &format!("{path}.condition"),
+    )?;
+    let on_true = parse_reference(
+        required_field(input, path, "on_true")?,
+        &format!("{path}.on_true"),
+    )?;
+    let on_false = input.field("on_false").map_or_else(
+        || Ok(constant_zero_reference()),
+        |value| parse_reference(value, &format!("{path}.on_false")),
+    )?;
+    Ok(NumberProvider::Conditional {
+        condition,
+        on_true,
+        on_false,
+    })
+}
+
+fn constant_zero_reference() -> NumberProviderReference {
+    NumberProviderReference::Inline(Box::new(NumberProvider::Constant(0.0)))
 }
 
 fn parse_weighted_list(input: Input<'_>, path: &str) -> Result<NumberProvider, String> {
@@ -783,7 +1128,10 @@ fn provider_set_field(
     Ok(NumberProviderSet::Direct(providers))
 }
 
-fn parse_reference(input: Input<'_>, path: &str) -> Result<NumberProviderReference, String> {
+pub(crate) fn parse_reference(
+    input: Input<'_>,
+    path: &str,
+) -> Result<NumberProviderReference, String> {
     if let Some(value) = input.string() {
         let value = ascii_string(&value, path)?;
         let id = Identifier::parse(&value)
@@ -824,7 +1172,11 @@ fn fixed_score_holder(input: Input<'_>, path: &str) -> Result<JavaString, String
     string_field(target, &target_path, "name")
 }
 
-fn required_field<'a>(input: Input<'a>, path: &str, field: &str) -> Result<Input<'a>, String> {
+pub(crate) fn required_field<'a>(
+    input: Input<'a>,
+    path: &str,
+    field: &str,
+) -> Result<Input<'a>, String> {
     input
         .field(field)
         .ok_or_else(|| format!("`{path}` is missing field `{field}`"))
@@ -837,7 +1189,11 @@ fn string_field(input: Input<'_>, path: &str, field: &str) -> Result<JavaString,
         .ok_or_else(|| format!("`{field_path}` must be a string"))
 }
 
-fn identifier_field(input: Input<'_>, path: &str, field: &str) -> Result<Identifier, String> {
+pub(crate) fn identifier_field(
+    input: Input<'_>,
+    path: &str,
+    field: &str,
+) -> Result<Identifier, String> {
     let field_path = format!("{path}.{field}");
     let value = string_field(input, path, field)?;
     let value = ascii_string(&value, &field_path)?;
@@ -854,16 +1210,20 @@ fn float_field(input: Input<'_>, path: &str, field: &str) -> Result<f32, String>
 
 fn int_field(input: Input<'_>, path: &str, field: &str) -> Result<i32, String> {
     let field_path = format!("{path}.{field}");
-    match required_field(input, path, field)? {
+    int_value(required_field(input, path, field)?, &field_path)
+}
+
+pub(crate) fn int_value(input: Input<'_>, path: &str) -> Result<i32, String> {
+    match input {
         Input::Json(Value::Number(value)) => crate::loader::java_number_to_i32(value)
-            .map_err(|reason| format!("invalid `{field_path}`: {reason}")),
+            .map_err(|reason| format!("invalid `{path}`: {reason}")),
         Input::Nbt(value) => {
-            tag_boxed_int_value(value).ok_or_else(|| format!("`{field_path}` must be a number"))
+            tag_boxed_int_value(value).ok_or_else(|| format!("`{path}` must be a number"))
         }
         Input::NbtByte(value) => Ok(i32::from(value)),
         Input::NbtInt(value) => Ok(value),
         Input::NbtLong(value) => Ok(value as i32),
-        Input::Json(_) => Err(format!("`{field_path}` must be a number")),
+        Input::Json(_) => Err(format!("`{path}` must be a number")),
     }
 }
 
@@ -885,7 +1245,7 @@ fn nbt_path_field(input: Input<'_>, path: &str, field: &str) -> Result<NbtPath, 
         .map_err(|reason| format!("invalid NBT path in `{field_path}`: {reason}"))
 }
 
-fn ascii_string(value: &JavaString, path: &str) -> Result<String, String> {
+pub(crate) fn ascii_string(value: &JavaString, path: &str) -> Result<String, String> {
     if !value.units().iter().all(|unit| *unit <= 0x7f) {
         return Err(format!("`{path}` must contain an ASCII identifier"));
     }
@@ -897,7 +1257,7 @@ fn ascii_string(value: &JavaString, path: &str) -> Result<String, String> {
 }
 
 #[derive(Clone, Copy)]
-enum Input<'a> {
+pub(crate) enum Input<'a> {
     Json(&'a Value),
     Nbt(&'a Tag),
     NbtByte(i8),
@@ -906,7 +1266,7 @@ enum Input<'a> {
 }
 
 impl<'a> Input<'a> {
-    fn number(self) -> Option<f32> {
+    pub(crate) fn number(self) -> Option<f32> {
         match self {
             Self::Json(Value::Number(value)) => value.to_string().parse().ok(),
             Self::Nbt(value) => tag_float_value(value),
@@ -917,7 +1277,7 @@ impl<'a> Input<'a> {
         }
     }
 
-    fn string(self) -> Option<JavaString> {
+    pub(crate) fn string(self) -> Option<JavaString> {
         match self {
             Self::Json(Value::String(value)) => Some(resource_json::decode_string(value)),
             Self::Nbt(Tag::String(value)) => Some(value.clone()),
@@ -929,14 +1289,14 @@ impl<'a> Input<'a> {
         }
     }
 
-    fn is_object(self) -> bool {
+    pub(crate) fn is_object(self) -> bool {
         matches!(
             self,
             Self::Json(Value::Object(_)) | Self::Nbt(Tag::Compound(_))
         )
     }
 
-    fn field(self, name: &str) -> Option<Self> {
+    pub(crate) fn field(self, name: &str) -> Option<Self> {
         match self {
             Self::Json(Value::Object(value)) => resource_json::field(value, name).map(Self::Json),
             Self::Nbt(Tag::Compound(value)) => value.get(&JavaString::from(name)).map(Self::Nbt),
@@ -948,7 +1308,7 @@ impl<'a> Input<'a> {
         }
     }
 
-    fn list(self) -> Option<Vec<Self>> {
+    pub(crate) fn list(self) -> Option<Vec<Self>> {
         match self {
             Self::Json(Value::Array(values)) => {
                 Some(values.iter().map(Self::Json).collect::<Vec<_>>())
@@ -973,8 +1333,6 @@ impl<'a> Input<'a> {
 }
 
 fn builtin_providers() -> HashMap<Identifier, NumberProvider> {
-    // The supported `default` context has no block state, so vanilla's block
-    // predicates select the normal cooking and weighted composting branches.
     fn id(path: &str) -> Identifier {
         Identifier::from_parts("minecraft", path)
             .expect("built-in number provider identifiers are valid")
@@ -982,6 +1340,10 @@ fn builtin_providers() -> HashMap<Identifier, NumberProvider> {
 
     fn named(path: &str) -> NumberProviderReference {
         NumberProviderReference::Named(id(path))
+    }
+
+    fn predicate(path: &str) -> PredicateReference {
+        PredicateReference::Named(id(path))
     }
 
     fn product(time: f32, multiplier: &str) -> NumberProviderReference {
@@ -1040,7 +1402,8 @@ fn builtin_providers() -> HashMap<Identifier, NumberProvider> {
         ),
         (
             id("cooking/speed_default"),
-            NumberProvider::DefaultContextConditional {
+            NumberProvider::Conditional {
+                condition: predicate("block/fast_cooking"),
                 on_true: named("cooking/fast_speed_multiplier"),
                 on_false: named("cooking/normal_speed_multiplier"),
             },
@@ -1070,7 +1433,8 @@ fn builtin_providers() -> HashMap<Identifier, NumberProvider> {
     ] {
         providers.insert(
             id(path),
-            NumberProvider::DefaultContextConditional {
+            NumberProvider::Conditional {
+                condition: predicate("block/fast_cooking"),
                 on_true: product(time, "cooking/fast_burn_time_multiplier"),
                 on_false: product(time, "cooking/normal_burn_time_multiplier"),
             },
@@ -1226,12 +1590,14 @@ mod tests {
                 ])),
             ),
         ]);
-        assert!(NumberProviderRegistry::new(providers, HashMap::new()).is_err());
+        assert!(
+            LootRegistry::new(providers, HashMap::new(), HashMap::new(), HashMap::new()).is_err()
+        );
     }
 
     #[test]
     fn integer_aggregates_round_each_operand() {
-        let registry = NumberProviderRegistry::empty();
+        let registry = LootRegistry::empty();
         let provider = NumberProviderReference::Inline(Box::new(
             parse_json(r#"{"type":"sum","operands":[0.6,0.6]}"#).unwrap(),
         ));

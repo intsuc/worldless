@@ -2,26 +2,27 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::macro_function::Function;
 use crate::nbt::{CompoundTag, JavaString, NbtPath, Tag};
-use crate::number_provider::{NumberProviderReference, NumberProviderRegistry};
+use crate::number_provider::{LootRegistry, NumberProviderReference};
+use crate::predicate::PredicateReference;
 use crate::resource::{FunctionReference, Identifier};
 
 #[derive(Debug)]
 pub(crate) struct Program {
     functions: HashMap<Identifier, Function>,
     function_tags: HashMap<Identifier, Vec<Identifier>>,
-    number_providers: Arc<NumberProviderRegistry>,
+    loot_registry: Arc<LootRegistry>,
 }
 
 impl Program {
     pub(crate) fn new(
         functions: HashMap<Identifier, Function>,
         function_tags: HashMap<Identifier, Vec<Identifier>>,
-        number_providers: Arc<NumberProviderRegistry>,
+        loot_registry: Arc<LootRegistry>,
     ) -> Self {
         Self {
             functions,
             function_tags,
-            number_providers,
+            loot_registry,
         }
     }
 
@@ -29,8 +30,8 @@ impl Program {
         self.functions.get(id)
     }
 
-    pub(crate) fn number_providers(&self) -> &Arc<NumberProviderRegistry> {
-        &self.number_providers
+    pub(crate) fn loot_registry(&self) -> &Arc<LootRegistry> {
+        &self.loot_registry
     }
 
     pub(crate) fn resolve_functions(
@@ -78,6 +79,7 @@ pub(crate) enum Modifier {
         expected: bool,
         function: FunctionReference,
     },
+    PredicateCondition(PredicateCondition),
     ReturnRun,
 }
 
@@ -100,6 +102,7 @@ pub(crate) enum Command {
     Scoreboard(ScoreboardCommand),
     Condition(ScoreCondition),
     StorageCondition(StorageCondition),
+    PredicateCondition(PredicateCondition),
     Data(DataCommand),
     Compute(ComputeCommand),
 }
@@ -108,6 +111,12 @@ pub(crate) enum Command {
 pub(crate) struct ComputeCommand {
     pub(crate) provider: NumberProviderReference,
     pub(crate) mode: ComputeMode,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PredicateCondition {
+    pub(crate) expected: bool,
+    pub(crate) predicate: PredicateReference,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
