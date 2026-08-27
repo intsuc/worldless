@@ -96,9 +96,17 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
         "example:context",
         "return run execute positioned ^ ^ ^1 if predicate example:ahead\n",
     );
+    high.write_function(
+        "example:default_context",
+        "return run execute positioned ^ ^ ^1 if predicate example:default_ahead\n",
+    );
     high.write_predicate(
         "example:ahead",
         r#"{"type":"location_check","predicate":{"position":{"x":{"min":-0.001,"max":0.001},"y":64,"z":{"min":0.999,"max":1.001}}}}"#,
+    );
+    high.write_predicate(
+        "example:default_ahead",
+        r#"{"type":"location_check","predicate":{"position":{"x":{"min":-0.001,"max":0.001},"y":0,"z":{"min":0.999,"max":1.001}}}}"#,
     );
 
     let common: Vec<&std::ffi::OsStr> = vec![
@@ -136,6 +144,18 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
     let output = run("example:fell_through");
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(text(&output.stdout), "fell-through\n");
+    assert!(output.stderr.is_empty());
+
+    let output = worldless(&[
+        "run".as_ref(),
+        "--pack".as_ref(),
+        low.root().as_os_str(),
+        "--pack".as_ref(),
+        high.root().as_os_str(),
+        "example:default_context".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(text(&output.stdout), "returned success=true value=1\n");
     assert!(output.stderr.is_empty());
 
     let output = run("example:context");

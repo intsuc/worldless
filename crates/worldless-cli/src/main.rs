@@ -7,7 +7,10 @@ use std::{
 
 use worldless::{ExecutionContext, FunctionOutcome, Pack, Position, Rotation, Vm};
 
-const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] --command-limit <USIZE> --position <X> <Y> <Z> --rotation <YAW> <PITCH> <FUNCTION_ID>";
+const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] <FUNCTION_ID>";
+const DEFAULT_COMMAND_LIMIT: usize = 65_536;
+const DEFAULT_POSITION: Position = Position::new(0.0, 0.0, 0.0);
+const DEFAULT_ROTATION: Rotation = Rotation::new(0.0, 0.0);
 const EXIT_USAGE: u8 = 2;
 const EXIT_LOAD: u8 = 3;
 const EXIT_EXECUTION: u8 = 4;
@@ -135,29 +138,42 @@ fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, Us
     }
     require_pack(&packs)?;
 
-    match arguments.next() {
-        Some(argument) if argument == "--command-limit" => {}
-        Some(argument) => {
-            return Err(usage_error(format!(
-                "expected --command-limit, found {argument:?}"
-            )));
-        }
-        None => return Err(usage_error("missing --command-limit")),
-    }
-    let command_limit = parse_command_limit(arguments.next())?;
+    let command_limit = if arguments
+        .peek()
+        .is_some_and(|argument| argument == "--command-limit")
+    {
+        arguments.next();
+        parse_command_limit(arguments.next())?
+    } else {
+        DEFAULT_COMMAND_LIMIT
+    };
 
-    expect_option(arguments.next(), "--position")?;
-    let position = Position::new(
-        parse_finite_f64(arguments.next(), "--position X")?,
-        parse_finite_f64(arguments.next(), "--position Y")?,
-        parse_finite_f64(arguments.next(), "--position Z")?,
-    );
+    let position = if arguments
+        .peek()
+        .is_some_and(|argument| argument == "--position")
+    {
+        arguments.next();
+        Position::new(
+            parse_finite_f64(arguments.next(), "--position X")?,
+            parse_finite_f64(arguments.next(), "--position Y")?,
+            parse_finite_f64(arguments.next(), "--position Z")?,
+        )
+    } else {
+        DEFAULT_POSITION
+    };
 
-    expect_option(arguments.next(), "--rotation")?;
-    let rotation = Rotation::new(
-        parse_finite_f32(arguments.next(), "--rotation YAW")?,
-        parse_finite_f32(arguments.next(), "--rotation PITCH")?,
-    );
+    let rotation = if arguments
+        .peek()
+        .is_some_and(|argument| argument == "--rotation")
+    {
+        arguments.next();
+        Rotation::new(
+            parse_finite_f32(arguments.next(), "--rotation YAW")?,
+            parse_finite_f32(arguments.next(), "--rotation PITCH")?,
+        )
+    } else {
+        DEFAULT_ROTATION
+    };
 
     let function_id = parse_function_id(arguments.next())?;
     if let Some(argument) = arguments.next() {
@@ -213,16 +229,6 @@ fn parse_command_limit(argument: Option<OsString>) -> Result<usize, UsageError> 
     }
     text.parse::<usize>()
         .map_err(|_| usage_error(format!("invalid --command-limit {text:?}")))
-}
-
-fn expect_option(argument: Option<OsString>, expected: &str) -> Result<(), UsageError> {
-    match argument {
-        Some(argument) if argument == expected => Ok(()),
-        Some(argument) => Err(usage_error(format!(
-            "expected {expected}, found {argument:?}"
-        ))),
-        None => Err(usage_error(format!("missing {expected}"))),
-    }
 }
 
 fn parse_finite_f64(argument: Option<OsString>, value_name: &str) -> Result<f64, UsageError> {
@@ -355,6 +361,73 @@ mod tests {
     }
 
     #[test]
+    fn run_options_have_independent_defaults() {
+        assert_eq!(
+            parse(&["run", "--pack", "pack", "example:main"]).unwrap(),
+            CliCommand::Run {
+                packs: vec![PathBuf::from("pack")],
+                command_limit: DEFAULT_COMMAND_LIMIT,
+                context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                function_id: "example:main".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "run",
+                "--pack",
+                "pack",
+                "--command-limit",
+                "12",
+                "example:main",
+            ])
+            .unwrap(),
+            CliCommand::Run {
+                packs: vec![PathBuf::from("pack")],
+                command_limit: 12,
+                context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                function_id: "example:main".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "run",
+                "--pack",
+                "pack",
+                "--position",
+                "1",
+                "2",
+                "3",
+                "example:main",
+            ])
+            .unwrap(),
+            CliCommand::Run {
+                packs: vec![PathBuf::from("pack")],
+                command_limit: DEFAULT_COMMAND_LIMIT,
+                context: ExecutionContext::new(Position::new(1.0, 2.0, 3.0), DEFAULT_ROTATION),
+                function_id: "example:main".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "run",
+                "--pack",
+                "pack",
+                "--rotation",
+                "90",
+                "-45",
+                "example:main",
+            ])
+            .unwrap(),
+            CliCommand::Run {
+                packs: vec![PathBuf::from("pack")],
+                command_limit: DEFAULT_COMMAND_LIMIT,
+                context: ExecutionContext::new(DEFAULT_POSITION, Rotation::new(90.0, -45.0)),
+                function_id: "example:main".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn rejects_missing_and_unknown_commands() {
         assert!(parse(&[]).is_err());
         assert!(parse(&["inspect", "--pack", "pack"]).is_err());
@@ -377,10 +450,9 @@ mod tests {
     }
 
     #[test]
-    fn requires_one_valid_command_limit() {
+    fn validates_explicit_command_limits() {
         for arguments in [
-            &["run", "--pack", "pack", "example:main"][..],
-            &["run", "--pack", "pack", "--command-limit"],
+            &["run", "--pack", "pack", "--command-limit"][..],
             &[
                 "run",
                 "--pack",
@@ -442,16 +514,8 @@ mod tests {
     }
 
     #[test]
-    fn requires_an_explicit_finite_execution_context() {
+    fn validates_explicit_execution_context_values() {
         for arguments in [
-            &[
-                "run",
-                "--pack",
-                "pack",
-                "--command-limit",
-                "1",
-                "example:main",
-            ][..],
             &[
                 "run",
                 "--pack",
@@ -465,19 +529,7 @@ mod tests {
                 "0",
                 "0",
                 "example:main",
-            ],
-            &[
-                "run",
-                "--pack",
-                "pack",
-                "--command-limit",
-                "1",
-                "--position",
-                "0",
-                "0",
-                "0",
-                "example:main",
-            ],
+            ][..],
             &[
                 "run",
                 "--pack",
