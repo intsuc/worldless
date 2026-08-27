@@ -10,17 +10,19 @@ use std::{
 use serde_json::{Map, Value};
 use worldless_brigadier::{
     Command, CommandDispatcher, LiteralMessage, SINGLE_SUCCESS, StringReader,
-    arguments::{ArgumentType, IntegerArgumentType, StringArgumentType},
-    builder::{LiteralArgumentBuilder, RequiredArgumentBuilder},
+    arguments::{ArgumentType, DoubleArgumentType, IntegerArgumentType, StringArgumentType},
+    builder::{ArgumentBuilder, LiteralArgumentBuilder, RequiredArgumentBuilder},
     context::CommandContext,
     exceptions::{CommandSyntaxException, SimpleCommandExceptionType},
 };
 
 use crate::{
+    nbt::{CompoundTag, NbtPath, Tag, parse_compound, parse_path, parse_tag},
     program::{
-        Command as CompiledCommand, Function, Instruction, Modifier, Program, ScoreComparison,
+        Command as CompiledCommand, DataCommand, DataModifyOperation, DataSource,
+        DataStringSubstring, Function, Instruction, Modifier, Program, ScoreComparison,
         ScoreCondition, ScorePredicate, ScoreRange, ScoreReference, ScoreboardCommand,
-        ScoreboardOperation, StoreKind,
+        ScoreboardOperation, StorageCondition, StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier, is_allowed_in_identifier},
 };
@@ -1280,6 +1282,10 @@ impl CommandCompiler {
             .register(scoreboard)
             .expect("the command tree contains no conflicting scoreboard literal");
 
+        dispatcher
+            .register(data_command_branch())
+            .expect("the command tree contains no conflicting data literal");
+
         let execute = dispatcher
             .register(LiteralArgumentBuilder::literal("execute"))
             .expect("the command tree contains no conflicting execute literal");
@@ -1292,17 +1298,9 @@ impl CommandCompiler {
             .expect("the execute literal can contain the run literal")
             .then(
                 LiteralArgumentBuilder::literal("store")
-                    .then(store_score_branch(
-                        "result",
-                        StoreKind::Result,
-                        execute.clone(),
-                    ))
+                    .then(store_branch("result", StoreKind::Result, execute.clone()))
                     .expect("the store literal can contain the result literal")
-                    .then(store_score_branch(
-                        "success",
-                        StoreKind::Success,
-                        execute.clone(),
-                    ))
+                    .then(store_branch("success", StoreKind::Success, execute.clone()))
                     .expect("the store literal can contain the success literal"),
             )
             .expect("the execute literal can contain the store literal")
@@ -1331,6 +1329,322 @@ impl CommandCompiler {
         let instruction = sink.borrow_mut().take();
         instruction.ok_or_else(|| "command did not produce an instruction".to_owned())
     }
+}
+
+type ModifyOperationFactory = fn(&CommandContext<LoweringSource>) -> DataModifyOperation;
+
+fn data_command_branch() -> LiteralArgumentBuilder<LoweringSource> {
+    let merge: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Data(DataCommand::Merge {
+                storage: storage_identifier(context, "target"),
+                value: compound_tag(context, "nbt"),
+            }))
+    });
+    let get: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Data(DataCommand::Get {
+                storage: storage_identifier(context, "target"),
+            }))
+    });
+    let get_path: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Data(DataCommand::GetPath {
+                storage: storage_identifier(context, "target"),
+                path: nbt_path(context, "path"),
+                scale: None,
+            }))
+    });
+    let get_scaled: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Data(DataCommand::GetPath {
+                storage: storage_identifier(context, "target"),
+                path: nbt_path(context, "path"),
+                scale: Some(
+                    DoubleArgumentType::get_double(context, "scale")
+                        .expect("scaled data get is attached below its scale argument"),
+                ),
+            }))
+    });
+    let remove: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Data(DataCommand::Remove {
+                storage: storage_identifier(context, "target"),
+                path: nbt_path(context, "path"),
+            }))
+    });
+
+    LiteralArgumentBuilder::literal("data")
+        .then(
+            LiteralArgumentBuilder::literal("merge")
+                .then(
+                    LiteralArgumentBuilder::literal("storage")
+                        .then(
+                            RequiredArgumentBuilder::argument("target", StorageIdentifierArgument)
+                                .then(
+                                    RequiredArgumentBuilder::argument("nbt", CompoundTagArgument)
+                                        .executes(merge),
+                                )
+                                .expect("a merge target can contain a compound tag"),
+                        )
+                        .expect("storage merge can contain a target"),
+                )
+                .expect("data merge can contain storage"),
+        )
+        .expect("data can contain merge")
+        .then(
+            LiteralArgumentBuilder::literal("get")
+                .then(
+                    LiteralArgumentBuilder::literal("storage")
+                        .then(
+                            RequiredArgumentBuilder::argument("target", StorageIdentifierArgument)
+                                .executes(get)
+                                .then(
+                                    RequiredArgumentBuilder::argument("path", NbtPathArgument)
+                                        .executes(get_path)
+                                        .then(
+                                            RequiredArgumentBuilder::argument(
+                                                "scale",
+                                                DoubleArgumentType::double(),
+                                            )
+                                            .executes(get_scaled),
+                                        )
+                                        .expect("a data path can contain a scale"),
+                                )
+                                .expect("a data target can contain a path"),
+                        )
+                        .expect("storage get can contain a target"),
+                )
+                .expect("data get can contain storage"),
+        )
+        .expect("data can contain get")
+        .then(
+            LiteralArgumentBuilder::literal("remove")
+                .then(
+                    LiteralArgumentBuilder::literal("storage")
+                        .then(
+                            RequiredArgumentBuilder::argument("target", StorageIdentifierArgument)
+                                .then(
+                                    RequiredArgumentBuilder::argument("path", NbtPathArgument)
+                                        .executes(remove),
+                                )
+                                .expect("a remove target can contain a path"),
+                        )
+                        .expect("storage remove can contain a target"),
+                )
+                .expect("data remove can contain storage"),
+        )
+        .expect("data can contain remove")
+        .then(data_modify_branch())
+        .expect("data can contain modify")
+}
+
+fn data_modify_branch() -> LiteralArgumentBuilder<LoweringSource> {
+    let target_path = RequiredArgumentBuilder::argument("targetPath", NbtPathArgument)
+        .then(modify_insert_branch())
+        .expect("a modify target path can contain insert")
+        .then(modify_operation_branch("prepend", |_| {
+            DataModifyOperation::Insert(0)
+        }))
+        .expect("a modify target path can contain prepend")
+        .then(modify_operation_branch("append", |_| {
+            DataModifyOperation::Insert(-1)
+        }))
+        .expect("a modify target path can contain append")
+        .then(modify_operation_branch("set", |_| DataModifyOperation::Set))
+        .expect("a modify target path can contain set")
+        .then(modify_operation_branch("merge", |_| {
+            DataModifyOperation::Merge
+        }))
+        .expect("a modify target path can contain merge");
+
+    LiteralArgumentBuilder::literal("modify")
+        .then(
+            LiteralArgumentBuilder::literal("storage")
+                .then(
+                    RequiredArgumentBuilder::argument("target", StorageIdentifierArgument)
+                        .then(target_path)
+                        .expect("a modify target can contain a path"),
+                )
+                .expect("storage modify can contain a target"),
+        )
+        .expect("data modify can contain storage")
+}
+
+fn modify_insert_branch() -> LiteralArgumentBuilder<LoweringSource> {
+    LiteralArgumentBuilder::literal("insert")
+        .then(modify_sources(
+            RequiredArgumentBuilder::argument("index", IntegerArgumentType::integer()),
+            |context| {
+                DataModifyOperation::Insert(
+                    IntegerArgumentType::get_integer(context, "index")
+                        .expect("insert sources are attached below the index argument"),
+                )
+            },
+        ))
+        .expect("insert can contain an index and source")
+}
+
+fn modify_operation_branch(
+    literal: &'static str,
+    operation: ModifyOperationFactory,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    match modify_sources(LiteralArgumentBuilder::literal(literal), operation) {
+        ArgumentBuilder::Literal(builder) => builder,
+        ArgumentBuilder::Required(_) => unreachable!("a literal operation remains a literal"),
+    }
+}
+
+fn modify_sources(
+    parent: impl Into<ArgumentBuilder<LoweringSource>>,
+    operation: ModifyOperationFactory,
+) -> ArgumentBuilder<LoweringSource> {
+    parent
+        .into()
+        .then(modify_value_source(operation))
+        .expect("a modify operation can contain a literal value")
+        .then(modify_storage_source("from", operation, false))
+        .expect("a modify operation can contain a storage source")
+        .then(modify_storage_source("string", operation, true))
+        .expect("a modify operation can contain a string storage source")
+}
+
+fn modify_value_source(
+    operation: ModifyOperationFactory,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let command: Command<LoweringSource> = Rc::new(move |context| {
+        record_data_modify(
+            context,
+            operation(context),
+            DataSource::Value(nbt_tag(context, "value")),
+        )
+    });
+    LiteralArgumentBuilder::literal("value")
+        .then(RequiredArgumentBuilder::argument("value", NbtTagArgument).executes(command))
+        .expect("the value literal can contain an NBT value")
+}
+
+fn modify_storage_source(
+    literal: &'static str,
+    operation: ModifyOperationFactory,
+    string: bool,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let root_command: Command<LoweringSource> = Rc::new(move |context| {
+        record_data_modify(
+            context,
+            operation(context),
+            storage_data_source(context, string, None, None),
+        )
+    });
+    let path_command: Command<LoweringSource> = Rc::new(move |context| {
+        record_data_modify(
+            context,
+            operation(context),
+            storage_data_source(context, string, Some(nbt_path(context, "sourcePath")), None),
+        )
+    });
+    let start_command: Command<LoweringSource> = Rc::new(move |context| {
+        let start = IntegerArgumentType::get_integer(context, "start")
+            .expect("string source is attached below its start argument");
+        record_data_modify(
+            context,
+            operation(context),
+            storage_data_source(
+                context,
+                string,
+                Some(nbt_path(context, "sourcePath")),
+                Some(DataStringSubstring { start, end: None }),
+            ),
+        )
+    });
+    let end_command: Command<LoweringSource> = Rc::new(move |context| {
+        let start = IntegerArgumentType::get_integer(context, "start")
+            .expect("string source is attached below its start argument");
+        let end = IntegerArgumentType::get_integer(context, "end")
+            .expect("string source is attached below its end argument");
+        record_data_modify(
+            context,
+            operation(context),
+            storage_data_source(
+                context,
+                string,
+                Some(nbt_path(context, "sourcePath")),
+                Some(DataStringSubstring {
+                    start,
+                    end: Some(end),
+                }),
+            ),
+        )
+    });
+
+    let source_path = if string {
+        RequiredArgumentBuilder::argument("sourcePath", NbtPathArgument)
+            .executes(path_command)
+            .then(
+                RequiredArgumentBuilder::argument("start", IntegerArgumentType::integer())
+                    .executes(start_command)
+                    .then(
+                        RequiredArgumentBuilder::argument("end", IntegerArgumentType::integer())
+                            .executes(end_command),
+                    )
+                    .expect("a string start can contain an end"),
+            )
+            .expect("a string source path can contain a start")
+    } else {
+        RequiredArgumentBuilder::argument("sourcePath", NbtPathArgument).executes(path_command)
+    };
+
+    LiteralArgumentBuilder::literal(literal)
+        .then(
+            LiteralArgumentBuilder::literal("storage")
+                .then(
+                    RequiredArgumentBuilder::argument("source", StorageIdentifierArgument)
+                        .executes(root_command)
+                        .then(source_path)
+                        .expect("a storage source can contain a path"),
+                )
+                .expect("a source can contain storage"),
+        )
+        .expect("a modify operation can contain a source kind")
+}
+
+fn storage_data_source(
+    context: &CommandContext<LoweringSource>,
+    string: bool,
+    path: Option<NbtPath>,
+    substring: Option<DataStringSubstring>,
+) -> DataSource {
+    let storage = storage_identifier(context, "source");
+    if string {
+        DataSource::String {
+            storage,
+            path,
+            substring,
+        }
+    } else {
+        debug_assert!(substring.is_none());
+        DataSource::Storage { storage, path }
+    }
+}
+
+fn record_data_modify(
+    context: &CommandContext<LoweringSource>,
+    operation: DataModifyOperation,
+    source: DataSource,
+) -> Result<i32, CommandSyntaxException> {
+    context
+        .source()
+        .record(CompiledCommand::Data(DataCommand::Modify {
+            storage: storage_identifier(context, "target"),
+            path: nbt_path(context, "targetPath"),
+            operation,
+            source,
+        }))
 }
 
 fn score_delta_branch(
@@ -1421,7 +1735,7 @@ fn execute_condition_branch(
                 .then(
                     RequiredArgumentBuilder::argument("name", FunctionArgument)
                         .fork(
-                            execute,
+                            execute.clone(),
                             Rc::new(move |context: &CommandContext<LoweringSource>| {
                                 let function = context.argument::<FunctionReference>("name").expect(
                                     "the function condition is attached below its name argument",
@@ -1439,6 +1753,51 @@ fn execute_condition_branch(
                 .expect("the function literal can contain a function name"),
         )
         .expect("a conditional can contain the function literal")
+        .then(storage_data_condition_branch(expected, execute))
+        .expect("a conditional can contain storage data")
+}
+
+fn storage_data_condition_branch(
+    expected: bool,
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let terminal: Command<LoweringSource> = Rc::new(move |context| {
+        context
+            .source()
+            .record(CompiledCommand::StorageCondition(storage_condition(
+                context, expected,
+            )))
+    });
+    let modifier = Rc::new(move |context: &CommandContext<LoweringSource>| {
+        Ok(vec![Rc::new(context.source().with_modifier(
+            Modifier::StorageCondition(storage_condition(context, expected)),
+        ))])
+    });
+
+    LiteralArgumentBuilder::literal("data")
+        .then(
+            LiteralArgumentBuilder::literal("storage")
+                .then(
+                    RequiredArgumentBuilder::argument("source", StorageIdentifierArgument)
+                        .then(
+                            RequiredArgumentBuilder::argument("path", NbtPathArgument)
+                                .executes(terminal)
+                                .fork(execute, modifier)
+                                .expect("a complete storage condition can redirect to execute"),
+                        )
+                        .expect("a storage condition source can contain a path"),
+                )
+                .expect("a data condition can contain storage"),
+        )
+        .expect("a conditional data literal can contain a provider")
+}
+
+fn storage_condition(context: &CommandContext<LoweringSource>, expected: bool) -> StorageCondition {
+    StorageCondition {
+        expected,
+        storage: storage_identifier(context, "source"),
+        path: nbt_path(context, "path"),
+    }
 }
 
 fn score_comparison_condition_branch(
@@ -1542,7 +1901,7 @@ fn score_matches_condition(
     }
 }
 
-fn store_score_branch(
+fn store_branch(
     literal: &'static str,
     kind: StoreKind,
     execute: worldless_brigadier::tree::Node<LoweringSource>,
@@ -1558,7 +1917,7 @@ fn store_score_branch(
                                 StringArgumentType::word(),
                             )
                             .redirect_with_modifier(
-                                execute,
+                                execute.clone(),
                                 Rc::new(move |context| {
                                     let holder = score_holder(context, "targets");
                                     let objective = command_string(context, "objective");
@@ -1578,11 +1937,128 @@ fn store_score_branch(
                 .expect("the score literal can contain a score holder"),
         )
         .expect("a store mode can contain the score literal")
+        .then(store_storage_branch(kind, execute))
+        .expect("a store mode can contain storage")
+}
+
+fn store_storage_branch(
+    kind: StoreKind,
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let path = RequiredArgumentBuilder::argument("path", NbtPathArgument)
+        .then(store_storage_type_branch(
+            "byte",
+            StorageNumberType::Byte,
+            kind,
+            execute.clone(),
+        ))
+        .expect("a storage path can contain byte")
+        .then(store_storage_type_branch(
+            "short",
+            StorageNumberType::Short,
+            kind,
+            execute.clone(),
+        ))
+        .expect("a storage path can contain short")
+        .then(store_storage_type_branch(
+            "int",
+            StorageNumberType::Int,
+            kind,
+            execute.clone(),
+        ))
+        .expect("a storage path can contain int")
+        .then(store_storage_type_branch(
+            "long",
+            StorageNumberType::Long,
+            kind,
+            execute.clone(),
+        ))
+        .expect("a storage path can contain long")
+        .then(store_storage_type_branch(
+            "float",
+            StorageNumberType::Float,
+            kind,
+            execute.clone(),
+        ))
+        .expect("a storage path can contain float")
+        .then(store_storage_type_branch(
+            "double",
+            StorageNumberType::Double,
+            kind,
+            execute,
+        ))
+        .expect("a storage path can contain double");
+
+    LiteralArgumentBuilder::literal("storage")
+        .then(
+            RequiredArgumentBuilder::argument("target", StorageIdentifierArgument)
+                .then(path)
+                .expect("a storage target can contain a path"),
+        )
+        .expect("storage can contain a target")
+}
+
+fn store_storage_type_branch(
+    literal: &'static str,
+    number_type: StorageNumberType,
+    kind: StoreKind,
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    LiteralArgumentBuilder::literal(literal)
+        .then(
+            RequiredArgumentBuilder::argument("scale", DoubleArgumentType::double())
+                .redirect_with_modifier(
+                    execute,
+                    Rc::new(move |context| {
+                        let scale = DoubleArgumentType::get_double(context, "scale")
+                            .expect("storage store is attached below its scale argument");
+                        Ok(Rc::new(context.source().with_modifier(
+                            Modifier::StoreStorage {
+                                kind,
+                                storage: storage_identifier(context, "target"),
+                                path: nbt_path(context, "path"),
+                                number_type,
+                                scale,
+                            },
+                        )))
+                    }),
+                )
+                .expect("a complete storage store has no children"),
+        )
+        .expect("a storage number type can contain a scale")
 }
 
 fn command_string(context: &CommandContext<LoweringSource>, name: &str) -> String {
     StringArgumentType::get_string(context, name)
         .expect("the command executor is attached below the requested string argument")
+}
+
+fn storage_identifier(context: &CommandContext<LoweringSource>, name: &str) -> Identifier {
+    context
+        .argument::<Identifier>(name)
+        .map(|identifier| (*identifier).clone())
+        .expect("the command executor is attached below the requested storage identifier")
+}
+
+fn nbt_path(context: &CommandContext<LoweringSource>, name: &str) -> NbtPath {
+    context
+        .argument::<NbtPath>(name)
+        .map(|path| (*path).clone())
+        .expect("the command executor is attached below the requested NBT path")
+}
+
+fn nbt_tag(context: &CommandContext<LoweringSource>, name: &str) -> Tag {
+    context
+        .argument::<Tag>(name)
+        .map(|tag| (*tag).clone())
+        .expect("the command executor is attached below the requested NBT tag")
+}
+
+fn compound_tag(context: &CommandContext<LoweringSource>, name: &str) -> CompoundTag {
+    context
+        .argument::<CompoundTag>(name)
+        .map(|tag| (*tag).clone())
+        .expect("the command executor is attached below the requested compound tag")
 }
 
 fn score_holder(context: &CommandContext<LoweringSource>, name: &str) -> String {
@@ -1611,6 +2087,115 @@ fn scoreboard_operation(
         .argument::<ScoreboardOperation>(name)
         .map(|operation| *operation)
         .expect("the scoreboard executor is attached below its operation argument")
+}
+
+#[derive(Clone, Copy)]
+struct StorageIdentifierArgument;
+
+impl ArgumentType<LoweringSource> for StorageIdentifierArgument {
+    type Value = Identifier;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let start = reader.cursor();
+        while reader.can_read() && is_allowed_in_identifier(reader.peek()) {
+            reader.skip();
+        }
+        let raw = reader.substring(start, reader.cursor());
+        if let Some(identifier) = Identifier::parse(&raw) {
+            Ok(identifier)
+        } else {
+            reader.set_cursor(start);
+            Err(
+                SimpleCommandExceptionType::new(LiteralMessage::new("invalid storage identifier"))
+                    .create_with_context(reader),
+            )
+        }
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["foo", "foo:bar", "012"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NbtTagArgument;
+
+impl ArgumentType<LoweringSource> for NbtTagArgument {
+    type Value = Tag;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        parse_nbt_argument(reader, parse_tag)
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["0", "0b", "0L", "0.0", "\"foo\"", "{foo:bar}", "[0]"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CompoundTagArgument;
+
+impl ArgumentType<LoweringSource> for CompoundTagArgument {
+    type Value = CompoundTag;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        parse_nbt_argument(reader, parse_compound)
+    }
+
+    fn examples(&self) -> Vec<String> {
+        vec!["{}".to_owned(), "{foo:bar}".to_owned()]
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NbtPathArgument;
+
+impl ArgumentType<LoweringSource> for NbtPathArgument {
+    type Value = NbtPath;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        parse_nbt_argument(reader, parse_path)
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["foo", "foo.bar", "foo[0]", "[0]", "[]", "{foo:bar}"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+fn parse_nbt_argument<T>(
+    reader: &mut StringReader,
+    parse: impl FnOnce(&mut StringReader) -> Result<T, String>,
+) -> Result<T, CommandSyntaxException> {
+    let start = reader.cursor();
+    parse(reader).map_err(|message| {
+        reader.set_cursor(start);
+        SimpleCommandExceptionType::new(LiteralMessage::new(message)).create_with_context(reader)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2131,6 +2716,117 @@ mod tests {
                 .compile("execute store result score Player values run return 1")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn compiler_lowers_storage_commands() {
+        let compiler = CommandCompiler::new();
+
+        assert!(matches!(
+            compiler
+                .compile("data merge storage example:state {answer:42}")
+                .unwrap()
+                .command,
+            CompiledCommand::Data(DataCommand::Merge { ref storage, .. })
+                if storage.to_string() == "example:state"
+        ));
+        assert!(matches!(
+            compiler
+                .compile("data get storage example:state")
+                .unwrap()
+                .command,
+            CompiledCommand::Data(DataCommand::Get { ref storage })
+                if storage.to_string() == "example:state"
+        ));
+        assert!(matches!(
+            compiler
+                .compile("data get storage example:state answer 2.5")
+                .unwrap()
+                .command,
+            CompiledCommand::Data(DataCommand::GetPath {
+                scale: Some(2.5),
+                ..
+            })
+        ));
+        assert!(matches!(
+            compiler
+                .compile("data remove storage example:state answer")
+                .unwrap()
+                .command,
+            CompiledCommand::Data(DataCommand::Remove { .. })
+        ));
+
+        for operation in ["insert -2", "prepend", "append", "set", "merge"] {
+            for source in [
+                "value {value:1}",
+                "from storage example:source values[]",
+                "string storage example:source text -2 -1",
+            ] {
+                let instruction = compiler
+                    .compile(&format!(
+                        "data modify storage example:state target {operation} {source}"
+                    ))
+                    .unwrap();
+                assert!(matches!(
+                    instruction.command,
+                    CompiledCommand::Data(DataCommand::Modify { .. })
+                ));
+            }
+        }
+
+        let terminal = compiler
+            .compile("execute if data storage example:state answer")
+            .unwrap();
+        assert!(terminal.modifiers.is_empty());
+        assert!(matches!(
+            terminal.command,
+            CompiledCommand::StorageCondition(StorageCondition { expected: true, .. })
+        ));
+
+        let conditional = compiler
+            .compile("execute unless data storage example:state answer run return 3")
+            .unwrap();
+        assert!(matches!(
+            conditional.modifiers.as_slice(),
+            [Modifier::StorageCondition(StorageCondition {
+                expected: false,
+                ..
+            })]
+        ));
+
+        for (literal, expected) in [
+            ("byte", StorageNumberType::Byte),
+            ("short", StorageNumberType::Short),
+            ("int", StorageNumberType::Int),
+            ("long", StorageNumberType::Long),
+            ("float", StorageNumberType::Float),
+            ("double", StorageNumberType::Double),
+        ] {
+            let instruction = compiler
+                .compile(&format!(
+                    "execute store result storage example:state answer {literal} -0.5 run return 1"
+                ))
+                .unwrap();
+            assert!(matches!(
+                instruction.modifiers.as_slice(),
+                [Modifier::StoreStorage {
+                    kind: StoreKind::Result,
+                    number_type,
+                    scale,
+                    ..
+                }] if *number_type == expected && *scale == -0.5
+            ));
+        }
+
+        for command in [
+            "data get entity @s",
+            "data get block 0 0 0",
+            "data modify storage example:state value set compute default example:number",
+            "execute store result entity @s value int 1 run return 1",
+            "execute if data entity @s value run return 1",
+        ] {
+            assert!(compiler.compile(command).is_err(), "{command}");
+        }
     }
 
     #[test]

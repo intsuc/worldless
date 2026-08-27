@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::nbt::{CompoundTag, NbtPath, Tag};
 use crate::resource::{FunctionReference, Identifier};
 
 #[derive(Debug)]
@@ -47,20 +48,28 @@ pub(crate) struct Function {
     pub(crate) instructions: Vec<Instruction>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Instruction {
     pub(crate) modifiers: Vec<Modifier>,
     pub(crate) command: Command,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Modifier {
     StoreScore {
         kind: StoreKind,
         holder: String,
         objective: String,
     },
+    StoreStorage {
+        kind: StoreKind,
+        storage: Identifier,
+        path: NbtPath,
+        number_type: StorageNumberType,
+        scale: f64,
+    },
     Condition(ScoreCondition),
+    StorageCondition(StorageCondition),
     FunctionCondition {
         expected: bool,
         function: FunctionReference,
@@ -74,12 +83,84 @@ pub(crate) enum StoreKind {
     Success,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Command {
     Function(FunctionReference),
     Return { success: bool, value: i32 },
     Scoreboard(ScoreboardCommand),
     Condition(ScoreCondition),
+    StorageCondition(StorageCondition),
+    Data(DataCommand),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageNumberType {
+    Byte,
+    Short,
+    Int,
+    Long,
+    Float,
+    Double,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StorageCondition {
+    pub(crate) expected: bool,
+    pub(crate) storage: Identifier,
+    pub(crate) path: NbtPath,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DataCommand {
+    Merge {
+        storage: Identifier,
+        value: CompoundTag,
+    },
+    Get {
+        storage: Identifier,
+    },
+    GetPath {
+        storage: Identifier,
+        path: NbtPath,
+        scale: Option<f64>,
+    },
+    Remove {
+        storage: Identifier,
+        path: NbtPath,
+    },
+    Modify {
+        storage: Identifier,
+        path: NbtPath,
+        operation: DataModifyOperation,
+        source: DataSource,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DataModifyOperation {
+    Insert(i32),
+    Set,
+    Merge,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DataSource {
+    Value(Tag),
+    Storage {
+        storage: Identifier,
+        path: Option<NbtPath>,
+    },
+    String {
+        storage: Identifier,
+        path: Option<NbtPath>,
+        substring: Option<DataStringSubstring>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DataStringSubstring {
+    pub(crate) start: i32,
+    pub(crate) end: Option<i32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

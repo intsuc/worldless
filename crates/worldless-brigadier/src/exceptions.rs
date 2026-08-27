@@ -768,7 +768,8 @@ impl BuiltInExceptionProvider for BuiltInExceptions {
     }
 }
 
-pub(crate) fn java_f32(value: f32) -> String {
+/// Formats an `f32` using Java SE's `Float.toString` representation.
+pub fn java_f32(value: f32) -> String {
     java_floating(value as f64, value.to_string(), |candidate| {
         candidate
             .parse::<f32>()
@@ -776,7 +777,8 @@ pub(crate) fn java_f32(value: f32) -> String {
     })
 }
 
-pub(crate) fn java_f64(value: f64) -> String {
+/// Formats an `f64` using Java SE's `Double.toString` representation.
+pub fn java_f64(value: f64) -> String {
     java_floating(value, value.to_string(), |candidate| {
         candidate
             .parse::<f64>()

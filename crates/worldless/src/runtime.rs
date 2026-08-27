@@ -1,9 +1,11 @@
 use std::{cell::Cell, collections::VecDeque, error::Error, fmt, rc::Rc};
 
 use crate::{
+    nbt::{CommandStorage, JavaString, Tag},
     program::{
-        Command, Function, Modifier, Program, ResolvedFunctions, ScoreCondition, Scoreboard,
-        ScoreboardCommand, StoreKind,
+        Command, DataCommand, DataModifyOperation, DataSource, Function, Modifier, Program,
+        ResolvedFunctions, ScoreCondition, Scoreboard, ScoreboardCommand, StorageCondition,
+        StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier},
 };
@@ -65,10 +67,19 @@ impl CommandResult {
 }
 
 #[derive(Clone)]
-struct StoreAction {
-    kind: StoreKind,
-    holder: String,
-    objective: String,
+enum StoreAction {
+    Score {
+        kind: StoreKind,
+        holder: String,
+        objective: String,
+    },
+    Storage {
+        kind: StoreKind,
+        storage: Identifier,
+        path: crate::nbt::NbtPath,
+        number_type: StorageNumberType,
+        scale: f64,
+    },
 }
 
 #[derive(Clone)]
@@ -126,18 +137,37 @@ impl ResultConsumer {
         &self,
         result: CommandResult,
         scoreboard: &mut Scoreboard,
+        command_storage: &mut CommandStorage,
         top_level_result: &mut Option<FunctionOutcome>,
     ) {
         for store in &self.stores {
-            let value = match store.kind {
-                StoreKind::Result => result.value,
-                StoreKind::Success => i32::from(result.success),
-            };
-            let stored = scoreboard.set_score(&store.holder, &store.objective, value);
-            assert!(
-                stored,
-                "store objectives are resolved before command execution"
-            );
+            match store {
+                StoreAction::Score {
+                    kind,
+                    holder,
+                    objective,
+                } => {
+                    let value = stored_command_value(*kind, result);
+                    let stored = scoreboard.set_score(holder, objective, value);
+                    assert!(
+                        stored,
+                        "store objectives are resolved before command execution"
+                    );
+                }
+                StoreAction::Storage {
+                    kind,
+                    storage,
+                    path,
+                    number_type,
+                    scale,
+                } => {
+                    let value = storage_number(
+                        *number_type,
+                        f64::from(stored_command_value(*kind, result)) * scale,
+                    );
+                    let _ = command_storage.edit(storage, |data| path.set(data, value));
+                }
+            }
         }
 
         match &self.end {
@@ -245,6 +275,7 @@ impl CommandQuota {
 pub(crate) fn execute(
     program: &Program,
     scoreboard: &mut Scoreboard,
+    command_storage: &mut CommandStorage,
     input: &str,
     command_limit: usize,
 ) -> Result<FunctionOutcome, ExecutionError> {
@@ -336,17 +367,45 @@ pub(crate) fn execute(
                             stores
                                 .as_mut()
                                 .expect("the stores have not been queued")
-                                .push(StoreAction {
+                                .push(StoreAction::Score {
                                     kind: *kind,
                                     holder: holder.clone(),
                                     objective: objective.clone(),
                                 });
+                        }
+                        Modifier::StoreStorage {
+                            kind,
+                            storage,
+                            path,
+                            number_type,
+                            scale,
+                        } => {
+                            quota.increment();
+                            if active {
+                                stores
+                                    .as_mut()
+                                    .expect("the stores have not been queued")
+                                    .push(StoreAction::Storage {
+                                        kind: *kind,
+                                        storage: storage.clone(),
+                                        path: path.clone(),
+                                        number_type: *number_type,
+                                        scale: *scale,
+                                    });
+                            }
                         }
                         Modifier::Condition(condition) => {
                             quota.increment();
                             forked = true;
                             if active {
                                 active = scoreboard.evaluate_condition(condition).unwrap_or(false);
+                            }
+                        }
+                        Modifier::StorageCondition(condition) => {
+                            quota.increment();
+                            forked = true;
+                            if active {
+                                active = storage_condition_matches(command_storage, condition);
                             }
                         }
                         Modifier::FunctionCondition {
@@ -474,6 +533,7 @@ pub(crate) fn execute(
                     Command::Function(reference) => execute_function_command(
                         program,
                         scoreboard,
+                        command_storage,
                         &mut queue,
                         &mut top_level_result,
                         frame,
@@ -489,11 +549,15 @@ pub(crate) fn execute(
                         frame.result_consumer.with_prefix(stores).accept(
                             result,
                             scoreboard,
+                            command_storage,
                             &mut top_level_result,
                         );
                         discard_at_depth_or_higher(&mut queue, frame.discard_depth);
                     }
-                    Command::Scoreboard(_) | Command::Condition(_) => {
+                    Command::Scoreboard(_)
+                    | Command::Condition(_)
+                    | Command::StorageCondition(_)
+                    | Command::Data(_) => {
                         queue.push_front(QueueEntry::ExecuteOrdinary {
                             frame,
                             instruction,
@@ -514,16 +578,28 @@ pub(crate) fn execute(
                 let result = match command {
                     Command::Scoreboard(command) => execute_scoreboard_command(scoreboard, command),
                     Command::Condition(condition) => execute_condition(scoreboard, condition),
+                    Command::StorageCondition(condition) => {
+                        execute_storage_condition(command_storage, condition)
+                    }
+                    Command::Data(command) => execute_data_command(command_storage, command),
                     Command::Function(_) | Command::Return { .. } => {
                         unreachable!("only ordinary commands are queued for ordinary execution")
                     }
                 };
-                ResultConsumer::ignoring(stores).accept(result, scoreboard, &mut top_level_result);
+                ResultConsumer::ignoring(stores).accept(
+                    result,
+                    scoreboard,
+                    command_storage,
+                    &mut top_level_result,
+                );
 
                 if return_run {
-                    frame
-                        .result_consumer
-                        .accept(result, scoreboard, &mut top_level_result);
+                    frame.result_consumer.accept(
+                        result,
+                        scoreboard,
+                        command_storage,
+                        &mut top_level_result,
+                    );
                     discard_at_depth_or_higher(&mut queue, frame.discard_depth);
                 } else {
                     schedule_next_instruction(&mut queue, frame);
@@ -561,6 +637,7 @@ pub(crate) fn execute(
                         ResultConsumer::ignoring(stores).accept(
                             CommandResult::success(value),
                             scoreboard,
+                            command_storage,
                             &mut top_level_result,
                         );
                     }
@@ -594,7 +671,12 @@ pub(crate) fn execute(
                 result_consumer,
                 ..
             } => {
-                result_consumer.accept(CommandResult::FAILURE, scoreboard, &mut top_level_result);
+                result_consumer.accept(
+                    CommandResult::FAILURE,
+                    scoreboard,
+                    command_storage,
+                    &mut top_level_result,
+                );
                 discard_at_depth_or_higher(&mut queue, discard_depth);
             }
         }
@@ -605,6 +687,7 @@ pub(crate) fn execute(
 fn execute_function_command<'a>(
     program: &'a Program,
     scoreboard: &mut Scoreboard,
+    command_storage: &mut CommandStorage,
     queue: &mut VecDeque<QueueEntry<'a>>,
     top_level_result: &mut Option<FunctionOutcome>,
     frame: Frame<'a>,
@@ -617,6 +700,7 @@ fn execute_function_command<'a>(
             ResultConsumer::ignoring(stores).accept(
                 CommandResult::FAILURE,
                 scoreboard,
+                command_storage,
                 top_level_result,
             );
             if !return_run {
@@ -766,6 +850,217 @@ fn execute_condition(scoreboard: &Scoreboard, condition: &ScoreCondition) -> Com
     } else {
         CommandResult::FAILURE
     }
+}
+
+fn stored_command_value(kind: StoreKind, result: CommandResult) -> i32 {
+    match kind {
+        StoreKind::Result => result.value,
+        StoreKind::Success => i32::from(result.success),
+    }
+}
+
+fn storage_number(number_type: StorageNumberType, value: f64) -> Tag {
+    match number_type {
+        StorageNumberType::Byte => Tag::Byte((value as i32) as i8),
+        StorageNumberType::Short => Tag::Short((value as i32) as i16),
+        StorageNumberType::Int => Tag::Int(value as i32),
+        StorageNumberType::Long => Tag::Long(value as i64),
+        StorageNumberType::Float => Tag::float(value as f32),
+        StorageNumberType::Double => Tag::double(value),
+    }
+}
+
+fn storage_condition_matches(
+    command_storage: &CommandStorage,
+    condition: &StorageCondition,
+) -> bool {
+    let value = command_storage.get(&condition.storage);
+    (condition.path.count_matching(&value) > 0) == condition.expected
+}
+
+fn execute_storage_condition(
+    command_storage: &CommandStorage,
+    condition: &StorageCondition,
+) -> CommandResult {
+    let value = command_storage.get(&condition.storage);
+    let count = condition.path.count_matching(&value);
+    if condition.expected {
+        if count == 0 {
+            CommandResult::FAILURE
+        } else {
+            CommandResult::success(
+                i32::try_from(count).expect("an NBT match collection fits in a Java int"),
+            )
+        }
+    } else if count == 0 {
+        CommandResult::success(1)
+    } else {
+        CommandResult::FAILURE
+    }
+}
+
+fn execute_data_command(
+    command_storage: &mut CommandStorage,
+    command: &DataCommand,
+) -> CommandResult {
+    let result = match command {
+        DataCommand::Merge { storage, value } => merge_storage(command_storage, storage, value),
+        DataCommand::Get { .. } => Ok(1),
+        DataCommand::GetPath {
+            storage,
+            path,
+            scale,
+        } => get_storage_path(command_storage, storage, path, *scale),
+        DataCommand::Remove { storage, path } => command_storage.edit(storage, |data| {
+            let count = path.remove(data);
+            (count != 0)
+                .then_some(count)
+                .ok_or_else(|| "NBT path removed nothing".to_owned())
+        }),
+        DataCommand::Modify {
+            storage,
+            path,
+            operation,
+            source,
+        } => modify_storage(command_storage, storage, path, *operation, source),
+    };
+    result.map_or(CommandResult::FAILURE, CommandResult::success)
+}
+
+fn merge_storage(
+    command_storage: &mut CommandStorage,
+    storage: &Identifier,
+    value: &crate::nbt::CompoundTag,
+) -> Result<i32, String> {
+    if Tag::Compound(value.clone()).is_too_deep(0) {
+        return Err("NBT data is too deep".to_owned());
+    }
+    let old = command_storage.get(storage);
+    let mut merged = old.clone();
+    merged.merge(value);
+    if merged == old {
+        return Err("NBT merge changed nothing".to_owned());
+    }
+    command_storage.set(storage.clone(), merged);
+    Ok(1)
+}
+
+fn get_storage_path(
+    command_storage: &CommandStorage,
+    storage: &Identifier,
+    path: &crate::nbt::NbtPath,
+    scale: Option<f64>,
+) -> Result<i32, String> {
+    let root = command_storage.get(storage);
+    let values = path.get(&root)?;
+    let [value] = values.as_slice() else {
+        return Err("an NBT get path must select exactly one value".to_owned());
+    };
+    if let Some(scale) = scale {
+        return value
+            .double_value()
+            .map(|value| minecraft_floor_to_i32(value * scale))
+            .ok_or_else(|| "scaled NBT get requires a number".to_owned());
+    }
+    if let Some(value) = value.double_value() {
+        return Ok(minecraft_floor_to_i32(value));
+    }
+    if let Some(length) = value.collection_len() {
+        return i32::try_from(length).map_err(|_| "NBT collection is too large".to_owned());
+    }
+    match value {
+        Tag::String(value) => {
+            i32::try_from(value.len()).map_err(|_| "NBT string is too large".to_owned())
+        }
+        Tag::Compound(value) => {
+            i32::try_from(value.len()).map_err(|_| "NBT compound is too large".to_owned())
+        }
+        _ => Err("unsupported NBT get value".to_owned()),
+    }
+}
+
+fn modify_storage(
+    command_storage: &mut CommandStorage,
+    storage: &Identifier,
+    path: &crate::nbt::NbtPath,
+    operation: DataModifyOperation,
+    source: &DataSource,
+) -> Result<i32, String> {
+    let source = resolve_data_source(command_storage, source)?;
+    command_storage.edit(storage, |target| {
+        let changed = match operation {
+            DataModifyOperation::Insert(index) => path.insert(index, target, &source)?,
+            DataModifyOperation::Set => path.set(
+                target,
+                source
+                    .last()
+                    .expect("data modification sources contain at least one value")
+                    .clone(),
+            )?,
+            DataModifyOperation::Merge => path.merge(target, &source)?,
+        };
+        (changed != 0)
+            .then_some(changed)
+            .ok_or_else(|| "NBT modification changed nothing".to_owned())
+    })
+}
+
+fn resolve_data_source(
+    command_storage: &CommandStorage,
+    source: &DataSource,
+) -> Result<Vec<Tag>, String> {
+    match source {
+        DataSource::Value(value) => Ok(vec![value.clone()]),
+        DataSource::Storage { storage, path } => {
+            let root = command_storage.get(storage);
+            path.as_ref().map_or_else(
+                || Ok(vec![Tag::Compound(root.clone())]),
+                |path| path.get(&root),
+            )
+        }
+        DataSource::String {
+            storage,
+            path,
+            substring,
+        } => {
+            let root = command_storage.get(storage);
+            let values = path.as_ref().map_or_else(
+                || Ok(vec![Tag::Compound(root.clone())]),
+                |path| path.get(&root),
+            )?;
+            values
+                .into_iter()
+                .map(|value| {
+                    let value = primitive_text(&value)?;
+                    let value = substring.map_or_else(
+                        || Ok(value.clone()),
+                        |range| value.substring(range.start, range.end),
+                    )?;
+                    Ok(Tag::String(value))
+                })
+                .collect()
+        }
+    }
+}
+
+fn primitive_text(value: &Tag) -> Result<JavaString, String> {
+    use worldless_brigadier::exceptions::{java_f32, java_f64};
+
+    let value = match value {
+        Tag::Byte(value) => format!("{value}b"),
+        Tag::Short(value) => format!("{value}s"),
+        Tag::Int(value) => value.to_string(),
+        Tag::Long(value) => format!("{value}L"),
+        Tag::Float(bits) => format!("{}f", java_f32(f32::from_bits(*bits))),
+        Tag::Double(bits) => format!("{}d", java_f64(f64::from_bits(*bits))),
+        Tag::String(value) => return Ok(value.clone()),
+        _ => return Err("string source requires a primitive NBT value".to_owned()),
+    };
+    Ok(JavaString::from(value.as_str()))
+}
+
+fn minecraft_floor_to_i32(value: f64) -> i32 {
+    value.floor() as i32
 }
 
 fn schedule_next_instruction<'a>(queue: &mut VecDeque<QueueEntry<'a>>, frame: Frame<'a>) {

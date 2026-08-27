@@ -2,13 +2,14 @@
 //! data packs.
 //!
 //! The current slice supports function calls and returns, persistent named
-//! scoreboard arithmetic, function tags, score- and function-backed `execute`
-//! conditions, and `execute store score`/`return run` result propagation.
+//! scoreboard arithmetic, command storage and NBT data operations, function
+//! tags, supported `execute` conditions, and result propagation.
 //! Functions and tags can be compiled from an expanded directory data pack or
 //! in-memory source. Construction is atomic: an invalid supported resource
 //! rejects the whole program instead of leaving a partially populated VM.
 
 mod loader;
+mod nbt;
 mod program;
 mod resource;
 mod runtime;
@@ -18,6 +19,7 @@ use std::path::Path;
 pub use loader::{CompileError, LoadError};
 pub use runtime::{ExecutionError, FunctionOutcome};
 
+use nbt::CommandStorage;
 use program::{Program, Scoreboard};
 
 /// A loaded worldless data-pack program.
@@ -25,6 +27,7 @@ use program::{Program, Scoreboard};
 pub struct Vm {
     program: Program,
     scoreboard: Scoreboard,
+    command_storage: CommandStorage,
 }
 
 impl Vm {
@@ -81,13 +84,20 @@ impl Vm {
         id: &str,
         command_limit: usize,
     ) -> Result<FunctionOutcome, ExecutionError> {
-        runtime::execute(&self.program, &mut self.scoreboard, id, command_limit)
+        runtime::execute(
+            &self.program,
+            &mut self.scoreboard,
+            &mut self.command_storage,
+            id,
+            command_limit,
+        )
     }
 
     fn new(program: Program) -> Self {
         Self {
             program,
             scoreboard: Scoreboard::default(),
+            command_storage: CommandStorage::default(),
         }
     }
 }
