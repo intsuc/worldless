@@ -1,3 +1,6 @@
+mod common;
+
+use common::context;
 use worldless::{
     ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
 };
@@ -79,34 +82,37 @@ fn function_conditions_test_the_return_value_without_using_success() {
     ]);
 
     assert_eq!(
-        vm.execute_function("example:if_nonzero", LIMIT).unwrap(),
+        vm.execute_function("example:if_nonzero", context(), LIMIT)
+            .unwrap(),
         returned(true, 11)
     );
     assert_eq!(
-        vm.execute_function("example:if_zero", LIMIT).unwrap(),
-        returned(false, 0)
-    );
-    assert_eq!(
-        vm.execute_function("example:unless_nonzero", LIMIT)
+        vm.execute_function("example:if_zero", context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:unless_zero", LIMIT).unwrap(),
+        vm.execute_function("example:unless_nonzero", context(), LIMIT)
+            .unwrap(),
+        returned(false, 0)
+    );
+    assert_eq!(
+        vm.execute_function("example:unless_zero", context(), LIMIT)
+            .unwrap(),
         returned(true, 12)
     );
     assert_eq!(
-        vm.execute_function("example:unless_failure", LIMIT)
+        vm.execute_function("example:unless_failure", context(), LIMIT)
             .unwrap(),
         returned(true, 13)
     );
     assert_eq!(
-        vm.execute_function("example:unless_fallthrough", LIMIT)
+        vm.execute_function("example:unless_fallthrough", context(), LIMIT)
             .unwrap(),
         returned(true, 14)
     );
     assert_eq!(
-        vm.execute_function("example:condition_before_return", LIMIT)
+        vm.execute_function("example:condition_before_return", context(), LIMIT)
             .unwrap(),
         returned(true, 16)
     );
@@ -140,17 +146,17 @@ fn only_a_return_from_the_tested_function_produces_a_condition_value() {
     ]);
 
     assert_eq!(
-        vm.execute_function("example:normal_is_zero", LIMIT)
+        vm.execute_function("example:normal_is_zero", context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:returning_is_nonzero", LIMIT)
+        vm.execute_function("example:returning_is_nonzero", context(), LIMIT)
             .unwrap(),
         returned(true, 2)
     );
     assert_eq!(
-        vm.execute_function("example:no_callback_is_not_zero", LIMIT)
+        vm.execute_function("example:no_callback_is_not_zero", context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
@@ -185,29 +191,30 @@ fn unknown_condition_functions_abort_the_chain_for_both_polarities() {
         ),
     ]);
 
-    vm.execute_function("example:setup", LIMIT).unwrap();
+    vm.execute_function("example:setup", context(), LIMIT)
+        .unwrap();
     assert_eq!(
-        vm.execute_function("example:condition_before_return", LIMIT)
+        vm.execute_function("example:condition_before_return", context(), LIMIT)
             .unwrap(),
         returned(true, 5)
     );
     assert_eq!(
-        vm.execute_function("example:return_before_condition", LIMIT)
+        vm.execute_function("example:return_before_condition", context(), LIMIT)
             .unwrap(),
         FunctionOutcome::FellThrough
     );
     assert_eq!(
-        vm.execute_function("example:if_before_return", LIMIT)
+        vm.execute_function("example:if_before_return", context(), LIMIT)
             .unwrap(),
         returned(true, 6)
     );
     assert_eq!(
-        vm.execute_function("example:inactive_after_return", LIMIT)
+        vm.execute_function("example:inactive_after_return", context(), LIMIT)
             .unwrap(),
         FunctionOutcome::FellThrough
     );
     assert_eq!(
-        vm.execute_function("example:store_before_unknown", LIMIT)
+        vm.execute_function("example:store_before_unknown", context(), LIMIT)
             .unwrap(),
         returned(true, 9)
     );
@@ -243,23 +250,26 @@ fn tested_functions_keep_side_effects_but_do_not_receive_outer_stores() {
         ),
     ]);
 
-    vm.execute_function("example:setup", LIMIT).unwrap();
+    vm.execute_function("example:setup", context(), LIMIT)
+        .unwrap();
     assert_eq!(
-        vm.execute_function("example:filtered_store", LIMIT)
+        vm.execute_function("example:filtered_store", context(), LIMIT)
             .unwrap(),
         returned(true, 9)
     );
     assert_eq!(
-        vm.execute_function("example:read_evaluations", LIMIT)
+        vm.execute_function("example:read_evaluations", context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:passing_store", LIMIT).unwrap(),
+        vm.execute_function("example:passing_store", context(), LIMIT)
+            .unwrap(),
         returned(true, 7)
     );
     assert_eq!(
-        vm.execute_function("example:read_stored", LIMIT).unwrap(),
+        vm.execute_function("example:read_stored", context(), LIMIT)
+            .unwrap(),
         returned(true, 7)
     );
 }
@@ -310,36 +320,41 @@ fn function_conditions_resume_the_remaining_modifier_chain_in_order() {
         ),
     ]);
 
-    vm.execute_function("example:setup", LIMIT).unwrap();
+    vm.execute_function("example:setup", context(), LIMIT)
+        .unwrap();
     assert_eq!(
-        vm.execute_function("example:function_then_score", LIMIT)
+        vm.execute_function("example:function_then_score", context(), LIMIT)
             .unwrap(),
         returned(true, 8)
     );
-    vm.execute_function("example:reset_calls", LIMIT).unwrap();
+    vm.execute_function("example:reset_calls", context(), LIMIT)
+        .unwrap();
     assert_eq!(
-        vm.execute_function("example:score_then_function", LIMIT)
+        vm.execute_function("example:score_then_function", context(), LIMIT)
             .unwrap(),
         returned(true, 9)
     );
-    vm.execute_function("example:reset_calls", LIMIT).unwrap();
+    vm.execute_function("example:reset_calls", context(), LIMIT)
+        .unwrap();
     assert_eq!(
-        vm.execute_function("example:inactive_function", LIMIT)
+        vm.execute_function("example:inactive_function", context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:two_function_conditions", LIMIT)
+        vm.execute_function("example:two_function_conditions", context(), LIMIT)
             .unwrap(),
         returned(true, 11)
     );
     assert_eq!(
-        vm.execute_function("example:read_calls", LIMIT).unwrap(),
+        vm.execute_function("example:read_calls", context(), LIMIT)
+            .unwrap(),
         returned(true, 11)
     );
-    vm.execute_function("example:reset_calls", LIMIT).unwrap();
+    vm.execute_function("example:reset_calls", context(), LIMIT)
+        .unwrap();
     assert_eq!(
-        vm.execute_function("example:short_circuited_function", LIMIT)
+        vm.execute_function("example:short_circuited_function", context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
@@ -356,7 +371,8 @@ fn a_function_condition_forks_the_remaining_modifier_chain() {
     ]);
 
     assert_eq!(
-        vm.execute_function("example:main", LIMIT).unwrap(),
+        vm.execute_function("example:main", context(), LIMIT)
+            .unwrap(),
         returned(false, 0)
     );
 }
@@ -376,15 +392,16 @@ fn function_condition_calls_consume_quota_but_the_modifier_does_not() {
     ]);
 
     assert_eq!(
-        vm.execute_function("example:condition", 2),
+        vm.execute_function("example:condition", context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_eq!(
-        vm.execute_function("example:condition", 3).unwrap(),
+        vm.execute_function("example:condition", context(), 3)
+            .unwrap(),
         returned(true, 9)
     );
     assert_eq!(
-        vm.execute_function("example:recursive", 10),
+        vm.execute_function("example:recursive", context(), 10),
         Err(ExecutionError::CommandLimitExceeded { limit: 10 })
     );
 }
@@ -410,13 +427,15 @@ fn quota_failure_preserves_tested_function_side_effects() {
         ),
     ]);
 
-    vm.execute_function("example:setup", LIMIT).unwrap();
+    vm.execute_function("example:setup", context(), LIMIT)
+        .unwrap();
     assert_eq!(
-        vm.execute_function("example:condition", 3),
+        vm.execute_function("example:condition", context(), 3),
         Err(ExecutionError::CommandLimitExceeded { limit: 3 })
     );
     assert_eq!(
-        vm.execute_function("example:read_calls", LIMIT).unwrap(),
+        vm.execute_function("example:read_calls", context(), LIMIT)
+            .unwrap(),
         returned(true, 1)
     );
 }

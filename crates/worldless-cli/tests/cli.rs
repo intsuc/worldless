@@ -28,13 +28,21 @@ impl TestPack {
     }
 
     fn write_function(&self, id: &str, source: &str) {
+        self.write_resource("function", id, "mcfunction", source);
+    }
+
+    fn write_predicate(&self, id: &str, source: &str) {
+        self.write_resource("predicate", id, "json", source);
+    }
+
+    fn write_resource(&self, kind: &str, id: &str, extension: &str, source: &str) {
         let (namespace, path) = id.split_once(':').unwrap();
         let path = self
             .root
             .join("data")
             .join(namespace)
-            .join("function")
-            .join(format!("{path}.mcfunction"));
+            .join(kind)
+            .join(format!("{path}.{extension}"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, source).unwrap();
     }
@@ -84,8 +92,16 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
     high.write_function("example:returned", "return fail\n");
     high.write_function("example:value", "return 42\n");
     high.write_function("example:fell_through", "");
+    high.write_function(
+        "example:context",
+        "return run execute positioned ^ ^ ^1 if predicate example:ahead\n",
+    );
+    high.write_predicate(
+        "example:ahead",
+        r#"{"type":"location_check","predicate":{"position":{"x":{"min":-0.001,"max":0.001},"y":64,"z":{"min":0.999,"max":1.001}}}}"#,
+    );
 
-    let common = [
+    let common: Vec<&std::ffi::OsStr> = vec![
         "run".as_ref(),
         "--pack".as_ref(),
         low.root().as_os_str(),
@@ -93,47 +109,38 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
         high.root().as_os_str(),
         "--command-limit".as_ref(),
         "16".as_ref(),
+        "--position".as_ref(),
+        "0".as_ref(),
+        "64".as_ref(),
+        "0".as_ref(),
+        "--rotation".as_ref(),
+        "0".as_ref(),
+        "0".as_ref(),
     ];
-    let output = worldless(&[
-        common[0],
-        common[1],
-        common[2],
-        common[3],
-        common[4],
-        common[5],
-        common[6],
-        "example:returned".as_ref(),
-    ]);
+    let run = |function: &str| {
+        let mut arguments = common.clone();
+        arguments.push(function.as_ref());
+        worldless(&arguments)
+    };
+
+    let output = run("example:returned");
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(text(&output.stdout), "returned success=false value=0\n");
     assert!(output.stderr.is_empty());
 
-    let output = worldless(&[
-        common[0],
-        common[1],
-        common[2],
-        common[3],
-        common[4],
-        common[5],
-        common[6],
-        "example:value".as_ref(),
-    ]);
+    let output = run("example:value");
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(text(&output.stdout), "returned success=true value=42\n");
     assert!(output.stderr.is_empty());
 
-    let output = worldless(&[
-        common[0],
-        common[1],
-        common[2],
-        common[3],
-        common[4],
-        common[5],
-        common[6],
-        "example:fell_through".as_ref(),
-    ]);
+    let output = run("example:fell_through");
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(text(&output.stdout), "fell-through\n");
+    assert!(output.stderr.is_empty());
+
+    let output = run("example:context");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(text(&output.stdout), "returned success=true value=1\n");
     assert!(output.stderr.is_empty());
 }
 
@@ -179,6 +186,13 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
         "--pack".as_ref(),
         pack.root().as_os_str(),
         "--command-limit".as_ref(),
+        "0".as_ref(),
+        "--position".as_ref(),
+        "0".as_ref(),
+        "0".as_ref(),
+        "0".as_ref(),
+        "--rotation".as_ref(),
+        "0".as_ref(),
         "0".as_ref(),
         "example:main".as_ref(),
     ]);

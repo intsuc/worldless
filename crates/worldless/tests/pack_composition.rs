@@ -1,3 +1,6 @@
+mod common;
+
+use common::context;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -90,7 +93,11 @@ fn returned(value: i32) -> FunctionOutcome {
 }
 
 fn assert_function(vm: &mut Vm, id: &str, expected: FunctionOutcome) {
-    assert_eq!(vm.execute_function(id, LIMIT).unwrap(), expected, "{id}");
+    assert_eq!(
+        vm.execute_function(id, context(), LIMIT).unwrap(),
+        expected,
+        "{id}"
+    );
 }
 
 #[test]
@@ -347,7 +354,7 @@ fn directory_and_memory_packs_share_the_same_priority_order() {
 fn an_empty_pack_stack_builds_an_empty_vm() {
     let mut vm = Vm::from_packs(std::iter::empty::<Pack>()).unwrap();
     assert_eq!(
-        vm.execute_function("example:missing", LIMIT),
+        vm.execute_function("example:missing", context(), LIMIT),
         Err(ExecutionError::UnknownFunction {
             id: "example:missing".to_owned(),
         })

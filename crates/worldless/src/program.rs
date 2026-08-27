@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::execution_context::ContextTransform;
 use crate::macro_function::Function;
 use crate::nbt::{CompoundTag, JavaString, NbtPath, Tag};
 use crate::number_provider::{LootRegistry, NumberProviderReference};
@@ -64,6 +65,7 @@ pub(crate) struct Instruction {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Modifier {
+    ContextTransform(ContextTransform),
     StoreScore {
         kind: StoreKind,
         holders: ScoreHolderSet,

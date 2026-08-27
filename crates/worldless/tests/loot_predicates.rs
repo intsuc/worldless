@@ -1,3 +1,6 @@
+mod common;
+
+use common::context;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -94,7 +97,7 @@ fn returned(success: bool, value: i32) -> FunctionOutcome {
 
 fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
     assert_eq!(
-        vm.execute_function(function, LIMIT).unwrap(),
+        vm.execute_function(function, context(), LIMIT).unwrap(),
         expected,
         "{function}"
     );
@@ -388,7 +391,10 @@ fn uniform_after(predicate: &str, predicate_tags: &[(&str, &str)]) -> i32 {
         ],
         predicate_tags,
     );
-    match vm.execute_function("example:main", LIMIT).unwrap() {
+    match vm
+        .execute_function("example:main", context(), LIMIT)
+        .unwrap()
+    {
         FunctionOutcome::Returned {
             success: true,
             value,

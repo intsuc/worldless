@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::{
+    execution_context::ExecutionContext,
     nbt::{CommandStorage, JavaString, NbtPath, Tag},
     predicate::{
         LootPredicate, PredicateReference, PredicateSet, builtin_predicates,
@@ -215,10 +216,16 @@ impl LootRegistry {
         provider: &NumberProviderReference,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
         random: &mut LegacyRandom,
     ) -> Result<f32, String> {
-        self.resolve_number_provider(provider)
-            .get_float(self, scoreboard, command_storage, random)
+        self.resolve_number_provider(provider).get_float(
+            self,
+            scoreboard,
+            command_storage,
+            execution_context,
+            random,
+        )
     }
 
     pub(crate) fn get_int(
@@ -226,10 +233,16 @@ impl LootRegistry {
         provider: &NumberProviderReference,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
         random: &mut LegacyRandom,
     ) -> Result<i32, String> {
-        self.resolve_number_provider(provider)
-            .get_int(self, scoreboard, command_storage, random)
+        self.resolve_number_provider(provider).get_int(
+            self,
+            scoreboard,
+            command_storage,
+            execution_context,
+            random,
+        )
     }
 
     pub(crate) fn resolve_number_provider<'a>(
@@ -311,10 +324,16 @@ impl LootRegistry {
         predicate: &PredicateReference,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
         random: &mut LegacyRandom,
     ) -> Result<bool, String> {
-        self.resolve_predicate(predicate)
-            .test(self, scoreboard, command_storage, random)
+        self.resolve_predicate(predicate).test(
+            self,
+            scoreboard,
+            command_storage,
+            execution_context,
+            random,
+        )
     }
 
     fn validate(
@@ -532,6 +551,7 @@ impl LootRegistry {
                 }
                 Ok(())
             }
+            LootPredicate::LocationCheck { .. } => Ok(()),
         }
     }
 
@@ -580,6 +600,7 @@ impl NumberProvider {
         registry: &LootRegistry,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
         random: &mut LegacyRandom,
     ) -> Result<f32, String> {
         match self {
@@ -589,12 +610,14 @@ impl NumberProvider {
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )?;
                 let max = registry.resolve_number_provider(max).get_float(
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )?;
                 Ok(if min >= max {
@@ -604,7 +627,13 @@ impl NumberProvider {
                 })
             }
             Self::Binomial { .. } => self
-                .get_int(registry, scoreboard, command_storage, random)
+                .get_int(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )
                 .map(|value| value as f32),
             Self::Storage { storage, path } => Ok(storage_number(command_storage, storage, path)
                 .as_ref()
@@ -620,14 +649,26 @@ impl NumberProvider {
             Self::Sum(providers) => {
                 let mut value = 0.0;
                 for provider in registry.number_provider_values(providers) {
-                    value += provider.get_float(registry, scoreboard, command_storage, random)?;
+                    value += provider.get_float(
+                        registry,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )?;
                 }
                 Ok(value)
             }
             Self::Product(providers) => {
                 let mut value = 1.0;
                 for provider in registry.number_provider_values(providers) {
-                    value *= provider.get_float(registry, scoreboard, command_storage, random)?;
+                    value *= provider.get_float(
+                        registry,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )?;
                 }
                 Ok(value)
             }
@@ -636,7 +677,13 @@ impl NumberProvider {
                 for provider in registry.number_provider_values(providers) {
                     value = java_min(
                         value,
-                        provider.get_float(registry, scoreboard, command_storage, random)?,
+                        provider.get_float(
+                            registry,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?,
                     );
                 }
                 Ok(value)
@@ -646,7 +693,13 @@ impl NumberProvider {
                 for provider in registry.number_provider_values(providers) {
                     value = java_max(
                         value,
-                        provider.get_float(registry, scoreboard, command_storage, random)?,
+                        provider.get_float(
+                            registry,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?,
                     );
                 }
                 Ok(value)
@@ -655,7 +708,13 @@ impl NumberProvider {
                 let mut sum = 0.0_f32;
                 let mut count = 0_u32;
                 for provider in registry.number_provider_values(providers) {
-                    sum += provider.get_float(registry, scoreboard, command_storage, random)?;
+                    sum += provider.get_float(
+                        registry,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )?;
                     count += 1;
                 }
                 Ok(if count == 0 { 0.0 } else { sum / count as f32 })
@@ -667,6 +726,7 @@ impl NumberProvider {
                         &case.condition,
                         scoreboard,
                         command_storage,
+                        execution_context,
                         random,
                     )? {
                         selected = &case.number_provider;
@@ -677,6 +737,7 @@ impl NumberProvider {
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )
             }
@@ -685,16 +746,22 @@ impl NumberProvider {
                 on_true,
                 on_false,
             } => {
-                let selected =
-                    if registry.test_predicate(condition, scoreboard, command_storage, random)? {
-                        on_true
-                    } else {
-                        on_false
-                    };
+                let selected = if registry.test_predicate(
+                    condition,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )? {
+                    on_true
+                } else {
+                    on_false
+                };
                 registry.resolve_number_provider(selected).get_float(
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )
             }
@@ -708,6 +775,7 @@ impl NumberProvider {
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )
             }
@@ -719,6 +787,7 @@ impl NumberProvider {
         registry: &LootRegistry,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
         random: &mut LegacyRandom,
     ) -> Result<i32, String> {
         match self {
@@ -727,12 +796,14 @@ impl NumberProvider {
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )?;
                 let max = registry.resolve_number_provider(max).get_int(
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )?;
                 if min >= max {
@@ -747,12 +818,14 @@ impl NumberProvider {
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )?;
                 let p = registry.resolve_number_provider(p).get_float(
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )?;
                 let mut result = 0;
@@ -774,6 +847,7 @@ impl NumberProvider {
                         registry,
                         scoreboard,
                         command_storage,
+                        execution_context,
                         random,
                     )?));
                 }
@@ -786,6 +860,7 @@ impl NumberProvider {
                         registry,
                         scoreboard,
                         command_storage,
+                        execution_context,
                         random,
                     )?));
                 }
@@ -798,6 +873,7 @@ impl NumberProvider {
                         registry,
                         scoreboard,
                         command_storage,
+                        execution_context,
                         random,
                     )?);
                 }
@@ -810,6 +886,7 @@ impl NumberProvider {
                         registry,
                         scoreboard,
                         command_storage,
+                        execution_context,
                         random,
                     )?);
                 }
@@ -823,6 +900,7 @@ impl NumberProvider {
                         registry,
                         scoreboard,
                         command_storage,
+                        execution_context,
                         random,
                     )?));
                     count += 1;
@@ -840,6 +918,7 @@ impl NumberProvider {
                         &case.condition,
                         scoreboard,
                         command_storage,
+                        execution_context,
                         random,
                     )? {
                         selected = &case.number_provider;
@@ -850,6 +929,7 @@ impl NumberProvider {
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )
             }
@@ -858,16 +938,22 @@ impl NumberProvider {
                 on_true,
                 on_false,
             } => {
-                let selected =
-                    if registry.test_predicate(condition, scoreboard, command_storage, random)? {
-                        on_true
-                    } else {
-                        on_false
-                    };
+                let selected = if registry.test_predicate(
+                    condition,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )? {
+                    on_true
+                } else {
+                    on_false
+                };
                 registry.resolve_number_provider(selected).get_int(
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )
             }
@@ -881,11 +967,18 @@ impl NumberProvider {
                     registry,
                     scoreboard,
                     command_storage,
+                    execution_context,
                     random,
                 )
             }
             Self::Constant(_) | Self::Score { .. } => self
-                .get_float(registry, scoreboard, command_storage, random)
+                .get_float(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )
                 .map(java_round),
         }
     }
@@ -1602,11 +1695,16 @@ mod tests {
             parse_json(r#"{"type":"sum","operands":[0.6,0.6]}"#).unwrap(),
         ));
         let mut random = LegacyRandom::default();
+        let execution_context = ExecutionContext::new(
+            crate::execution_context::Position::new(0.0, 0.0, 0.0),
+            crate::execution_context::Rotation::new(0.0, 0.0),
+        );
         assert_eq!(
             registry.get_float(
                 &provider,
                 &Scoreboard::default(),
                 &CommandStorage::default(),
+                &execution_context,
                 &mut random,
             ),
             Ok(1.2)
@@ -1616,6 +1714,7 @@ mod tests {
                 &provider,
                 &Scoreboard::default(),
                 &CommandStorage::default(),
+                &execution_context,
                 &mut random,
             ),
             Ok(2)

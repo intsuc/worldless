@@ -1,3 +1,6 @@
+mod common;
+
+use common::context;
 use worldless::{
     ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
 };
@@ -25,7 +28,7 @@ where
 
 fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
     assert_eq!(
-        vm.execute_function(function, LIMIT).unwrap(),
+        vm.execute_function(function, context(), LIMIT).unwrap(),
         expected,
         "{function}"
     );
@@ -1033,30 +1036,30 @@ fn storage_side_effects_before_the_command_limit_are_not_rolled_back() {
 
     assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
     assert_eq!(
-        vm.execute_function("example:modify_at_limit", 2),
+        vm.execute_function("example:modify_at_limit", context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_function(&mut vm, "example:read_modified", returned(true, 7));
     assert_eq!(
-        vm.execute_function("example:store_at_limit", 2),
+        vm.execute_function("example:store_at_limit", context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_function(&mut vm, "example:read_stored", returned(true, 6));
     assert_eq!(
-        vm.execute_function("example:condition_at_limit", 2),
+        vm.execute_function("example:condition_at_limit", context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_eq!(
-        vm.execute_function("example:condition_at_limit", 3)
+        vm.execute_function("example:condition_at_limit", context(), 3)
             .unwrap(),
         returned(true, 9)
     );
     assert_eq!(
-        vm.execute_function("example:terminal_condition_at_limit", 2),
+        vm.execute_function("example:terminal_condition_at_limit", context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_eq!(
-        vm.execute_function("example:terminal_condition_at_limit", 3)
+        vm.execute_function("example:terminal_condition_at_limit", context(), 3)
             .unwrap(),
         returned(true, 1)
     );

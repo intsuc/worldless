@@ -1,3 +1,6 @@
+mod common;
+
+use common::context;
 use worldless::{
     ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
 };
@@ -43,7 +46,7 @@ where
 
 fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
     assert_eq!(
-        vm.execute_function(function, LIMIT).unwrap(),
+        vm.execute_function(function, context(), LIMIT).unwrap(),
         expected,
         "{function}"
     );
@@ -424,7 +427,7 @@ fn macro_conditions_have_no_arguments_and_top_level_failure_is_explicit() {
 
     assert_function(&mut vm, "example:unless_macro", returned(true, 1));
     assert!(matches!(
-        vm.execute_function("example:macro", LIMIT),
+        vm.execute_function("example:macro", context(), LIMIT),
         Err(ExecutionError::FunctionInstantiationFailed { .. })
     ));
 
@@ -457,8 +460,8 @@ fn macro_instantiation_does_not_consume_command_quota() {
 
     for limit in 1..=8 {
         assert_eq!(
-            vm.execute_function("example:plain_call", limit),
-            vm.execute_function("example:macro_call", limit),
+            vm.execute_function("example:plain_call", context(), limit),
+            vm.execute_function("example:macro_call", context(), limit),
             "limit {limit}"
         );
     }

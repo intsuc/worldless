@@ -5,14 +5,14 @@ use std::{
     process::ExitCode,
 };
 
-use worldless::{FunctionOutcome, Pack, Vm};
+use worldless::{ExecutionContext, FunctionOutcome, Pack, Position, Rotation, Vm};
 
-const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] --command-limit <USIZE> <FUNCTION_ID>";
+const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] --command-limit <USIZE> --position <X> <Y> <Z> --rotation <YAW> <PITCH> <FUNCTION_ID>";
 const EXIT_USAGE: u8 = 2;
 const EXIT_LOAD: u8 = 3;
 const EXIT_EXECUTION: u8 = 4;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 enum CliCommand {
     Check {
         packs: Vec<PathBuf>,
@@ -20,6 +20,7 @@ enum CliCommand {
     Run {
         packs: Vec<PathBuf>,
         command_limit: usize,
+        context: ExecutionContext,
         function_id: String,
     },
 }
@@ -47,11 +48,13 @@ fn main() -> ExitCode {
         CliCommand::Run {
             packs,
             command_limit,
+            context,
             function_id,
         } => (
             packs,
             Operation::Run {
                 command_limit,
+                context,
                 function_id,
             },
         ),
@@ -68,8 +71,9 @@ fn main() -> ExitCode {
         Operation::Check => println!("ok"),
         Operation::Run {
             command_limit,
+            context,
             function_id,
-        } => match vm.execute_function(&function_id, command_limit) {
+        } => match vm.execute_function(&function_id, context, command_limit) {
             Ok(FunctionOutcome::FellThrough) => println!("fell-through"),
             Ok(FunctionOutcome::Returned { success, value }) => {
                 println!("returned success={success} value={value}")
@@ -88,6 +92,7 @@ enum Operation {
     Check,
     Run {
         command_limit: usize,
+        context: ExecutionContext,
         function_id: String,
     },
 }
@@ -140,6 +145,20 @@ fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, Us
         None => return Err(usage_error("missing --command-limit")),
     }
     let command_limit = parse_command_limit(arguments.next())?;
+
+    expect_option(arguments.next(), "--position")?;
+    let position = Position::new(
+        parse_finite_f64(arguments.next(), "--position X")?,
+        parse_finite_f64(arguments.next(), "--position Y")?,
+        parse_finite_f64(arguments.next(), "--position Z")?,
+    );
+
+    expect_option(arguments.next(), "--rotation")?;
+    let rotation = Rotation::new(
+        parse_finite_f32(arguments.next(), "--rotation YAW")?,
+        parse_finite_f32(arguments.next(), "--rotation PITCH")?,
+    );
+
     let function_id = parse_function_id(arguments.next())?;
     if let Some(argument) = arguments.next() {
         if argument == "--command-limit" {
@@ -151,6 +170,7 @@ fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, Us
     Ok(CliCommand::Run {
         packs,
         command_limit,
+        context: ExecutionContext::new(position, rotation),
         function_id,
     })
 }
@@ -195,6 +215,60 @@ fn parse_command_limit(argument: Option<OsString>) -> Result<usize, UsageError> 
         .map_err(|_| usage_error(format!("invalid --command-limit {text:?}")))
 }
 
+fn expect_option(argument: Option<OsString>, expected: &str) -> Result<(), UsageError> {
+    match argument {
+        Some(argument) if argument == expected => Ok(()),
+        Some(argument) => Err(usage_error(format!(
+            "expected {expected}, found {argument:?}"
+        ))),
+        None => Err(usage_error(format!("missing {expected}"))),
+    }
+}
+
+fn parse_finite_f64(argument: Option<OsString>, value_name: &str) -> Result<f64, UsageError> {
+    let text = parse_number_text(argument, value_name)?;
+    let value = text
+        .parse::<f64>()
+        .map_err(|_| invalid_number(value_name, &text))?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(invalid_number(value_name, &text))
+    }
+}
+
+fn parse_finite_f32(argument: Option<OsString>, value_name: &str) -> Result<f32, UsageError> {
+    let text = parse_number_text(argument, value_name)?;
+    let value = text
+        .parse::<f32>()
+        .map_err(|_| invalid_number(value_name, &text))?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(invalid_number(value_name, &text))
+    }
+}
+
+fn parse_number_text(argument: Option<OsString>, value_name: &str) -> Result<String, UsageError> {
+    let argument =
+        argument.ok_or_else(|| usage_error(format!("missing value for {value_name}")))?;
+    if is_known_option(&argument) {
+        return Err(usage_error(format!("missing value for {value_name}")));
+    }
+    if is_option(&argument) {
+        return Err(unexpected_argument(argument));
+    }
+    argument
+        .into_string()
+        .map_err(|_| usage_error(format!("{value_name} is not valid UTF-8")))
+}
+
+fn invalid_number(value_name: &str, text: &str) -> UsageError {
+    usage_error(format!(
+        "invalid {value_name} {text:?}; expected a finite number"
+    ))
+}
+
 fn parse_function_id(argument: Option<OsString>) -> Result<String, UsageError> {
     let argument = argument.ok_or_else(|| usage_error("missing function identifier"))?;
     if is_option(&argument) {
@@ -215,7 +289,10 @@ fn is_option(argument: &OsStr) -> bool {
 }
 
 fn is_known_option(argument: &OsStr) -> bool {
-    argument == "--pack" || argument == "--command-limit"
+    argument == "--pack"
+        || argument == "--command-limit"
+        || argument == "--position"
+        || argument == "--rotation"
 }
 
 fn unexpected_argument(argument: OsString) -> UsageError {
@@ -255,12 +332,23 @@ mod tests {
                 "high",
                 "--command-limit",
                 "12",
+                "--position",
+                "-1.5",
+                "2",
+                "-3.25",
+                "--rotation",
+                "-90",
+                "45.5",
                 "example:main",
             ])
             .unwrap(),
             CliCommand::Run {
                 packs: vec![PathBuf::from("low"), PathBuf::from("high")],
                 command_limit: 12,
+                context: ExecutionContext::new(
+                    Position::new(-1.5, 2.0, -3.25),
+                    Rotation::new(-90.0, 45.5),
+                ),
                 function_id: "example:main".to_owned(),
             }
         );
@@ -354,6 +442,122 @@ mod tests {
     }
 
     #[test]
+    fn requires_an_explicit_finite_execution_context() {
+        for arguments in [
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--command-limit",
+                "1",
+                "example:main",
+            ][..],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--command-limit",
+                "1",
+                "--position",
+                "0",
+                "0",
+                "--rotation",
+                "0",
+                "0",
+                "example:main",
+            ],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--command-limit",
+                "1",
+                "--position",
+                "0",
+                "0",
+                "0",
+                "example:main",
+            ],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--command-limit",
+                "1",
+                "--position",
+                "0",
+                "0",
+                "0",
+                "--rotation",
+                "0",
+                "example:main",
+            ],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--command-limit",
+                "1",
+                "--position",
+                "NaN",
+                "0",
+                "0",
+                "--rotation",
+                "0",
+                "0",
+                "example:main",
+            ],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--command-limit",
+                "1",
+                "--position",
+                "0",
+                "0",
+                "0",
+                "--rotation",
+                "inf",
+                "0",
+                "example:main",
+            ],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--command-limit",
+                "1",
+                "--position",
+                "1e309",
+                "0",
+                "0",
+                "--rotation",
+                "0",
+                "0",
+                "example:main",
+            ],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--command-limit",
+                "1",
+                "--position",
+                "0",
+                "0",
+                "0",
+                "--rotation",
+                "1e39",
+                "0",
+                "example:main",
+            ],
+        ] {
+            assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+        }
+    }
+
+    #[test]
     fn rejects_unknown_options_and_extra_positionals() {
         for arguments in [
             &["check", "--unknown", "value"][..],
@@ -367,6 +571,13 @@ mod tests {
                 "pack",
                 "--command-limit",
                 "1",
+                "--position",
+                "0",
+                "0",
+                "0",
+                "--rotation",
+                "0",
+                "0",
                 "example:main",
                 "extra",
             ],

@@ -1,6 +1,7 @@
 use std::{cell::Cell, collections::VecDeque, error::Error, fmt, rc::Rc, sync::Arc};
 
 use crate::{
+    execution_context::ExecutionContext,
     loader::CommandCompiler,
     macro_function::Function,
     nbt::{CommandStorage, JavaString, Tag},
@@ -202,6 +203,7 @@ impl ResultConsumer {
 
 struct Frame {
     function: Arc<[Instruction]>,
+    context: ExecutionContext,
     next_instruction: usize,
     depth: usize,
     discard_depth: usize,
@@ -213,6 +215,7 @@ enum QueueEntry {
     Step(Frame),
     Prepare {
         frame: Frame,
+        context: ExecutionContext,
         instruction: usize,
         next_modifier: usize,
         stores: Vec<StoreAction>,
@@ -222,12 +225,14 @@ enum QueueEntry {
     },
     ExecuteOrdinary {
         frame: Frame,
+        context: ExecutionContext,
         instruction: usize,
         stores: Vec<StoreAction>,
         return_run: bool,
     },
     ResumeFunctionCondition {
         frame: Frame,
+        context: ExecutionContext,
         instruction: usize,
         next_modifier: usize,
         stores: Vec<StoreAction>,
@@ -237,6 +242,7 @@ enum QueueEntry {
     },
     ContinueFunctionTag {
         frame: Frame,
+        context: ExecutionContext,
         functions: Arc<[Arc<[Instruction]>]>,
         next_function: usize,
         stores: Vec<StoreAction>,
@@ -288,6 +294,7 @@ pub(crate) fn execute(
     command_storage: &mut CommandStorage,
     random: &mut LegacyRandom,
     input: &str,
+    context: ExecutionContext,
     command_limit: usize,
 ) -> Result<FunctionOutcome, ExecutionError> {
     let id = Identifier::parse(input).ok_or_else(|| ExecutionError::InvalidFunctionIdentifier {
@@ -302,6 +309,7 @@ pub(crate) fn execute(
     })?;
     let mut queue = VecDeque::from([QueueEntry::Call(Frame {
         function,
+        context,
         next_instruction: 0,
         depth: 0,
         discard_depth: 0,
@@ -328,8 +336,10 @@ pub(crate) fn execute(
             QueueEntry::Step(mut frame) => {
                 let instruction = frame.next_instruction;
                 frame.next_instruction += 1;
+                let context = frame.context;
                 queue.push_front(QueueEntry::Prepare {
                     frame,
+                    context,
                     instruction,
                     next_modifier: 0,
                     stores: Vec::new(),
@@ -340,6 +350,7 @@ pub(crate) fn execute(
             }
             QueueEntry::Prepare {
                 frame,
+                mut context,
                 instruction,
                 mut next_modifier,
                 stores,
@@ -360,6 +371,12 @@ pub(crate) fn execute(
                     };
                     next_modifier += 1;
                     match modifier {
+                        Modifier::ContextTransform(transform) => {
+                            quota.increment();
+                            if active {
+                                transform.apply(&mut context);
+                            }
+                        }
                         Modifier::StoreScore {
                             kind,
                             holders,
@@ -441,6 +458,7 @@ pub(crate) fn execute(
                                         &condition.predicate,
                                         scoreboard,
                                         command_storage,
+                                        &context,
                                         random,
                                     )
                                     .map_err(|reason| {
@@ -470,6 +488,7 @@ pub(crate) fn execute(
                             if !active {
                                 queue.push_front(QueueEntry::Prepare {
                                     frame,
+                                    context,
                                     instruction,
                                     next_modifier,
                                     stores,
@@ -493,6 +512,7 @@ pub(crate) fn execute(
                             let isolated_depth = frame.depth + 1;
                             queue.push_front(QueueEntry::ResumeFunctionCondition {
                                 frame,
+                                context,
                                 instruction,
                                 next_modifier,
                                 stores,
@@ -508,6 +528,7 @@ pub(crate) fn execute(
                             for function in condition_functions.into_iter().rev() {
                                 queue.push_front(QueueEntry::Call(Frame {
                                     function,
+                                    context,
                                     next_instruction: 0,
                                     depth: isolated_depth,
                                     discard_depth: isolated_depth,
@@ -522,6 +543,7 @@ pub(crate) fn execute(
                                 discard_at_depth_or_higher(&mut queue, frame.discard_depth);
                                 queue.push_front(QueueEntry::Prepare {
                                     frame,
+                                    context,
                                     instruction,
                                     next_modifier,
                                     stores: stores.take().expect("the stores have not been queued"),
@@ -574,6 +596,7 @@ pub(crate) fn execute(
                         &mut queue,
                         &mut top_level_result,
                         frame,
+                        context,
                         reference,
                         arguments.as_ref(),
                         stores,
@@ -600,6 +623,7 @@ pub(crate) fn execute(
                     | Command::Compute(_) => {
                         queue.push_front(QueueEntry::ExecuteOrdinary {
                             frame,
+                            context,
                             instruction,
                             stores,
                             return_run,
@@ -609,6 +633,7 @@ pub(crate) fn execute(
             }
             QueueEntry::ExecuteOrdinary {
                 frame,
+                context,
                 instruction,
                 stores,
                 return_run,
@@ -627,16 +652,23 @@ pub(crate) fn execute(
                         program,
                         scoreboard,
                         command_storage,
+                        &context,
                         random,
                         condition,
                     ),
-                    Command::Data(command) => {
-                        execute_data_command(program, scoreboard, command_storage, random, command)
-                    }
+                    Command::Data(command) => execute_data_command(
+                        program,
+                        scoreboard,
+                        command_storage,
+                        &context,
+                        random,
+                        command,
+                    ),
                     Command::Compute(command) => execute_compute_command(
                         program,
                         scoreboard,
                         command_storage,
+                        &context,
                         random,
                         command,
                     ),
@@ -666,6 +698,7 @@ pub(crate) fn execute(
             }
             QueueEntry::ResumeFunctionCondition {
                 frame,
+                context,
                 instruction,
                 next_modifier,
                 stores,
@@ -676,6 +709,7 @@ pub(crate) fn execute(
                 let active = result.get().is_some_and(|value| (value != 0) == expected);
                 queue.push_front(QueueEntry::Prepare {
                     frame,
+                    context,
                     instruction,
                     next_modifier,
                     stores,
@@ -686,6 +720,7 @@ pub(crate) fn execute(
             }
             QueueEntry::ContinueFunctionTag {
                 frame,
+                context,
                 functions,
                 next_function,
                 stores,
@@ -710,6 +745,7 @@ pub(crate) fn execute(
                 );
                 queue.push_front(QueueEntry::ContinueFunctionTag {
                     frame,
+                    context,
                     functions,
                     next_function: next_function + 1,
                     stores,
@@ -717,6 +753,7 @@ pub(crate) fn execute(
                 });
                 queue.push_front(QueueEntry::Call(Frame {
                     function,
+                    context,
                     next_instruction: 0,
                     depth: child_depth,
                     discard_depth: child_depth,
@@ -749,6 +786,7 @@ fn execute_function_command(
     queue: &mut VecDeque<QueueEntry>,
     top_level_result: &mut Option<FunctionOutcome>,
     frame: Frame,
+    context: ExecutionContext,
     reference: &FunctionReference,
     argument_source: Option<&FunctionArguments>,
     stores: Vec<StoreAction>,
@@ -759,6 +797,7 @@ fn execute_function_command(
             fail_function_command(
                 queue,
                 frame,
+                context,
                 Vec::new(),
                 stores,
                 return_run,
@@ -777,6 +816,7 @@ fn execute_function_command(
             fail_function_command(
                 queue,
                 frame,
+                context,
                 Vec::new(),
                 stores,
                 return_run,
@@ -795,6 +835,7 @@ fn execute_function_command(
         fail_function_command(
             queue,
             frame,
+            context,
             instances,
             stores,
             return_run,
@@ -806,6 +847,7 @@ fn execute_function_command(
         queue_single_function(
             queue,
             frame,
+            context,
             Arc::clone(
                 instances
                     .first()
@@ -815,7 +857,7 @@ fn execute_function_command(
             return_run,
         );
     } else {
-        queue_function_tag(queue, frame, instances, stores, return_run);
+        queue_function_tag(queue, frame, context, instances, stores, return_run);
     }
 }
 
@@ -880,6 +922,7 @@ fn instantiate_resolved_prefix(
 fn fail_function_command(
     queue: &mut VecDeque<QueueEntry>,
     frame: Frame,
+    context: ExecutionContext,
     instances: Vec<Arc<[Instruction]>>,
     stores: Vec<StoreAction>,
     return_run: bool,
@@ -900,6 +943,7 @@ fn fail_function_command(
         for function in instances.into_iter().rev() {
             queue.push_front(QueueEntry::Call(Frame {
                 function,
+                context,
                 next_instruction: 0,
                 depth: child_depth,
                 discard_depth,
@@ -918,6 +962,7 @@ fn fail_function_command(
         } else {
             queue.push_front(QueueEntry::ContinueFunctionTag {
                 frame,
+                context,
                 functions: Arc::from(instances),
                 next_function: 0,
                 stores: Vec::new(),
@@ -930,6 +975,7 @@ fn fail_function_command(
 fn queue_single_function(
     queue: &mut VecDeque<QueueEntry>,
     frame: Frame,
+    context: ExecutionContext,
     function: Arc<[Instruction]>,
     stores: Vec<StoreAction>,
     return_run: bool,
@@ -939,6 +985,7 @@ fn queue_single_function(
         let parent_consumer = frame.result_consumer;
         let child = Frame {
             function,
+            context,
             next_instruction: 0,
             depth: child_depth,
             discard_depth: frame.discard_depth,
@@ -953,6 +1000,7 @@ fn queue_single_function(
     } else {
         let child = Frame {
             function,
+            context,
             next_instruction: 0,
             depth: child_depth,
             discard_depth: child_depth,
@@ -966,6 +1014,7 @@ fn queue_single_function(
 fn queue_function_tag(
     queue: &mut VecDeque<QueueEntry>,
     frame: Frame,
+    context: ExecutionContext,
     functions: Vec<Arc<[Instruction]>>,
     stores: Vec<StoreAction>,
     return_run: bool,
@@ -984,6 +1033,7 @@ fn queue_function_tag(
         for function in functions.into_iter().rev() {
             queue.push_front(QueueEntry::Call(Frame {
                 function,
+                context,
                 next_instruction: 0,
                 depth: child_depth,
                 discard_depth,
@@ -994,6 +1044,7 @@ fn queue_function_tag(
         let result = (!stores.is_empty()).then(|| Rc::new(Cell::new(None)));
         queue.push_front(QueueEntry::ContinueFunctionTag {
             frame,
+            context,
             functions: Arc::from(functions),
             next_function: 0,
             stores,
@@ -1085,6 +1136,7 @@ fn execute_predicate_condition(
     program: &Program,
     scoreboard: &Scoreboard,
     command_storage: &CommandStorage,
+    execution_context: &ExecutionContext,
     random: &mut LegacyRandom,
     condition: &PredicateCondition,
 ) -> Result<CommandResult, String> {
@@ -1092,6 +1144,7 @@ fn execute_predicate_condition(
         &condition.predicate,
         scoreboard,
         command_storage,
+        execution_context,
         random,
     )? == condition.expected;
     Ok(if matches {
@@ -1105,17 +1158,28 @@ fn execute_compute_command(
     program: &Program,
     scoreboard: &Scoreboard,
     command_storage: &CommandStorage,
+    execution_context: &ExecutionContext,
     random: &mut LegacyRandom,
     command: &ComputeCommand,
 ) -> Result<CommandResult, String> {
     let providers = program.loot_registry();
     let value = match command.mode {
         ComputeMode::Float { scale } => providers
-            .get_float(&command.provider, scoreboard, command_storage, random)
+            .get_float(
+                &command.provider,
+                scoreboard,
+                command_storage,
+                execution_context,
+                random,
+            )
             .map(|value| (value * scale).floor() as i32),
-        ComputeMode::Integer => {
-            providers.get_int(&command.provider, scoreboard, command_storage, random)
-        }
+        ComputeMode::Integer => providers.get_int(
+            &command.provider,
+            scoreboard,
+            command_storage,
+            execution_context,
+            random,
+        ),
     };
     value.map(CommandResult::success)
 }
@@ -1171,6 +1235,7 @@ fn execute_data_command(
     program: &Program,
     scoreboard: &Scoreboard,
     command_storage: &mut CommandStorage,
+    execution_context: &ExecutionContext,
     random: &mut LegacyRandom,
     command: &DataCommand,
 ) -> Result<CommandResult, String> {
@@ -1194,14 +1259,20 @@ fn execute_data_command(
             operation,
             source,
         } => {
-            let source_values =
-                match resolve_data_source(program, scoreboard, command_storage, random, source) {
-                    Ok(values) => values,
-                    Err(reason) if matches!(source, DataSource::Compute { .. }) => {
-                        return Err(reason);
-                    }
-                    Err(_) => return Ok(CommandResult::FAILURE),
-                };
+            let source_values = match resolve_data_source(
+                program,
+                scoreboard,
+                command_storage,
+                execution_context,
+                random,
+                source,
+            ) {
+                Ok(values) => values,
+                Err(reason) if matches!(source, DataSource::Compute { .. }) => {
+                    return Err(reason);
+                }
+                Err(_) => return Ok(CommandResult::FAILURE),
+            };
             modify_storage(command_storage, storage, path, *operation, &source_values)
         }
     };
@@ -1289,6 +1360,7 @@ fn resolve_data_source(
     program: &Program,
     scoreboard: &Scoreboard,
     command_storage: &CommandStorage,
+    execution_context: &ExecutionContext,
     random: &mut LegacyRandom,
     source: &DataSource,
 ) -> Result<Vec<Tag>, String> {
@@ -1328,9 +1400,21 @@ fn resolve_data_source(
         DataSource::Compute { provider, integer } => {
             let providers = program.loot_registry();
             Ok(vec![if *integer {
-                Tag::Int(providers.get_int(provider, scoreboard, command_storage, random)?)
+                Tag::Int(providers.get_int(
+                    provider,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?)
             } else {
-                Tag::float(providers.get_float(provider, scoreboard, command_storage, random)?)
+                Tag::float(providers.get_float(
+                    provider,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?)
             }])
         }
     }

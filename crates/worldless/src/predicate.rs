@@ -1,4 +1,5 @@
 use crate::{
+    execution_context::ExecutionContext,
     nbt::{CommandStorage, Tag},
     number_provider::{
         Input, LegacyRandom, LootRegistry, NumberProviderReference, ascii_string, identifier_field,
@@ -33,6 +34,10 @@ pub(crate) enum LootPredicate {
         value: NumberProviderReference,
         range: IntRange,
     },
+    LocationCheck {
+        position: PositionPredicate,
+        offset: [i32; 3],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,18 +46,61 @@ pub(crate) struct IntRange {
     pub(crate) max: Option<NumberProviderReference>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PositionPredicate {
+    x: DoubleRange,
+    y: DoubleRange,
+    z: DoubleRange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DoubleRange {
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+impl PositionPredicate {
+    const ANY: Self = Self {
+        x: DoubleRange::ANY,
+        y: DoubleRange::ANY,
+        z: DoubleRange::ANY,
+    };
+
+    fn test(self, position: [f64; 3]) -> bool {
+        self.x.test(position[0]) && self.y.test(position[1]) && self.z.test(position[2])
+    }
+}
+
+impl DoubleRange {
+    const ANY: Self = Self {
+        min: None,
+        max: None,
+    };
+
+    fn test(self, value: f64) -> bool {
+        !self.min.is_some_and(|min| min > value) && !self.max.is_some_and(|max| max < value)
+    }
+}
+
 impl LootPredicate {
     pub(crate) fn test(
         &self,
         registry: &LootRegistry,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
         random: &mut LegacyRandom,
     ) -> Result<bool, String> {
         match self {
             Self::AllOf(predicates) => {
                 for predicate in registry.predicate_values(predicates) {
-                    if !predicate.test(registry, scoreboard, command_storage, random)? {
+                    if !predicate.test(
+                        registry,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )? {
                         return Ok(false);
                     }
                 }
@@ -60,7 +108,13 @@ impl LootPredicate {
             }
             Self::AnyOf(predicates) => {
                 for predicate in registry.predicate_values(predicates) {
-                    if predicate.test(registry, scoreboard, command_storage, random)? {
+                    if predicate.test(
+                        registry,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )? {
                         return Ok(true);
                     }
                 }
@@ -68,15 +122,48 @@ impl LootPredicate {
             }
             Self::Inverted(predicate) => registry
                 .resolve_predicate(predicate)
-                .test(registry, scoreboard, command_storage, random)
+                .test(
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )
                 .map(|result| !result),
             Self::RandomChance { chance } => {
-                let chance = registry.get_float(chance, scoreboard, command_storage, random)?;
+                let chance = registry.get_float(
+                    chance,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
                 Ok(random.next_float() < chance)
             }
             Self::ValueCheck { value, range } => {
-                let value = registry.get_int(value, scoreboard, command_storage, random)?;
-                range.test(value, registry, scoreboard, command_storage, random)
+                let value = registry.get_int(
+                    value,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                range.test(
+                    value,
+                    registry,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )
+            }
+            Self::LocationCheck { position, offset } => {
+                let origin = execution_context.position();
+                Ok(position.test([
+                    origin.x() + f64::from(offset[0]),
+                    origin.y() + f64::from(offset[1]),
+                    origin.z() + f64::from(offset[2]),
+                ]))
             }
         }
     }
@@ -89,15 +176,18 @@ impl IntRange {
         registry: &LootRegistry,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
         random: &mut LegacyRandom,
     ) -> Result<bool, String> {
         if let Some(min) = &self.min
-            && value < registry.get_int(min, scoreboard, command_storage, random)?
+            && value
+                < registry.get_int(min, scoreboard, command_storage, execution_context, random)?
         {
             return Ok(false);
         }
         if let Some(max) = &self.max
-            && value > registry.get_int(max, scoreboard, command_storage, random)?
+            && value
+                > registry.get_int(max, scoreboard, command_storage, execution_context, random)?
         {
             return Ok(false);
         }
@@ -159,6 +249,7 @@ fn parse_direct(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
                 &format!("{path}.range"),
             )?,
         }),
+        "location_check" => parse_location_check(input, path),
         "random_chance_with_enchanted_bonus"
         | "entity_properties"
         | "killed_by_player"
@@ -168,7 +259,6 @@ fn parse_direct(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
         | "table_bonus"
         | "survives_explosion"
         | "damage_source_properties"
-        | "location_check"
         | "weather_check"
         | "time_check"
         | "enchantment_active_check"
@@ -178,6 +268,125 @@ fn parse_direct(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
         _ => Err(format!(
             "predicate type `{predicate_type}` is not supported"
         )),
+    }
+}
+
+fn parse_location_check(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
+    let position = input
+        .field("predicate")
+        .map_or(Ok(PositionPredicate::ANY), |value| {
+            parse_location_predicate(value, &format!("{path}.predicate"))
+        })?;
+    let mut offset = [0; 3];
+    for (index, field) in ["offsetX", "offsetY", "offsetZ"].into_iter().enumerate() {
+        if let Some(value) = input.field(field) {
+            offset[index] = int_value(value, &format!("{path}.{field}"))?;
+        }
+    }
+    Ok(LootPredicate::LocationCheck { position, offset })
+}
+
+fn parse_location_predicate(input: Input<'_>, path: &str) -> Result<PositionPredicate, String> {
+    if !input.is_object() {
+        return Err(format!("`{path}` must be an object"));
+    }
+    for field in [
+        "biomes",
+        "structures",
+        "dimension",
+        "smokey",
+        "light",
+        "block",
+        "fluid",
+        "can_see_sky",
+    ] {
+        if input.field(field).is_some() {
+            return Err(format!(
+                "`{path}.{field}` depends on physical-world state outside Worldless scope"
+            ));
+        }
+    }
+    input
+        .field("position")
+        .map_or(Ok(PositionPredicate::ANY), |value| {
+            parse_position_predicate(value, &format!("{path}.position"))
+        })
+}
+
+fn parse_position_predicate(input: Input<'_>, path: &str) -> Result<PositionPredicate, String> {
+    if !input.is_object() {
+        return Err(format!("`{path}` must be an object"));
+    }
+    let mut ranges = [DoubleRange::ANY; 3];
+    for (index, field) in ["x", "y", "z"].into_iter().enumerate() {
+        if let Some(value) = input.field(field) {
+            ranges[index] = parse_double_range(value, &format!("{path}.{field}"))?;
+        }
+    }
+    Ok(PositionPredicate {
+        x: ranges[0],
+        y: ranges[1],
+        z: ranges[2],
+    })
+}
+
+fn parse_double_range(input: Input<'_>, path: &str) -> Result<DoubleRange, String> {
+    if let Some(value) = double_value(input) {
+        return Ok(DoubleRange {
+            min: Some(value),
+            max: Some(value),
+        });
+    }
+    if !input.is_object() {
+        return Err(format!("`{path}` must be a number or an object"));
+    }
+    let min = input
+        .field("min")
+        .map(|value| required_double(value, &format!("{path}.min")))
+        .transpose()?;
+    let max = input
+        .field("max")
+        .map(|value| required_double(value, &format!("{path}.max")))
+        .transpose()?;
+    if min
+        .zip(max)
+        .is_some_and(|(min, max)| java_double_compare(min, max).is_gt())
+    {
+        return Err(format!("`{path}` has swapped minimum and maximum bounds"));
+    }
+    Ok(DoubleRange { min, max })
+}
+
+fn required_double(input: Input<'_>, path: &str) -> Result<f64, String> {
+    double_value(input).ok_or_else(|| format!("`{path}` must be a number"))
+}
+
+fn double_value(input: Input<'_>) -> Option<f64> {
+    match input {
+        Input::Json(serde_json::Value::Number(value)) => value.to_string().parse().ok(),
+        Input::Nbt(value) => value.double_value(),
+        Input::NbtByte(value) => Some(f64::from(value)),
+        Input::NbtInt(value) => Some(f64::from(value)),
+        Input::NbtLong(value) => Some(value as f64),
+        Input::Json(_) => None,
+    }
+}
+
+fn java_double_compare(left: f64, right: f64) -> std::cmp::Ordering {
+    if left < right {
+        return std::cmp::Ordering::Less;
+    }
+    if left > right {
+        return std::cmp::Ordering::Greater;
+    }
+    java_double_to_long_bits(left).cmp(&java_double_to_long_bits(right))
+}
+
+fn java_double_to_long_bits(value: f64) -> i64 {
+    if value.is_nan() {
+        0x7ff8_0000_0000_0000_u64 as i64
+    } else {
+        value.to_bits() as i64
     }
 }
 
@@ -269,6 +478,7 @@ pub(crate) fn builtin_predicates() -> std::collections::HashMap<Identifier, Loot
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_context::{Position, Rotation};
 
     #[test]
     fn parses_supported_predicate_shapes() {
@@ -280,5 +490,81 @@ mod tests {
             parse_json(r#"{"type":"value_check","value":1.5,"range":{"min":1,"max":2}}"#).unwrap(),
             LootPredicate::ValueCheck { .. }
         ));
+    }
+
+    #[test]
+    fn location_check_parses_minecraft_bounds_and_offsets() {
+        let predicate = parse_json(
+            r#"{
+                "type":"location_check",
+                "predicate":{"position":{
+                    "x":{"min":11.0,"max":11.0},
+                    "y":2.5,
+                    "z":{"max":29.0}
+                }},
+                "offsetX":1,
+                "offsetZ":-1
+            }"#,
+        )
+        .unwrap();
+        let context =
+            ExecutionContext::new(Position::new(10.0, 2.5, 30.0), Rotation::new(0.0, 0.0));
+
+        assert_eq!(
+            predicate.test(
+                &LootRegistry::empty(),
+                &Scoreboard::default(),
+                &CommandStorage::default(),
+                &context,
+                &mut LegacyRandom::default(),
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn location_check_rejects_every_world_dependent_location_field() {
+        for (field, value) in [
+            ("biomes", "[]"),
+            ("structures", "[]"),
+            ("dimension", r#""minecraft:overworld""#),
+            ("smokey", "false"),
+            ("light", "{}"),
+            ("block", "{}"),
+            ("fluid", "{}"),
+            ("can_see_sky", "false"),
+        ] {
+            let source =
+                format!(r#"{{"type":"location_check","predicate":{{"{field}":{value}}}}}"#);
+            let error = parse_json(&source).unwrap_err();
+            assert!(
+                error.contains(&format!("root.predicate.{field}")),
+                "{error}"
+            );
+            assert!(error.contains("physical-world state"), "{error}");
+        }
+    }
+
+    #[test]
+    fn location_check_validates_bounds_with_java_double_ordering() {
+        for source in [
+            r#"{"type":"location_check","predicate":{"position":{"x":{"min":2.0,"max":1.0}}}}"#,
+            r#"{"type":"location_check","predicate":{"position":{"x":{"min":0.0,"max":-0.0}}}}"#,
+        ] {
+            assert!(parse_json(source).unwrap_err().contains("swapped"));
+        }
+        assert!(
+            parse_json(
+                r#"{"type":"location_check","predicate":{"position":{"x":{"min":-0.0,"max":0.0}}}}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            DoubleRange {
+                min: Some(1.0),
+                max: Some(1.0),
+            }
+            .test(f64::NAN)
+        );
     }
 }

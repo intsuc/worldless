@@ -22,6 +22,9 @@ use worldless_brigadier::{
 };
 
 use crate::{
+    execution_context::{
+        Axes, ContextTransform, PositionCoordinates, RotationCoordinates, WorldCoordinate,
+    },
     macro_function::{Function, FunctionBuilder, MAX_COMMAND_LENGTH},
     nbt::{CompoundTag, JavaString, NbtPath, Tag, parse_compound, parse_path, parse_tag},
     number_provider::{
@@ -1688,6 +1691,16 @@ impl CommandCompiler {
                     .expect("the execute run literal has no children"),
             )
             .expect("the execute literal can contain the run literal")
+            .then(positioned_branch(execute.clone()))
+            .expect("the execute literal can contain positioned")
+            .then(rotated_branch(execute.clone()))
+            .expect("the execute literal can contain rotated")
+            .then(facing_branch(execute.clone()))
+            .expect("the execute literal can contain facing")
+            .then(align_branch(execute.clone()))
+            .expect("the execute literal can contain align")
+            .then(anchored_branch(execute.clone()))
+            .expect("the execute literal can contain anchored")
             .then(
                 LiteralArgumentBuilder::literal("store")
                     .then(store_branch("result", StoreKind::Result, execute.clone()))
@@ -1739,6 +1752,112 @@ impl CommandCompiler {
         let instruction = sink.borrow_mut().take();
         instruction.ok_or_else(|| "command did not produce an instruction".to_owned())
     }
+}
+
+fn positioned_branch(
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    LiteralArgumentBuilder::literal("positioned")
+        .then(
+            RequiredArgumentBuilder::argument("pos", PositionArgument)
+                .redirect_with_modifier(
+                    execute,
+                    Rc::new(|context| {
+                        Ok(Rc::new(context.source().with_modifier(
+                            Modifier::ContextTransform(ContextTransform::Positioned(
+                                position_coordinates(context, "pos"),
+                            )),
+                        )))
+                    }),
+                )
+                .expect("a complete positioned transform has no children"),
+        )
+        .expect("positioned can contain a position")
+}
+
+fn rotated_branch(
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    LiteralArgumentBuilder::literal("rotated")
+        .then(
+            RequiredArgumentBuilder::argument("rot", RotationArgument)
+                .redirect_with_modifier(
+                    execute,
+                    Rc::new(|context| {
+                        Ok(Rc::new(context.source().with_modifier(
+                            Modifier::ContextTransform(ContextTransform::Rotated(
+                                rotation_coordinates(context, "rot"),
+                            )),
+                        )))
+                    }),
+                )
+                .expect("a complete rotated transform has no children"),
+        )
+        .expect("rotated can contain a rotation")
+}
+
+fn facing_branch(
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    LiteralArgumentBuilder::literal("facing")
+        .then(
+            RequiredArgumentBuilder::argument("pos", PositionArgument)
+                .redirect_with_modifier(
+                    execute,
+                    Rc::new(|context| {
+                        Ok(Rc::new(context.source().with_modifier(
+                            Modifier::ContextTransform(ContextTransform::Facing(
+                                position_coordinates(context, "pos"),
+                            )),
+                        )))
+                    }),
+                )
+                .expect("a complete facing transform has no children"),
+        )
+        .expect("facing can contain a position")
+}
+
+fn align_branch(
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    LiteralArgumentBuilder::literal("align")
+        .then(
+            RequiredArgumentBuilder::argument("axes", AxesArgument)
+                .redirect_with_modifier(
+                    execute,
+                    Rc::new(|context| {
+                        Ok(Rc::new(context.source().with_modifier(
+                            Modifier::ContextTransform(ContextTransform::Align(axes(
+                                context, "axes",
+                            ))),
+                        )))
+                    }),
+                )
+                .expect("a complete align transform has no children"),
+        )
+        .expect("align can contain axes")
+}
+
+fn anchored_branch(
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let anchor = |literal| {
+        LiteralArgumentBuilder::literal(literal)
+            .redirect_with_modifier(
+                execute.clone(),
+                Rc::new(|context| {
+                    Ok(Rc::new(context.source().with_modifier(
+                        Modifier::ContextTransform(ContextTransform::Anchored),
+                    )))
+                }),
+            )
+            .expect("a complete anchored transform has no children")
+    };
+    LiteralArgumentBuilder::literal("anchored")
+        .then(anchor("feet"))
+        .expect("anchored can contain feet")
+        .then(anchor("eyes"))
+        .expect("anchored can contain eyes")
 }
 
 fn compute_command_branch(
@@ -2618,6 +2737,33 @@ fn number_provider(
         .expect("the command executor is attached below its number provider argument")
 }
 
+fn position_coordinates(
+    context: &CommandContext<LoweringSource>,
+    name: &str,
+) -> PositionCoordinates {
+    context
+        .argument::<PositionCoordinates>(name)
+        .map(|coordinates| *coordinates)
+        .expect("the command executor is attached below its position argument")
+}
+
+fn rotation_coordinates(
+    context: &CommandContext<LoweringSource>,
+    name: &str,
+) -> RotationCoordinates {
+    context
+        .argument::<RotationCoordinates>(name)
+        .map(|coordinates| *coordinates)
+        .expect("the command executor is attached below its rotation argument")
+}
+
+fn axes(context: &CommandContext<LoweringSource>, name: &str) -> Axes {
+    context
+        .argument::<Axes>(name)
+        .map(|axes| *axes)
+        .expect("the command executor is attached below its axes argument")
+}
+
 fn storage_identifier(context: &CommandContext<LoweringSource>, name: &str) -> Identifier {
     context
         .argument::<Identifier>(name)
@@ -2672,6 +2818,194 @@ fn scoreboard_operation(
         .argument::<ScoreboardOperation>(name)
         .map(|operation| *operation)
         .expect("the scoreboard executor is attached below its operation argument")
+}
+
+#[derive(Clone, Copy)]
+struct PositionArgument;
+
+impl ArgumentType<LoweringSource> for PositionArgument {
+    type Value = PositionCoordinates;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        if reader.can_read() && reader.peek() == b'^' as u16 {
+            parse_local_coordinates(reader)
+        } else {
+            parse_world_position(reader)
+        }
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["0 0 0", "~ ~ ~", "^ ^ ^", "^1 ^ ^-5"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RotationArgument;
+
+impl ArgumentType<LoweringSource> for RotationArgument {
+    type Value = RotationCoordinates;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let start = reader.cursor();
+        if !reader.can_read() {
+            return Err(coordinate_error(reader, "incomplete rotation"));
+        }
+        let yaw = parse_world_coordinate(reader, false)?;
+        if !reader.can_read() || reader.peek() != b' ' as u16 {
+            reader.set_cursor(start);
+            return Err(coordinate_error(reader, "incomplete rotation"));
+        }
+        reader.skip();
+        let pitch = parse_world_coordinate(reader, false)?;
+        Ok(RotationCoordinates { yaw, pitch })
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["0 0", "~ ~", "~-5 ~5"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AxesArgument;
+
+impl ArgumentType<LoweringSource> for AxesArgument {
+    type Value = Axes;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let mut axes = Axes {
+            x: false,
+            y: false,
+            z: false,
+        };
+        while reader.can_read() && reader.peek() != b' ' as u16 {
+            let selected = match reader.read() {
+                value if value == b'x' as u16 => &mut axes.x,
+                value if value == b'y' as u16 => &mut axes.y,
+                value if value == b'z' as u16 => &mut axes.z,
+                _ => return Err(coordinate_error(reader, "invalid axes")),
+            };
+            if *selected {
+                return Err(coordinate_error(reader, "invalid axes"));
+            }
+            *selected = true;
+        }
+        Ok(axes)
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["xyz", "x"].into_iter().map(str::to_owned).collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+fn parse_world_position(
+    reader: &mut StringReader,
+) -> Result<PositionCoordinates, CommandSyntaxException> {
+    let start = reader.cursor();
+    let x = parse_world_coordinate(reader, true)?;
+    if !reader.can_read() || reader.peek() != b' ' as u16 {
+        reader.set_cursor(start);
+        return Err(coordinate_error(reader, "incomplete position"));
+    }
+    reader.skip();
+    let y = parse_world_coordinate(reader, false)?;
+    if !reader.can_read() || reader.peek() != b' ' as u16 {
+        reader.set_cursor(start);
+        return Err(coordinate_error(reader, "incomplete position"));
+    }
+    reader.skip();
+    let z = parse_world_coordinate(reader, true)?;
+    Ok(PositionCoordinates::World { x, y, z })
+}
+
+fn parse_local_coordinates(
+    reader: &mut StringReader,
+) -> Result<PositionCoordinates, CommandSyntaxException> {
+    let start = reader.cursor();
+    let left = parse_local_coordinate(reader, start)?;
+    if !reader.can_read() || reader.peek() != b' ' as u16 {
+        reader.set_cursor(start);
+        return Err(coordinate_error(reader, "incomplete position"));
+    }
+    reader.skip();
+    let up = parse_local_coordinate(reader, start)?;
+    if !reader.can_read() || reader.peek() != b' ' as u16 {
+        reader.set_cursor(start);
+        return Err(coordinate_error(reader, "incomplete position"));
+    }
+    reader.skip();
+    let forwards = parse_local_coordinate(reader, start)?;
+    Ok(PositionCoordinates::Local { left, up, forwards })
+}
+
+fn parse_local_coordinate(
+    reader: &mut StringReader,
+    start: usize,
+) -> Result<f64, CommandSyntaxException> {
+    if !reader.can_read() {
+        return Err(coordinate_error(reader, "expected coordinate"));
+    }
+    if reader.peek() != b'^' as u16 {
+        reader.set_cursor(start);
+        return Err(coordinate_error(reader, "mixed coordinate types"));
+    }
+    reader.skip();
+    if reader.can_read() && reader.peek() != b' ' as u16 {
+        reader.read_double()
+    } else {
+        Ok(0.0)
+    }
+}
+
+fn parse_world_coordinate(
+    reader: &mut StringReader,
+    center: bool,
+) -> Result<WorldCoordinate, CommandSyntaxException> {
+    if reader.can_read() && reader.peek() == b'^' as u16 {
+        return Err(coordinate_error(reader, "mixed coordinate types"));
+    }
+    if !reader.can_read() {
+        return Err(coordinate_error(reader, "expected coordinate"));
+    }
+
+    let relative = if reader.peek() == b'~' as u16 {
+        reader.skip();
+        true
+    } else {
+        false
+    };
+    let start = reader.cursor();
+    let mut value = if reader.can_read() && reader.peek() != b' ' as u16 {
+        reader.read_double()?
+    } else {
+        0.0
+    };
+    let number = reader.substring(start, reader.cursor());
+    if !relative && center && !number.contains('.') {
+        value += 0.5;
+    }
+    Ok(WorldCoordinate { relative, value })
+}
+
+fn coordinate_error(reader: &StringReader, message: &'static str) -> CommandSyntaxException {
+    SimpleCommandExceptionType::new(LiteralMessage::new(message)).create_with_context(reader)
 }
 
 #[derive(Clone, Copy)]
