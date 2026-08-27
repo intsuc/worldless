@@ -29,6 +29,7 @@ pub enum ExecutionOutcome {
 pub enum ExecutionError {
     InvalidFunctionReference { input: String },
     CommandCompilationFailed { reason: String },
+    PredicateEvaluationFailed { reason: String },
     NumberProviderEvaluationFailed { reason: String },
     MissingWorldSeed { sequence: String },
     CommandLimitExceeded { limit: usize },
@@ -42,6 +43,9 @@ impl fmt::Display for ExecutionError {
             }
             Self::CommandCompilationFailed { reason } => {
                 write!(formatter, "command compilation failed: {reason}")
+            }
+            Self::PredicateEvaluationFailed { reason } => {
+                write!(formatter, "predicate evaluation failed: {reason}")
             }
             Self::NumberProviderEvaluationFailed { reason } => {
                 write!(formatter, "number provider evaluation failed: {reason}")
@@ -527,9 +531,7 @@ fn execute_instruction(
                                         &context,
                                         random.unnamed(),
                                     )
-                                    .map_err(|reason| {
-                                        ExecutionError::NumberProviderEvaluationFailed { reason }
-                                    })?
+                                    .map_err(predicate_evaluation_failed)?
                                     == condition.expected;
                             }
                         }
@@ -734,7 +736,7 @@ fn execute_instruction(
                         condition,
                     )
                     .map(Some)
-                    .map_err(|reason| ExecutionError::NumberProviderEvaluationFailed { reason })?,
+                    .map_err(predicate_evaluation_failed)?,
                     Command::Data(command) => execute_data_command(
                         program,
                         scoreboard,
@@ -1339,6 +1341,10 @@ fn missing_world_seed(error: crate::random::MissingWorldSeed) -> ExecutionError 
     ExecutionError::MissingWorldSeed {
         sequence: error.sequence().to_string(),
     }
+}
+
+fn predicate_evaluation_failed(reason: String) -> ExecutionError {
+    ExecutionError::PredicateEvaluationFailed { reason }
 }
 
 fn stored_command_value(kind: StoreKind, result: CommandResult) -> i32 {

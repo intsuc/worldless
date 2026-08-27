@@ -39,6 +39,13 @@ pub(crate) enum LootPredicate {
         position: PositionPredicate,
         offset: [i32; 3],
     },
+    AbsentContext {
+        result: bool,
+        referenced_number_providers: Vec<NumberProviderReference>,
+    },
+    MissingContextParameter {
+        parameter: &'static str,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,6 +173,10 @@ impl LootPredicate {
                     origin.z() + f64::from(offset[2]),
                 ]))
             }
+            Self::AbsentContext { result, .. } => Ok(*result),
+            Self::MissingContextParameter { parameter } => {
+                Err(format!("loot context parameter `{parameter}` is absent"))
+            }
         }
     }
 }
@@ -251,24 +262,191 @@ fn parse_direct(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
             )?,
         }),
         "location_check" => parse_location_check(input, path),
-        "random_chance_with_enchanted_bonus"
-        | "entity_properties"
-        | "killed_by_player"
-        | "entity_scores"
-        | "match_block"
-        | "match_tool"
-        | "table_bonus"
-        | "survives_explosion"
-        | "damage_source_properties"
-        | "weather_check"
-        | "time_check"
-        | "enchantment_active_check"
-        | "environment_attribute_check" => Err(format!(
+        "entity_properties" => parse_entity_properties(input, path),
+        "killed_by_player" => Ok(absent_context(false)),
+        "entity_scores" => parse_entity_scores(input, path),
+        "match_block" => parse_match_block(input, path),
+        "match_tool" => parse_match_tool(input, path),
+        "survives_explosion" => Ok(absent_context(true)),
+        "damage_source_properties" => parse_damage_source_properties(input, path),
+        "weather_check" => parse_weather_check(input, path),
+        "enchantment_active_check" => parse_enchantment_active_check(input, path),
+        "random_chance_with_enchanted_bonus" | "table_bonus" => Err(format!(
+            "predicate type `{predicate_type}` requires an enchantment registry that Worldless does not support"
+        )),
+        "time_check" | "environment_attribute_check" => Err(format!(
             "predicate type `{predicate_type}` depends on a loot context outside Worldless scope"
         )),
         _ => Err(format!(
             "predicate type `{predicate_type}` is not supported"
         )),
+    }
+}
+
+fn absent_context(result: bool) -> LootPredicate {
+    LootPredicate::AbsentContext {
+        result,
+        referenced_number_providers: Vec::new(),
+    }
+}
+
+fn parse_entity_properties(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
+    parse_entity_target(input, path)?;
+    let Some(predicate) = input.field("predicate") else {
+        return Ok(absent_context(true));
+    };
+    require_empty_nested_predicate(predicate, &format!("{path}.predicate"), "entity")?;
+    Ok(absent_context(false))
+}
+
+fn parse_entity_scores(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
+    parse_entity_target(input, path)?;
+    let scores_path = format!("{path}.scores");
+    let scores = required_field(input, path, "scores")?
+        .object_entries()
+        .ok_or_else(|| format!("`{scores_path}` must be an object"))?;
+    let mut referenced_number_providers = Vec::new();
+    for (score, range) in scores {
+        let range = parse_int_range(range, &format!("{scores_path}.{score}"))?;
+        referenced_number_providers.extend(range.min);
+        referenced_number_providers.extend(range.max);
+    }
+    Ok(LootPredicate::AbsentContext {
+        result: false,
+        referenced_number_providers,
+    })
+}
+
+fn parse_entity_target(input: Input<'_>, path: &str) -> Result<(), String> {
+    let target_path = format!("{path}.entity");
+    let target = required_field(input, path, "entity")?
+        .string()
+        .ok_or_else(|| format!("`{target_path}` must be a string"))?;
+    let target = ascii_string(&target, &target_path)?;
+    if [
+        "this",
+        "attacker",
+        "direct_attacker",
+        "attacking_player",
+        "target_entity",
+        "interacting_entity",
+    ]
+    .contains(&target.as_str())
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{target_path}` has invalid entity target `{target}`"
+        ))
+    }
+}
+
+fn parse_match_block(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
+    reject_present_fields(
+        input,
+        path,
+        &["blocks", "state", "nbt", "components", "predicates"],
+        "block predicate decoding",
+    )?;
+    Ok(absent_context(false))
+}
+
+fn parse_match_tool(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
+    if let Some(predicate) = input.field("predicate") {
+        reject_nested_predicate_fields(
+            predicate,
+            &format!("{path}.predicate"),
+            &["items", "count", "components", "predicates"],
+            "item predicate decoding",
+        )?;
+    }
+    Ok(absent_context(false))
+}
+
+fn parse_damage_source_properties(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
+    if let Some(predicate) = input.field("predicate") {
+        reject_nested_predicate_fields(
+            predicate,
+            &format!("{path}.predicate"),
+            &["tags", "direct_entity", "source_entity", "is_direct"],
+            "damage-source predicate decoding",
+        )?;
+    }
+    Ok(absent_context(false))
+}
+
+fn parse_weather_check(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
+    let raining = optional_boolean_field(input, path, "raining")?;
+    let thundering = optional_boolean_field(input, path, "thundering")?;
+    if raining.is_some() || thundering.is_some() {
+        return Err(
+            "predicate type `minecraft:weather_check` observes physical-world weather outside Worldless scope"
+                .to_owned(),
+        );
+    }
+    Ok(absent_context(true))
+}
+
+fn parse_enchantment_active_check(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
+    let active_path = format!("{path}.active");
+    required_field(input, path, "active")?
+        .boolean()
+        .ok_or_else(|| format!("`{active_path}` must be a boolean"))?;
+    Ok(LootPredicate::MissingContextParameter {
+        parameter: "minecraft:enchantment_active",
+    })
+}
+
+fn optional_boolean_field(
+    input: Input<'_>,
+    path: &str,
+    field: &str,
+) -> Result<Option<bool>, String> {
+    let Some(value) = input.field(field) else {
+        return Ok(None);
+    };
+    value
+        .boolean()
+        .map(Some)
+        .ok_or_else(|| format!("`{path}.{field}` must be a boolean"))
+}
+
+fn require_empty_nested_predicate(input: Input<'_>, path: &str, kind: &str) -> Result<(), String> {
+    if input.is_empty_object() {
+        Ok(())
+    } else if input.is_object() {
+        Err(format!(
+            "`{path}` requires unsupported {kind} predicate decoding"
+        ))
+    } else {
+        Err(format!("`{path}` must be an object"))
+    }
+}
+
+fn reject_nested_predicate_fields(
+    input: Input<'_>,
+    path: &str,
+    fields: &[&str],
+    unsupported: &str,
+) -> Result<(), String> {
+    if !input.is_object() {
+        return Err(format!("`{path}` must be an object"));
+    }
+    reject_present_fields(input, path, fields, unsupported)
+}
+
+fn reject_present_fields(
+    input: Input<'_>,
+    path: &str,
+    fields: &[&str],
+    unsupported: &str,
+) -> Result<(), String> {
+    if let Some(field) = fields.iter().find(|field| input.field(field).is_some()) {
+        Err(format!(
+            "`{path}.{field}` requires unsupported {unsupported}"
+        ))
+    } else {
+        Ok(())
     }
 }
 

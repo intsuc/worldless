@@ -8,7 +8,8 @@ use std::{
 };
 
 use worldless::{
-    ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, ResourceOrigin, Vm,
+    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind,
+    ResourceOrigin, Vm,
 };
 
 const LIMIT: usize = 256;
@@ -348,6 +349,258 @@ fn vanilla_world_dependent_predicates_exist_with_their_worldless_result() {
 
     assert_function(&mut vm, "example:silk_touch", returned(true, 1));
     assert_function(&mut vm, "example:tagged_shears", returned(true, 1));
+}
+
+#[test]
+fn absent_command_context_parameters_produce_their_minecraft_results() {
+    let mut vm = compile(
+        &[
+            (
+                "example:survives",
+                "return run execute if predicate example:survives\n",
+            ),
+            (
+                "example:killed",
+                "return run execute if predicate example:killed\n",
+            ),
+            (
+                "example:entity_without_predicate",
+                "return run execute if predicate example:entity_without_predicate\n",
+            ),
+            (
+                "example:entity_with_empty_predicate",
+                "return run execute if predicate example:entity_with_empty_predicate\n",
+            ),
+            (
+                "example:scores",
+                "return run execute if predicate example:scores\n",
+            ),
+            (
+                "example:block",
+                "return run execute if predicate example:block\n",
+            ),
+            (
+                "example:tool_without_predicate",
+                "return run execute if predicate example:tool_without_predicate\n",
+            ),
+            (
+                "example:tool_with_empty_predicate",
+                "return run execute if predicate example:tool_with_empty_predicate\n",
+            ),
+            (
+                "example:damage_without_predicate",
+                "return run execute if predicate example:damage_without_predicate\n",
+            ),
+            (
+                "example:damage_with_empty_predicate",
+                "return run execute if predicate example:damage_with_empty_predicate\n",
+            ),
+            (
+                "example:weather",
+                "return run execute if predicate example:weather\n",
+            ),
+        ],
+        &[("example:bound", "1")],
+        &[
+            ("example:survives", r#"{"type":"survives_explosion"}"#),
+            ("example:killed", r#"{"type":"killed_by_player"}"#),
+            (
+                "example:entity_without_predicate",
+                r#"{"type":"entity_properties","entity":"this"}"#,
+            ),
+            (
+                "example:entity_with_empty_predicate",
+                r#"{"type":"entity_properties","entity":"this","predicate":{}}"#,
+            ),
+            (
+                "example:scores",
+                r#"{"type":"entity_scores","scores":{"points":{"min":"example:bound"}},"entity":"attacker"}"#,
+            ),
+            ("example:block", r#"{"type":"match_block"}"#),
+            ("example:tool_without_predicate", r#"{"type":"match_tool"}"#),
+            (
+                "example:tool_with_empty_predicate",
+                r#"{"type":"match_tool","predicate":{}}"#,
+            ),
+            (
+                "example:damage_without_predicate",
+                r#"{"type":"damage_source_properties"}"#,
+            ),
+            (
+                "example:damage_with_empty_predicate",
+                r#"{"type":"damage_source_properties","predicate":{}}"#,
+            ),
+            ("example:weather", r#"{"type":"weather_check"}"#),
+        ],
+        &[],
+    );
+
+    for function in [
+        "example:survives",
+        "example:entity_without_predicate",
+        "example:weather",
+    ] {
+        assert_function(&mut vm, function, returned(true, 1));
+    }
+    for function in [
+        "example:killed",
+        "example:entity_with_empty_predicate",
+        "example:scores",
+        "example:block",
+        "example:tool_without_predicate",
+        "example:tool_with_empty_predicate",
+        "example:damage_without_predicate",
+        "example:damage_with_empty_predicate",
+    ] {
+        assert_function(&mut vm, function, returned(false, 0));
+    }
+}
+
+#[test]
+fn absent_context_results_do_not_consume_randomness_or_evaluate_score_ranges() {
+    for predicate in [
+        r#"{"type":"survives_explosion"}"#,
+        r#"{"type":"killed_by_player"}"#,
+        r#"{"type":"entity_properties","entity":"this"}"#,
+        r#"{"type":"entity_properties","entity":"this","predicate":{}}"#,
+        r#"{"type":"entity_scores","scores":{"points":{"min":{"type":"uniform","min":0,"max":1}}},"entity":"this"}"#,
+        r#"{"type":"match_block"}"#,
+        r#"{"type":"match_tool"}"#,
+        r#"{"type":"damage_source_properties"}"#,
+        r#"{"type":"weather_check"}"#,
+    ] {
+        assert_eq!(uniform_after(predicate, &[]), 7, "{predicate}");
+    }
+}
+
+#[test]
+fn missing_required_context_is_an_evaluation_error_and_respects_short_circuiting() {
+    let mut vm = compile(
+        &[
+            (
+                "example:active_true",
+                "return run execute if predicate example:active_true\n",
+            ),
+            (
+                "example:active_false",
+                "return run execute unless predicate example:active_false\n",
+            ),
+            (
+                "example:inverted",
+                "return run execute if predicate example:inverted\n",
+            ),
+            (
+                "example:all_short_circuit",
+                "return run execute if predicate example:all_short_circuit\n",
+            ),
+            (
+                "example:any_short_circuit",
+                "return run execute if predicate example:any_short_circuit\n",
+            ),
+            (
+                "example:modifier_short_circuit",
+                "return run execute if predicate example:falsehood if predicate example:active_true\n",
+            ),
+        ],
+        &[],
+        &[
+            (
+                "example:active_true",
+                r#"{"type":"enchantment_active_check","active":true}"#,
+            ),
+            (
+                "example:active_false",
+                r#"{"type":"enchantment_active_check","active":false}"#,
+            ),
+            ("example:truth", r#"{"type":"survives_explosion"}"#),
+            ("example:falsehood", r#"{"type":"killed_by_player"}"#),
+            (
+                "example:inverted",
+                r#"{"type":"inverted","term":"example:active_true"}"#,
+            ),
+            (
+                "example:all_short_circuit",
+                r#"{"type":"all_of","terms":["example:falsehood","example:active_true"]}"#,
+            ),
+            (
+                "example:any_short_circuit",
+                r#"{"type":"any_of","terms":["example:truth","example:active_true"]}"#,
+            ),
+        ],
+        &[],
+    );
+
+    for function in [
+        "example:active_true",
+        "example:active_false",
+        "example:inverted",
+    ] {
+        match vm.execute_function(function, None, context(), LIMIT) {
+            Err(ExecutionError::PredicateEvaluationFailed { reason }) => {
+                assert!(reason.contains("enchantment_active"), "{reason}");
+            }
+            result => panic!("expected a predicate evaluation error, got {result:?}"),
+        }
+    }
+    assert_function(&mut vm, "example:all_short_circuit", returned(false, 0));
+    assert_function(&mut vm, "example:any_short_circuit", returned(true, 1));
+    assert_function(
+        &mut vm,
+        "example:modifier_short_circuit",
+        returned(false, 0),
+    );
+}
+
+#[test]
+fn context_absent_predicate_codecs_are_validated_at_load_time() {
+    for entity in [
+        "this",
+        "attacker",
+        "direct_attacker",
+        "attacking_player",
+        "target_entity",
+        "interacting_entity",
+    ] {
+        let source = format!(r#"{{"type":"entity_scores","scores":{{}},"entity":"{entity}"}}"#);
+        resources(&[], &[], &[("example:test", &source)], &[]).unwrap();
+    }
+
+    for source in [
+        r#"{"type":"match_tool","predicate":{"unknown":1}}"#,
+        r#"{"type":"damage_source_properties","predicate":{"unknown":1}}"#,
+    ] {
+        resources(&[], &[], &[("example:test", source)], &[]).unwrap();
+    }
+
+    for (source, expected) in [
+        (
+            r#"{"type":"entity_scores","scores":{"points":{"min":"example:missing"}},"entity":"this"}"#,
+            "number provider `example:missing` does not exist",
+        ),
+        (
+            r#"{"type":"entity_scores","scores":{},"entity":"invalid"}"#,
+            "invalid entity target",
+        ),
+        (
+            r#"{"type":"weather_check","raining":true}"#,
+            "physical-world weather",
+        ),
+        (
+            r#"{"type":"weather_check","raining":1}"#,
+            "must be a boolean",
+        ),
+        (
+            r#"{"type":"enchantment_active_check"}"#,
+            "missing field `active`",
+        ),
+        (
+            r#"{"type":"enchantment_active_check","active":1}"#,
+            "must be a boolean",
+        ),
+    ] {
+        let error = resources(&[], &[], &[("example:test", source)], &[]).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }
 
 #[test]
@@ -698,12 +951,12 @@ fn invalid_predicates_references_and_cross_registry_cycles_are_rejected() {
         ),
         (
             "example:unsupported",
-            r#"{"type":"match_block"}"#,
+            r#"{"type":"time_check","clock":"minecraft:day_time","value":0}"#,
             "outside Worldless scope",
         ),
         (
             "example:unreachable_unsupported",
-            r#"{"type":"all_of","terms":[{"type":"any_of","terms":[]},{"type":"match_block"}]}"#,
+            r#"{"type":"all_of","terms":[{"type":"any_of","terms":[]},{"type":"time_check","clock":"minecraft:day_time","value":0}]}"#,
             "outside Worldless scope",
         ),
         (

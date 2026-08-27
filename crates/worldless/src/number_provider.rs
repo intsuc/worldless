@@ -496,7 +496,18 @@ impl LootRegistry {
                 }
                 Ok(())
             }
-            LootPredicate::LocationCheck { .. } => Ok(()),
+            LootPredicate::AbsentContext {
+                referenced_number_providers,
+                ..
+            } => {
+                for provider in referenced_number_providers {
+                    self.collect_number_provider_reference_dependencies(provider, dependencies)?;
+                }
+                Ok(())
+            }
+            LootPredicate::LocationCheck { .. } | LootPredicate::MissingContextParameter { .. } => {
+                Ok(())
+            }
         }
     }
 
@@ -1304,6 +1315,17 @@ pub(crate) enum Input<'a> {
 }
 
 impl<'a> Input<'a> {
+    pub(crate) fn boolean(self) -> Option<bool> {
+        match self {
+            Self::Json(Value::Bool(value)) => Some(*value),
+            Self::Nbt(value) => value.double_value().map(|value| value != 0.0),
+            Self::NbtByte(value) => Some(value != 0),
+            Self::NbtInt(value) => Some(value != 0),
+            Self::NbtLong(value) => Some(value != 0),
+            Self::Json(_) => None,
+        }
+    }
+
     pub(crate) fn number(self) -> Option<f32> {
         match self {
             Self::Json(Value::Number(value)) => value.to_string().parse().ok(),
@@ -1332,6 +1354,40 @@ impl<'a> Input<'a> {
             self,
             Self::Json(Value::Object(_)) | Self::Nbt(Tag::Compound(_))
         )
+    }
+
+    pub(crate) fn is_empty_object(self) -> bool {
+        match self {
+            Self::Json(Value::Object(value)) => value.is_empty(),
+            Self::Nbt(Tag::Compound(value)) => value.is_empty(),
+            Self::Json(_)
+            | Self::Nbt(_)
+            | Self::NbtByte(_)
+            | Self::NbtInt(_)
+            | Self::NbtLong(_) => false,
+        }
+    }
+
+    pub(crate) fn object_entries(self) -> Option<Vec<(JavaString, Self)>> {
+        match self {
+            Self::Json(Value::Object(value)) => Some(
+                value
+                    .iter()
+                    .map(|(key, value)| (resource_json::decode_string(key), Self::Json(value)))
+                    .collect(),
+            ),
+            Self::Nbt(Tag::Compound(value)) => Some(
+                value
+                    .entries()
+                    .map(|(key, value)| (key.clone(), Self::Nbt(value)))
+                    .collect(),
+            ),
+            Self::Json(_)
+            | Self::Nbt(_)
+            | Self::NbtByte(_)
+            | Self::NbtInt(_)
+            | Self::NbtLong(_) => None,
+        }
     }
 
     pub(crate) fn field(self, name: &str) -> Option<Self> {

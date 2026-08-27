@@ -135,6 +135,10 @@ impl CompoundTag {
         self.0.values()
     }
 
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&JavaString, &Tag)> {
+        self.0.iter()
+    }
+
     pub(crate) fn merge(&mut self, other: &Self) {
         for (name, other_tag) in &other.0 {
             match (self.0.get_mut(name), other_tag) {
