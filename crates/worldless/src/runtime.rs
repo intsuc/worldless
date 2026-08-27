@@ -1,11 +1,13 @@
-use std::{cell::Cell, collections::VecDeque, error::Error, fmt, rc::Rc};
+use std::{cell::Cell, collections::VecDeque, error::Error, fmt, rc::Rc, sync::Arc};
 
 use crate::{
+    loader::CommandCompiler,
+    macro_function::Function,
     nbt::{CommandStorage, JavaString, Tag},
     program::{
-        Command, DataCommand, DataModifyOperation, DataSource, Function, Modifier, Program,
-        ResolvedFunctions, ScoreCondition, Scoreboard, ScoreboardCommand, StorageCondition,
-        StorageNumberType, StoreKind,
+        Command, DataCommand, DataModifyOperation, DataSource, FunctionArguments, Instruction,
+        Modifier, Program, ResolvedFunctions, ScoreCondition, Scoreboard, ScoreboardCommand,
+        StorageCondition, StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier},
 };
@@ -24,6 +26,7 @@ pub enum FunctionOutcome {
 pub enum ExecutionError {
     InvalidFunctionIdentifier { input: String },
     UnknownFunction { id: String },
+    FunctionInstantiationFailed { id: String, reason: String },
     CommandLimitExceeded { limit: usize },
 }
 
@@ -34,6 +37,9 @@ impl fmt::Display for ExecutionError {
                 write!(formatter, "invalid function identifier {input:?}")
             }
             Self::UnknownFunction { id } => write!(formatter, "unknown function {id}"),
+            Self::FunctionInstantiationFailed { id, reason } => {
+                write!(formatter, "failed to instantiate function {id}: {reason}")
+            }
             Self::CommandLimitExceeded { limit } => {
                 write!(
                     formatter,
@@ -70,7 +76,7 @@ impl CommandResult {
 enum StoreAction {
     Score {
         kind: StoreKind,
-        holder: String,
+        holder: JavaString,
         objective: String,
     },
     Storage {
@@ -190,19 +196,19 @@ impl ResultConsumer {
     }
 }
 
-struct Frame<'a> {
-    function: &'a Function,
+struct Frame {
+    function: Arc<[Instruction]>,
     next_instruction: usize,
     depth: usize,
     discard_depth: usize,
     result_consumer: ResultConsumer,
 }
 
-enum QueueEntry<'a> {
-    Call(Frame<'a>),
-    Step(Frame<'a>),
+enum QueueEntry {
+    Call(Frame),
+    Step(Frame),
     Prepare {
-        frame: Frame<'a>,
+        frame: Frame,
         instruction: usize,
         next_modifier: usize,
         stores: Vec<StoreAction>,
@@ -211,13 +217,13 @@ enum QueueEntry<'a> {
         forked: bool,
     },
     ExecuteOrdinary {
-        frame: Frame<'a>,
+        frame: Frame,
         instruction: usize,
         stores: Vec<StoreAction>,
         return_run: bool,
     },
     ResumeFunctionCondition {
-        frame: Frame<'a>,
+        frame: Frame,
         instruction: usize,
         next_modifier: usize,
         stores: Vec<StoreAction>,
@@ -226,8 +232,8 @@ enum QueueEntry<'a> {
         result: Rc<Cell<Option<i32>>>,
     },
     ContinueFunctionTag {
-        frame: Frame<'a>,
-        functions: &'a [Identifier],
+        frame: Frame,
+        functions: Arc<[Arc<[Instruction]>]>,
         next_function: usize,
         stores: Vec<StoreAction>,
         result: Option<Rc<Cell<Option<i32>>>>,
@@ -239,7 +245,7 @@ enum QueueEntry<'a> {
     },
 }
 
-impl QueueEntry<'_> {
+impl QueueEntry {
     fn depth(&self) -> usize {
         match self {
             Self::Call(frame)
@@ -282,7 +288,14 @@ pub(crate) fn execute(
     let id = Identifier::parse(input).ok_or_else(|| ExecutionError::InvalidFunctionIdentifier {
         input: input.to_owned(),
     })?;
-    let function = find_function(program, &id)?;
+    let definition = find_function(program, &id)?;
+    let mut compiler = None;
+    let function = instantiate_function(definition, None, &mut compiler).map_err(|reason| {
+        ExecutionError::FunctionInstantiationFailed {
+            id: id.to_string(),
+            reason,
+        }
+    })?;
     let mut queue = VecDeque::from([QueueEntry::Call(Frame {
         function,
         next_instruction: 0,
@@ -330,8 +343,8 @@ pub(crate) fn execute(
                 active,
                 forked,
             } => {
-                let function = frame.function;
-                let compiled = &function.instructions[instruction];
+                let function = Arc::clone(&frame.function);
+                let compiled = &function[instruction];
                 let mut frame = Some(frame);
                 let mut stores = Some(stores);
                 let mut active = active;
@@ -439,6 +452,13 @@ pub(crate) fn execute(
                                 break false;
                             }
 
+                            let (condition_functions, _) = instantiate_resolved_prefix(
+                                program,
+                                condition_functions,
+                                None,
+                                &mut compiler,
+                            );
+
                             let result = Rc::new(Cell::new(None));
                             let result_consumer =
                                 ResultConsumer::function_condition(Rc::clone(&result));
@@ -457,29 +477,14 @@ pub(crate) fn execute(
                                 discard_depth: isolated_depth,
                                 result_consumer: result_consumer.clone(),
                             });
-                            match condition_functions {
-                                ResolvedFunctions::Single(function) => {
-                                    queue.push_front(QueueEntry::Call(Frame {
-                                        function,
-                                        next_instruction: 0,
-                                        depth: isolated_depth,
-                                        discard_depth: isolated_depth,
-                                        result_consumer,
-                                    }));
-                                }
-                                ResolvedFunctions::Tag(functions) => {
-                                    for function_id in functions.iter().rev() {
-                                        queue.push_front(QueueEntry::Call(Frame {
-                                            function: program.function(function_id).expect(
-                                                "resolved function tags contain loaded functions",
-                                            ),
-                                            next_instruction: 0,
-                                            depth: isolated_depth,
-                                            discard_depth: isolated_depth,
-                                            result_consumer: result_consumer.clone(),
-                                        }));
-                                    }
-                                }
+                            for function in condition_functions.into_iter().rev() {
+                                queue.push_front(QueueEntry::Call(Frame {
+                                    function,
+                                    next_instruction: 0,
+                                    depth: isolated_depth,
+                                    discard_depth: isolated_depth,
+                                    result_consumer: result_consumer.clone(),
+                                }));
                             }
                             break false;
                         }
@@ -530,14 +535,19 @@ pub(crate) fn execute(
                 }
 
                 match &compiled.command {
-                    Command::Function(reference) => execute_function_command(
+                    Command::Function {
+                        reference,
+                        arguments,
+                    } => execute_function_command(
                         program,
                         scoreboard,
                         command_storage,
+                        &mut compiler,
                         &mut queue,
                         &mut top_level_result,
                         frame,
                         reference,
+                        arguments.as_ref(),
                         stores,
                         return_run,
                     ),
@@ -574,7 +584,7 @@ pub(crate) fn execute(
                 return_run,
             } => {
                 quota.increment();
-                let command = &frame.function.instructions[instruction].command;
+                let command = &frame.function[instruction].command;
                 let result = match command {
                     Command::Scoreboard(command) => execute_scoreboard_command(scoreboard, command),
                     Command::Condition(condition) => execute_condition(scoreboard, condition),
@@ -582,7 +592,7 @@ pub(crate) fn execute(
                         execute_storage_condition(command_storage, condition)
                     }
                     Command::Data(command) => execute_data_command(command_storage, command),
-                    Command::Function(_) | Command::Return { .. } => {
+                    Command::Function { .. } | Command::Return { .. } => {
                         unreachable!("only ordinary commands are queued for ordinary execution")
                     }
                 };
@@ -632,7 +642,7 @@ pub(crate) fn execute(
                 stores,
                 result,
             } => {
-                let Some(function_id) = functions.get(next_function) else {
+                let Some(function) = functions.get(next_function).map(Arc::clone) else {
                     if let Some(value) = result.as_ref().and_then(|result| result.get()) {
                         ResultConsumer::ignoring(stores).accept(
                             CommandResult::success(value),
@@ -657,9 +667,7 @@ pub(crate) fn execute(
                     result,
                 });
                 queue.push_front(QueueEntry::Call(Frame {
-                    function: program
-                        .function(function_id)
-                        .expect("resolved function tags contain loaded functions"),
+                    function,
                     next_instruction: 0,
                     depth: child_depth,
                     discard_depth: child_depth,
@@ -684,88 +692,196 @@ pub(crate) fn execute(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_function_command<'a>(
-    program: &'a Program,
+fn execute_function_command(
+    program: &Program,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
-    queue: &mut VecDeque<QueueEntry<'a>>,
+    compiler: &mut Option<CommandCompiler>,
+    queue: &mut VecDeque<QueueEntry>,
     top_level_result: &mut Option<FunctionOutcome>,
-    frame: Frame<'a>,
+    frame: Frame,
     reference: &FunctionReference,
+    argument_source: Option<&FunctionArguments>,
     stores: Vec<StoreAction>,
     return_run: bool,
 ) {
     let functions = match program.resolve_functions(reference) {
         Some(ResolvedFunctions::Tag([])) | None => {
-            ResultConsumer::ignoring(stores).accept(
-                CommandResult::FAILURE,
+            fail_function_command(
+                queue,
+                frame,
+                Vec::new(),
+                stores,
+                return_run,
                 scoreboard,
                 command_storage,
                 top_level_result,
             );
-            if !return_run {
-                schedule_next_instruction(queue, frame);
-            }
             return;
         }
         Some(functions) => functions,
     };
 
-    match functions {
-        ResolvedFunctions::Single(function) => {
-            queue_single_function(queue, frame, function, stores, return_run);
-        }
-        ResolvedFunctions::Tag([function_id]) => {
-            queue_single_function(
+    let arguments = match resolve_function_arguments(argument_source, command_storage) {
+        Ok(arguments) => arguments,
+        Err(()) => {
+            fail_function_command(
                 queue,
                 frame,
-                program
-                    .function(function_id)
-                    .expect("resolved function tags contain loaded functions"),
+                Vec::new(),
                 stores,
                 return_run,
+                scoreboard,
+                command_storage,
+                top_level_result,
             );
+            return;
         }
-        ResolvedFunctions::Tag(functions) if return_run => {
-            let child_depth = frame.depth + 1;
-            let fallback_depth = frame.depth;
-            let discard_depth = frame.discard_depth;
-            let parent_consumer = frame.result_consumer;
-            let child_consumer = parent_consumer.with_prefix(stores);
-            queue.push_front(QueueEntry::Fallthrough {
-                depth: fallback_depth,
-                discard_depth,
-                result_consumer: parent_consumer,
-            });
-            for function_id in functions.iter().rev() {
-                queue.push_front(QueueEntry::Call(Frame {
-                    function: program
-                        .function(function_id)
-                        .expect("resolved function tags contain loaded functions"),
-                    next_instruction: 0,
-                    depth: child_depth,
-                    discard_depth,
-                    result_consumer: child_consumer.clone(),
-                }));
+    };
+    let is_single = matches!(functions, ResolvedFunctions::Single(_))
+        || matches!(functions, ResolvedFunctions::Tag([_]));
+    let (instances, failed) =
+        instantiate_resolved_prefix(program, functions, arguments.as_ref(), compiler);
+    if failed {
+        fail_function_command(
+            queue,
+            frame,
+            instances,
+            stores,
+            return_run,
+            scoreboard,
+            command_storage,
+            top_level_result,
+        );
+    } else if is_single {
+        queue_single_function(
+            queue,
+            frame,
+            Arc::clone(
+                instances
+                    .first()
+                    .expect("a resolved single function produces one instance"),
+            ),
+            stores,
+            return_run,
+        );
+    } else {
+        queue_function_tag(queue, frame, instances, stores, return_run);
+    }
+}
+
+fn resolve_function_arguments(
+    source: Option<&FunctionArguments>,
+    command_storage: &CommandStorage,
+) -> Result<Option<crate::nbt::CompoundTag>, ()> {
+    match source {
+        None => Ok(None),
+        Some(FunctionArguments::Compound(arguments)) => Ok(Some(arguments.clone())),
+        Some(FunctionArguments::Storage {
+            storage,
+            path: None,
+        }) => Ok(Some(command_storage.get(storage))),
+        Some(FunctionArguments::Storage {
+            storage,
+            path: Some(path),
+        }) => {
+            let root = command_storage.get(storage);
+            let mut selected = path.get(&root).map_err(|_| ())?;
+            if selected.len() != 1 {
+                return Err(());
+            }
+            match selected.pop().expect("one NBT value was selected") {
+                Tag::Compound(arguments) => Ok(Some(arguments)),
+                _ => Err(()),
+            }
+        }
+    }
+}
+
+fn instantiate_resolved_prefix(
+    program: &Program,
+    functions: ResolvedFunctions<'_>,
+    arguments: Option<&crate::nbt::CompoundTag>,
+    compiler: &mut Option<CommandCompiler>,
+) -> (Vec<Arc<[Instruction]>>, bool) {
+    let mut instances = Vec::new();
+    match functions {
+        ResolvedFunctions::Single(function) => {
+            match instantiate_function(function, arguments, compiler) {
+                Ok(instance) => instances.push(instance),
+                Err(_) => return (instances, true),
             }
         }
         ResolvedFunctions::Tag(functions) => {
-            let result = (!stores.is_empty()).then(|| Rc::new(Cell::new(None)));
+            for id in functions {
+                let function = program
+                    .function(id)
+                    .expect("resolved function tags contain loaded functions");
+                match instantiate_function(function, arguments, compiler) {
+                    Ok(instance) => instances.push(instance),
+                    Err(_) => return (instances, true),
+                }
+            }
+        }
+    }
+    (instances, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fail_function_command(
+    queue: &mut VecDeque<QueueEntry>,
+    frame: Frame,
+    instances: Vec<Arc<[Instruction]>>,
+    stores: Vec<StoreAction>,
+    return_run: bool,
+    scoreboard: &mut Scoreboard,
+    command_storage: &mut CommandStorage,
+    top_level_result: &mut Option<FunctionOutcome>,
+) {
+    if return_run {
+        ResultConsumer::ignoring(stores.clone()).accept(
+            CommandResult::FAILURE,
+            scoreboard,
+            command_storage,
+            top_level_result,
+        );
+        let child_depth = frame.depth + 1;
+        let discard_depth = frame.discard_depth;
+        let child_consumer = frame.result_consumer.with_prefix(stores);
+        for function in instances.into_iter().rev() {
+            queue.push_front(QueueEntry::Call(Frame {
+                function,
+                next_instruction: 0,
+                depth: child_depth,
+                discard_depth,
+                result_consumer: child_consumer.clone(),
+            }));
+        }
+    } else {
+        ResultConsumer::ignoring(stores).accept(
+            CommandResult::FAILURE,
+            scoreboard,
+            command_storage,
+            top_level_result,
+        );
+        if instances.is_empty() {
+            schedule_next_instruction(queue, frame);
+        } else {
             queue.push_front(QueueEntry::ContinueFunctionTag {
                 frame,
-                functions,
+                functions: Arc::from(instances),
                 next_function: 0,
-                stores,
-                result,
+                stores: Vec::new(),
+                result: None,
             });
         }
     }
 }
 
-fn queue_single_function<'a>(
-    queue: &mut VecDeque<QueueEntry<'a>>,
-    frame: Frame<'a>,
-    function: &'a Function,
+fn queue_single_function(
+    queue: &mut VecDeque<QueueEntry>,
+    frame: Frame,
+    function: Arc<[Instruction]>,
     stores: Vec<StoreAction>,
     return_run: bool,
 ) {
@@ -795,6 +911,45 @@ fn queue_single_function<'a>(
         };
         schedule_next_instruction(queue, frame);
         queue.push_front(QueueEntry::Call(child));
+    }
+}
+
+fn queue_function_tag(
+    queue: &mut VecDeque<QueueEntry>,
+    frame: Frame,
+    functions: Vec<Arc<[Instruction]>>,
+    stores: Vec<StoreAction>,
+    return_run: bool,
+) {
+    if return_run {
+        let child_depth = frame.depth + 1;
+        let fallback_depth = frame.depth;
+        let discard_depth = frame.discard_depth;
+        let parent_consumer = frame.result_consumer;
+        let child_consumer = parent_consumer.with_prefix(stores);
+        queue.push_front(QueueEntry::Fallthrough {
+            depth: fallback_depth,
+            discard_depth,
+            result_consumer: parent_consumer,
+        });
+        for function in functions.into_iter().rev() {
+            queue.push_front(QueueEntry::Call(Frame {
+                function,
+                next_instruction: 0,
+                depth: child_depth,
+                discard_depth,
+                result_consumer: child_consumer.clone(),
+            }));
+        }
+    } else {
+        let result = (!stores.is_empty()).then(|| Rc::new(Cell::new(None)));
+        queue.push_front(QueueEntry::ContinueFunctionTag {
+            frame,
+            functions: Arc::from(functions),
+            next_function: 0,
+            stores,
+            result,
+        });
     }
 }
 
@@ -1031,7 +1186,9 @@ fn resolve_data_source(
             values
                 .into_iter()
                 .map(|value| {
-                    let value = primitive_text(&value)?;
+                    let value = value
+                        .primitive_text()
+                        .ok_or_else(|| "string source requires a primitive NBT value".to_owned())?;
                     let value = substring.map_or_else(
                         || Ok(value.clone()),
                         |range| value.substring(range.start, range.end),
@@ -1043,33 +1200,17 @@ fn resolve_data_source(
     }
 }
 
-fn primitive_text(value: &Tag) -> Result<JavaString, String> {
-    use worldless_brigadier::exceptions::{java_f32, java_f64};
-
-    let value = match value {
-        Tag::Byte(value) => format!("{value}b"),
-        Tag::Short(value) => format!("{value}s"),
-        Tag::Int(value) => value.to_string(),
-        Tag::Long(value) => format!("{value}L"),
-        Tag::Float(bits) => format!("{}f", java_f32(f32::from_bits(*bits))),
-        Tag::Double(bits) => format!("{}d", java_f64(f64::from_bits(*bits))),
-        Tag::String(value) => return Ok(value.clone()),
-        _ => return Err("string source requires a primitive NBT value".to_owned()),
-    };
-    Ok(JavaString::from(value.as_str()))
-}
-
 fn minecraft_floor_to_i32(value: f64) -> i32 {
     value.floor() as i32
 }
 
-fn schedule_next_instruction<'a>(queue: &mut VecDeque<QueueEntry<'a>>, frame: Frame<'a>) {
-    if frame.next_instruction < frame.function.instructions.len() {
+fn schedule_next_instruction(queue: &mut VecDeque<QueueEntry>, frame: Frame) {
+    if frame.next_instruction < frame.function.len() {
         queue.push_front(QueueEntry::Step(frame));
     }
 }
 
-fn discard_at_depth_or_higher(queue: &mut VecDeque<QueueEntry<'_>>, depth: usize) {
+fn discard_at_depth_or_higher(queue: &mut VecDeque<QueueEntry>, depth: usize) {
     queue.retain(|entry| entry.depth() < depth);
 }
 
@@ -1080,4 +1221,19 @@ fn find_function<'a>(
     program
         .function(id)
         .ok_or_else(|| ExecutionError::UnknownFunction { id: id.to_string() })
+}
+
+fn instantiate_function(
+    function: &Function,
+    arguments: Option<&crate::nbt::CompoundTag>,
+    compiler: &mut Option<CommandCompiler>,
+) -> Result<Arc<[Instruction]>, String> {
+    match function {
+        Function::Plain(instructions) => Ok(Arc::clone(instructions)),
+        Function::Macro(function) => function.instantiate(arguments, |command| {
+            compiler
+                .get_or_insert_with(CommandCompiler::new)
+                .compile_utf16(command)
+        }),
+    }
 }

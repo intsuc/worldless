@@ -3,12 +3,13 @@
 //!
 //! The current slice supports function calls and returns, persistent named
 //! scoreboard arithmetic, command storage and NBT data operations, function
-//! tags, supported `execute` conditions, and result propagation.
+//! macros and tags, supported `execute` conditions, and result propagation.
 //! Functions and tags can be compiled from an expanded directory data pack or
 //! in-memory source. Construction is atomic: an invalid supported resource
 //! rejects the whole program instead of leaving a partially populated VM.
 
 mod loader;
+mod macro_function;
 mod nbt;
 mod program;
 mod resource;
@@ -78,7 +79,9 @@ impl Vm {
     /// Function identifiers without a namespace use `minecraft`. The command
     /// limit follows Minecraft's queue limit: reaching the limit stops
     /// execution, so a completed invocation always consumes less than
-    /// `command_limit`.
+    /// `command_limit`. A macro function cannot be invoked directly because
+    /// this entry point supplies no argument compound; invoke it from another
+    /// function with `function <id> <compound>` or `with storage`.
     pub fn execute_function(
         &mut self,
         id: &str,

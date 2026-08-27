@@ -1143,7 +1143,6 @@ fn rejects_invalid_and_out_of_slice_storage_command_forms() {
         "execute if data entity @s path run return 1",
         "execute store result entity @s path int 1 run return 1",
         "data modify storage example:value path set compute 1",
-        "function example:target with storage example:value",
     ] {
         assert!(
             matches!(

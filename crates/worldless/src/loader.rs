@@ -17,10 +17,11 @@ use worldless_brigadier::{
 };
 
 use crate::{
-    nbt::{CompoundTag, NbtPath, Tag, parse_compound, parse_path, parse_tag},
+    macro_function::{Function, FunctionBuilder, MAX_COMMAND_LENGTH},
+    nbt::{CompoundTag, JavaString, NbtPath, Tag, parse_compound, parse_path, parse_tag},
     program::{
         Command as CompiledCommand, DataCommand, DataModifyOperation, DataSource,
-        DataStringSubstring, Function, Instruction, Modifier, Program, ScoreComparison,
+        DataStringSubstring, FunctionArguments, Instruction, Modifier, Program, ScoreComparison,
         ScoreCondition, ScorePredicate, ScoreRange, ScoreReference, ScoreboardCommand,
         ScoreboardOperation, StorageCondition, StorageNumberType, StoreKind,
     },
@@ -32,7 +33,6 @@ const TARGET_PACK_FORMAT: PackFormat = PackFormat {
     minor: 0,
 };
 const LAST_PRE_MINOR_DATA_PACK_FORMAT: i32 = 81;
-const MAX_COMMAND_LENGTH: usize = 2_000_000;
 
 /// An error encountered while loading a directory data pack.
 #[derive(Debug)]
@@ -194,14 +194,14 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
             let id = Identifier::from_parts(namespace, function_path)
                 .expect("removing a valid suffix preserves an identifier path");
             let contents = read_to_string(&path)?;
-            let instructions = parse_function(&contents, &compiler).map_err(|error| {
+            let function = parse_function(&contents, &compiler).map_err(|error| {
                 LoadError::InvalidFunction {
                     path: path.clone(),
                     line: error.line,
                     reason: error.reason,
                 }
             })?;
-            functions.insert(id, Function { instructions });
+            functions.insert(id, function);
         }
 
         let tag_root = namespace_dir.join("tags/function");
@@ -282,14 +282,14 @@ where
             }
             Entry::Vacant(entry) => {
                 let id = entry.key().to_string();
-                let instructions = parse_function(source.as_ref(), &compiler).map_err(|error| {
+                let function = parse_function(source.as_ref(), &compiler).map_err(|error| {
                     CompileError::InvalidFunction {
                         id,
                         line: error.line,
                         reason: error.reason,
                     }
                 })?;
-                entry.insert(Function { instructions });
+                entry.insert(function);
             }
         }
     }
@@ -915,9 +915,9 @@ struct FunctionParseError {
 fn parse_function(
     contents: &str,
     compiler: &CommandCompiler,
-) -> Result<Vec<Instruction>, FunctionParseError> {
+) -> Result<Function, FunctionParseError> {
     let lines = java_lines(contents);
-    let mut instructions = Vec::new();
+    let mut builder = FunctionBuilder::new();
     let mut index = 0;
     while index < lines.len() {
         let line_number = index + 1;
@@ -957,20 +957,21 @@ fn parse_function(
             };
             return Err(invalid_function(line_number, reason));
         }
-        if line.starts_with('$') {
-            return Err(invalid_function(
-                line_number,
-                "function macros are not supported",
-            ));
+        if let Some(macro_command) = line.strip_prefix('$') {
+            builder
+                .add_macro(macro_command)
+                .map_err(|reason| invalid_function(line_number, reason))?;
+            index += 1;
+            continue;
         }
 
         let instruction = compiler
             .compile(&line)
             .map_err(|reason| invalid_function(line_number, reason))?;
-        instructions.push(instruction);
+        builder.add_command(instruction);
         index += 1;
     }
-    Ok(instructions)
+    Ok(builder.build())
 }
 
 fn check_command_length(line: usize, length: usize) -> Result<(), FunctionParseError> {
@@ -1042,24 +1043,71 @@ impl LoweringSource {
     }
 }
 
-struct CommandCompiler {
+pub(crate) struct CommandCompiler {
     dispatcher: CommandDispatcher<LoweringSource>,
 }
 
 impl CommandCompiler {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let dispatcher = CommandDispatcher::new();
 
-        let function: Command<LoweringSource> = Rc::new(|context| {
-            let reference = context
-                .argument::<FunctionReference>("name")
-                .expect("the function executor is attached below its name argument");
-            context
-                .source()
-                .record(CompiledCommand::Function((*reference).clone()))
+        let function_without_arguments: Command<LoweringSource> = Rc::new(|context| {
+            context.source().record(CompiledCommand::Function {
+                reference: function_reference(context),
+                arguments: None,
+            })
         });
-        let function_name =
-            RequiredArgumentBuilder::argument("name", FunctionArgument).executes(function);
+        let function_with_compound: Command<LoweringSource> = Rc::new(|context| {
+            context.source().record(CompiledCommand::Function {
+                reference: function_reference(context),
+                arguments: Some(FunctionArguments::Compound(compound_tag(
+                    context,
+                    "arguments",
+                ))),
+            })
+        });
+        let function_with_storage: Command<LoweringSource> = Rc::new(|context| {
+            context.source().record(CompiledCommand::Function {
+                reference: function_reference(context),
+                arguments: Some(FunctionArguments::Storage {
+                    storage: storage_identifier(context, "source"),
+                    path: None,
+                }),
+            })
+        });
+        let function_with_storage_path: Command<LoweringSource> = Rc::new(|context| {
+            context.source().record(CompiledCommand::Function {
+                reference: function_reference(context),
+                arguments: Some(FunctionArguments::Storage {
+                    storage: storage_identifier(context, "source"),
+                    path: Some(nbt_path(context, "path")),
+                }),
+            })
+        });
+        let storage_source = RequiredArgumentBuilder::argument("source", StorageIdentifierArgument)
+            .executes(function_with_storage)
+            .then(
+                RequiredArgumentBuilder::argument("path", NbtPathArgument)
+                    .executes(function_with_storage_path),
+            )
+            .expect("a storage source can contain an NBT path");
+        let function_name = RequiredArgumentBuilder::argument("name", FunctionArgument)
+            .executes(function_without_arguments)
+            .then(
+                RequiredArgumentBuilder::argument("arguments", CompoundTagArgument)
+                    .executes(function_with_compound),
+            )
+            .expect("a function name can contain a compound argument")
+            .then(
+                LiteralArgumentBuilder::literal("with")
+                    .then(
+                        LiteralArgumentBuilder::literal("storage")
+                            .then(storage_source)
+                            .expect("the storage argument has a distinct child name"),
+                    )
+                    .expect("the with literal can contain the storage literal"),
+            )
+            .expect("a function name can contain an argument source");
         dispatcher
             .register(
                 LiteralArgumentBuilder::literal("function")
@@ -1315,10 +1363,18 @@ impl CommandCompiler {
         Self { dispatcher }
     }
 
-    fn compile(&self, command: &str) -> Result<Instruction, String> {
+    pub(crate) fn compile(&self, command: &str) -> Result<Instruction, String> {
+        self.compile_reader(StringReader::new(command))
+    }
+
+    pub(crate) fn compile_utf16(&self, command: Vec<u16>) -> Result<Instruction, String> {
+        self.compile_reader(StringReader::from_utf16(command))
+    }
+
+    fn compile_reader(&self, command: StringReader) -> Result<Instruction, String> {
         let sink = Rc::new(RefCell::new(None));
         self.dispatcher
-            .execute(
+            .execute_reader(
                 command,
                 LoweringSource {
                     sink: Rc::clone(&sink),
@@ -2033,6 +2089,13 @@ fn command_string(context: &CommandContext<LoweringSource>, name: &str) -> Strin
         .expect("the command executor is attached below the requested string argument")
 }
 
+fn function_reference(context: &CommandContext<LoweringSource>) -> FunctionReference {
+    context
+        .argument::<FunctionReference>("name")
+        .map(|reference| (*reference).clone())
+        .expect("the function executor is attached below its name argument")
+}
+
 fn storage_identifier(context: &CommandContext<LoweringSource>, name: &str) -> Identifier {
     context
         .argument::<Identifier>(name)
@@ -2061,9 +2124,9 @@ fn compound_tag(context: &CommandContext<LoweringSource>, name: &str) -> Compoun
         .expect("the command executor is attached below the requested compound tag")
 }
 
-fn score_holder(context: &CommandContext<LoweringSource>, name: &str) -> String {
+fn score_holder(context: &CommandContext<LoweringSource>, name: &str) -> JavaString {
     context
-        .argument::<String>(name)
+        .argument::<JavaString>(name)
         .map(|holder| (*holder).clone())
         .expect("the command executor is attached below the requested score holder argument")
 }
@@ -2202,15 +2265,15 @@ fn parse_nbt_argument<T>(
 struct ScoreHolderArgument;
 
 impl ArgumentType<LoweringSource> for ScoreHolderArgument {
-    type Value = String;
+    type Value = JavaString;
 
     fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
         let start = reader.cursor();
         while reader.can_read() && reader.peek() != b' ' as u16 {
             reader.skip();
         }
-        let holder = reader.substring(start, reader.cursor());
-        if holder.starts_with('#') {
+        let holder = JavaString::from_units(reader.substring_utf16(start, reader.cursor()));
+        if holder.units().first() == Some(&u16::from(b'#')) {
             Ok(holder)
         } else {
             reader.set_cursor(start);
@@ -2573,7 +2636,13 @@ mod tests {
         let compiler = CommandCompiler::new();
         let instruction = compiler.compile("function example:child").unwrap();
         assert!(instruction.modifiers.is_empty());
-        assert!(matches!(instruction.command, CompiledCommand::Function(_)));
+        assert!(matches!(
+            instruction.command,
+            CompiledCommand::Function {
+                arguments: None,
+                ..
+            }
+        ));
 
         let instruction = compiler.compile("return -7").unwrap();
         assert!(instruction.modifiers.is_empty());
@@ -2602,7 +2671,13 @@ mod tests {
             instruction.modifiers.as_slice(),
             [Modifier::ReturnRun, Modifier::ReturnRun]
         ));
-        assert!(matches!(instruction.command, CompiledCommand::Function(_)));
+        assert!(matches!(
+            instruction.command,
+            CompiledCommand::Function {
+                arguments: None,
+                ..
+            }
+        ));
 
         assert!(matches!(
             compiler
@@ -2640,7 +2715,10 @@ mod tests {
 
         assert!(matches!(
             compiler.compile("function #example:tag").unwrap().command,
-            CompiledCommand::Function(ref reference) if reference.to_string() == "#example:tag"
+            CompiledCommand::Function {
+                ref reference,
+                arguments: None
+            } if reference.to_string() == "#example:tag"
         ));
         assert!(compiler.compile("scoreboard objectives list").is_err());
         assert!(
@@ -2873,13 +2951,16 @@ mod tests {
     #[test]
     fn continuation_precedes_comment_handling_and_requires_a_following_line() {
         let compiler = CommandCompiler::new();
-        let instructions = parse_function(
+        let function = parse_function(
             "# consumes the next line\\\nreturn 1\nreturn 2\n",
             &compiler,
         )
         .unwrap();
+        let Function::Plain(instructions) = function else {
+            panic!("a function without macro lines is plain")
+        };
         assert!(matches!(
-            instructions.as_slice(),
+            instructions.as_ref(),
             [Instruction {
                 modifiers,
                 command: CompiledCommand::Return {

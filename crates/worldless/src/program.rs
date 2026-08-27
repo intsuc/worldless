@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::nbt::{CompoundTag, NbtPath, Tag};
+use crate::macro_function::Function;
+use crate::nbt::{CompoundTag, JavaString, NbtPath, Tag};
 use crate::resource::{FunctionReference, Identifier};
 
 #[derive(Debug)]
@@ -43,11 +44,6 @@ pub(crate) enum ResolvedFunctions<'a> {
     Tag(&'a [Identifier]),
 }
 
-#[derive(Debug)]
-pub(crate) struct Function {
-    pub(crate) instructions: Vec<Instruction>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Instruction {
     pub(crate) modifiers: Vec<Modifier>,
@@ -58,7 +54,7 @@ pub(crate) struct Instruction {
 pub(crate) enum Modifier {
     StoreScore {
         kind: StoreKind,
-        holder: String,
+        holder: JavaString,
         objective: String,
     },
     StoreStorage {
@@ -85,12 +81,27 @@ pub(crate) enum StoreKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Command {
-    Function(FunctionReference),
-    Return { success: bool, value: i32 },
+    Function {
+        reference: FunctionReference,
+        arguments: Option<FunctionArguments>,
+    },
+    Return {
+        success: bool,
+        value: i32,
+    },
     Scoreboard(ScoreboardCommand),
     Condition(ScoreCondition),
     StorageCondition(StorageCondition),
     Data(DataCommand),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FunctionArguments {
+    Compound(CompoundTag),
+    Storage {
+        storage: Identifier,
+        path: Option<NbtPath>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,7 +176,7 @@ pub(crate) struct DataStringSubstring {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScoreReference {
-    pub(crate) holder: String,
+    pub(crate) holder: JavaString,
     pub(crate) objective: String,
 }
 
@@ -222,21 +233,21 @@ pub(crate) enum ScoreboardCommand {
         objective: String,
     },
     SetScore {
-        holder: String,
+        holder: JavaString,
         objective: String,
         value: i32,
     },
     GetScore {
-        holder: String,
+        holder: JavaString,
         objective: String,
     },
     AddScore {
-        holder: String,
+        holder: JavaString,
         objective: String,
         value: i32,
     },
     RemoveScore {
-        holder: String,
+        holder: JavaString,
         objective: String,
         value: i32,
     },
@@ -249,7 +260,7 @@ pub(crate) enum ScoreboardCommand {
 
 #[derive(Debug, Default)]
 pub(crate) struct Scoreboard {
-    objectives: HashMap<String, HashMap<String, i32>>,
+    objectives: HashMap<String, HashMap<JavaString, i32>>,
 }
 
 impl Scoreboard {
@@ -269,22 +280,27 @@ impl Scoreboard {
         )
     }
 
-    pub(crate) fn set_score(&mut self, holder: &str, objective: &str, value: i32) -> bool {
+    pub(crate) fn set_score(&mut self, holder: &JavaString, objective: &str, value: i32) -> bool {
         let Some(scores) = self.objectives.get_mut(objective) else {
             return false;
         };
-        scores.insert(holder.to_owned(), value);
+        scores.insert(holder.clone(), value);
         true
     }
 
-    pub(crate) fn score(&self, holder: &str, objective: &str) -> Option<i32> {
+    pub(crate) fn score(&self, holder: &JavaString, objective: &str) -> Option<i32> {
         self.objectives
             .get(objective)
             .and_then(|scores| scores.get(holder))
             .copied()
     }
 
-    pub(crate) fn add_score(&mut self, holder: &str, objective: &str, value: i32) -> Option<i32> {
+    pub(crate) fn add_score(
+        &mut self,
+        holder: &JavaString,
+        objective: &str,
+        value: i32,
+    ) -> Option<i32> {
         let score = self
             .objectives
             .get_mut(objective)?
@@ -296,7 +312,7 @@ impl Scoreboard {
 
     pub(crate) fn remove_score(
         &mut self,
-        holder: &str,
+        holder: &JavaString,
         objective: &str,
         value: i32,
     ) -> Option<i32> {

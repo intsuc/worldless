@@ -320,11 +320,11 @@ fn reports_in_memory_compilation_errors() {
         }
     );
     assert_eq!(
-        Vm::from_functions([("example:macro", "\n$return $(value)\n")]).unwrap_err(),
+        Vm::from_functions([("example:macro", "\n$return 1\n")]).unwrap_err(),
         CompileError::InvalidFunction {
             id: "example:macro".to_owned(),
             line: 2,
-            reason: "function macros are not supported".to_owned()
+            reason: "macro line contains no variables".to_owned()
         }
     );
 }
@@ -332,13 +332,13 @@ fn reports_in_memory_compilation_errors() {
 #[test]
 fn directory_loader_reports_invalid_function_paths() {
     let pack = TestPack::new();
-    pack.write_function("example:macro", "$return $(value)\n");
+    pack.write_function("example:macro", "$return 1\n");
     let expected_path = pack.root().join("data/example/function/macro.mcfunction");
     match Vm::load_directory(pack.root()).unwrap_err() {
         LoadError::InvalidFunction { path, line, reason } => {
             assert_eq!(path, expected_path);
             assert_eq!(line, 1);
-            assert_eq!(reason, "function macros are not supported");
+            assert_eq!(reason, "macro line contains no variables");
         }
         error => panic!("expected an invalid function error, got {error}"),
     }

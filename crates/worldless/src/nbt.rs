@@ -3,13 +3,16 @@ use std::{
     fmt,
 };
 
-use worldless_brigadier::StringReader;
+use worldless_brigadier::{
+    StringReader,
+    exceptions::{java_f32, java_f64},
+};
 
 use crate::resource::Identifier;
 
 const MAX_DEPTH: usize = 512;
 
-#[derive(Clone, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct JavaString(Vec<u16>);
 
 impl JavaString {
@@ -71,6 +74,12 @@ impl JavaString {
 impl From<&str> for JavaString {
     fn from(value: &str) -> Self {
         Self(value.encode_utf16().collect())
+    }
+}
+
+impl PartialEq<str> for JavaString {
+    fn eq(&self, other: &str) -> bool {
+        self.units().iter().copied().eq(other.encode_utf16())
     }
 }
 
@@ -275,6 +284,35 @@ impl Tag {
         false
     }
 
+    pub(crate) fn macro_stringify(&self) -> JavaString {
+        match self {
+            Self::Byte(value) => JavaString::from(value.to_string().as_str()),
+            Self::Short(value) => JavaString::from(value.to_string().as_str()),
+            Self::Long(value) => JavaString::from(value.to_string().as_str()),
+            Self::Float(bits) => {
+                JavaString::from(format_macro_decimal(f64::from(f32::from_bits(*bits))).as_str())
+            }
+            Self::Double(bits) => {
+                JavaString::from(format_macro_decimal(f64::from_bits(*bits)).as_str())
+            }
+            Self::String(value) => value.clone(),
+            _ => compact_stringify(self),
+        }
+    }
+
+    pub(crate) fn primitive_text(&self) -> Option<JavaString> {
+        match self {
+            Self::Byte(_)
+            | Self::Short(_)
+            | Self::Int(_)
+            | Self::Long(_)
+            | Self::Float(_)
+            | Self::Double(_) => Some(compact_stringify(self)),
+            Self::String(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     fn collection_element(&self, index: usize) -> Option<Tag> {
         match self {
             Self::ByteArray(values) => values.get(index).copied().map(Self::Byte),
@@ -405,6 +443,188 @@ impl PartialEq for Tag {
 }
 
 impl Eq for Tag {}
+
+fn compact_stringify(tag: &Tag) -> JavaString {
+    let mut output = Vec::new();
+    write_compact_tag(tag, &mut output);
+    JavaString::from_units(output)
+}
+
+fn write_compact_tag(tag: &Tag, output: &mut Vec<u16>) {
+    match tag {
+        Tag::Byte(value) => {
+            push_ascii(output, &value.to_string());
+            output.push(u16::from(b'b'));
+        }
+        Tag::Short(value) => {
+            push_ascii(output, &value.to_string());
+            output.push(u16::from(b's'));
+        }
+        Tag::Int(value) => push_ascii(output, &value.to_string()),
+        Tag::Long(value) => {
+            push_ascii(output, &value.to_string());
+            output.push(u16::from(b'L'));
+        }
+        Tag::Float(bits) => {
+            push_ascii(output, &java_f32(f32::from_bits(*bits)));
+            output.push(u16::from(b'f'));
+        }
+        Tag::Double(bits) => {
+            push_ascii(output, &java_f64(f64::from_bits(*bits)));
+            output.push(u16::from(b'd'));
+        }
+        Tag::ByteArray(values) => {
+            push_ascii(output, "[B;");
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(u16::from(b','));
+                }
+                push_ascii(output, &value.to_string());
+                output.push(u16::from(b'B'));
+            }
+            output.push(u16::from(b']'));
+        }
+        Tag::String(value) => write_quoted(value, output),
+        Tag::List(values) => {
+            output.push(u16::from(b'['));
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(u16::from(b','));
+                }
+                write_compact_tag(value, output);
+            }
+            output.push(u16::from(b']'));
+        }
+        Tag::Compound(compound) => {
+            output.push(u16::from(b'{'));
+            for (index, (name, value)) in compound.0.iter().enumerate() {
+                if index != 0 {
+                    output.push(u16::from(b','));
+                }
+                if is_unquoted_compound_key(name) {
+                    output.extend_from_slice(name.units());
+                } else {
+                    write_quoted(name, output);
+                }
+                output.push(u16::from(b':'));
+                write_compact_tag(value, output);
+            }
+            output.push(u16::from(b'}'));
+        }
+        Tag::IntArray(values) => {
+            push_ascii(output, "[I;");
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(u16::from(b','));
+                }
+                push_ascii(output, &value.to_string());
+            }
+            output.push(u16::from(b']'));
+        }
+        Tag::LongArray(values) => {
+            push_ascii(output, "[L;");
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(u16::from(b','));
+                }
+                push_ascii(output, &value.to_string());
+                output.push(u16::from(b'L'));
+            }
+            output.push(u16::from(b']'));
+        }
+    }
+}
+
+fn push_ascii(output: &mut Vec<u16>, value: &str) {
+    output.extend(value.bytes().map(u16::from));
+}
+
+fn is_unquoted_compound_key(value: &JavaString) -> bool {
+    if value.eq_ascii_ignore_case(b"true") || value.eq_ascii_ignore_case(b"false") {
+        return false;
+    }
+    let Some((&first, remaining)) = value.units().split_first() else {
+        return false;
+    };
+    (is_ascii_letter(first) || first == u16::from(b'.') || first == u16::from(b'_'))
+        && remaining.iter().copied().all(|unit| {
+            is_ascii_letter(unit)
+                || matches!(unit, 0x30..=0x39)
+                || matches!(unit, 0x2b | 0x2d | 0x2e | 0x5f)
+        })
+}
+
+fn is_ascii_letter(unit: u16) -> bool {
+    matches!(unit, 0x41..=0x5a | 0x61..=0x7a)
+}
+
+fn write_quoted(value: &JavaString, output: &mut Vec<u16>) {
+    let quote = value
+        .units()
+        .iter()
+        .copied()
+        .find_map(|unit| match unit {
+            0x22 => Some(0x27),
+            0x27 => Some(0x22),
+            _ => None,
+        })
+        .unwrap_or(0x22);
+    output.push(quote);
+    for &unit in value.units() {
+        match unit {
+            0x5c => push_ascii(output, "\\\\"),
+            0x08 => push_ascii(output, "\\b"),
+            0x09 => push_ascii(output, "\\t"),
+            0x0a => push_ascii(output, "\\n"),
+            0x0c => push_ascii(output, "\\f"),
+            0x0d => push_ascii(output, "\\r"),
+            0x00..=0x1f => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                push_ascii(output, "\\x");
+                output.push(u16::from(HEX[usize::from(unit >> 4)]));
+                output.push(u16::from(HEX[usize::from(unit & 0x0f)]));
+            }
+            _ => {
+                if unit == quote {
+                    output.push(u16::from(b'\\'));
+                }
+                output.push(unit);
+            }
+        }
+    }
+    output.push(quote);
+}
+
+fn format_macro_decimal(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_owned();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "-∞".to_owned()
+        } else {
+            "∞".to_owned()
+        };
+    }
+
+    // Apply the public Java SE rounding contract to the exact binary value;
+    // JAVA_COMPATIBILITY.md excludes a particular JDK's private digit converter.
+    let negative = value.is_sign_negative();
+    let mut output = format!("{:.15}", value.abs());
+    while output.ends_with('0') {
+        output.pop();
+    }
+    if output.ends_with('.') {
+        output.pop();
+    }
+    if output.starts_with("0.") {
+        output.remove(0);
+    }
+    if negative {
+        output.insert(0, '-');
+    }
+    output
+}
 
 fn canonical_f32_bits(bits: u32) -> u32 {
     let value = f32::from_bits(bits);
@@ -2018,6 +2238,137 @@ impl CommandStorage {
                 }
                 result
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_java_string(actual: JavaString, expected: &str) {
+        assert_eq!(actual.units(), expected.encode_utf16().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn macro_stringify_uses_unadorned_primitive_values() {
+        assert_java_string(Tag::Byte(-12).macro_stringify(), "-12");
+        assert_java_string(Tag::Short(34).macro_stringify(), "34");
+        assert_java_string(Tag::Int(-56).macro_stringify(), "-56");
+        assert_java_string(Tag::Long(78).macro_stringify(), "78");
+        assert_java_string(Tag::float(0.1).macro_stringify(), ".100000001490116");
+        assert_java_string(Tag::double(0.1).macro_stringify(), ".1");
+
+        let string = JavaString::from_units(vec![0x61, 0xd800, 0x62]);
+        assert_eq!(
+            Tag::String(string.clone()).macro_stringify().units(),
+            string.units()
+        );
+    }
+
+    #[test]
+    fn macro_decimal_format_rounds_the_exact_value_to_fifteen_fraction_digits() {
+        let cases: [(f64, &str); 15] = [
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (10.0, "10"),
+            (1.234_567_890_123_456_7, "1.234567890123457"),
+            (1_000_000_000_000_000.1, "1000000000000000.125"),
+            (999_999_999_999_999.9, "999999999999999.875"),
+            (5.0e-16, ".000000000000001"),
+            (6.0e-16, ".000000000000001"),
+            (1.5e-15, ".000000000000001"),
+            (2.5e-15, ".000000000000002"),
+            (3.5e-15, ".000000000000004"),
+            (0.000_015_258_789_062_5, ".000015258789062"),
+            (0.000_045_776_367_187_5, ".000045776367188"),
+            (f64::from_bits(0x43ac_1109_368c_74bb), "1011203918777703808"),
+            (1.0e20, "100000000000000000000"),
+        ];
+        for (value, expected) in cases {
+            assert_java_string(Tag::Double(value.to_bits()).macro_stringify(), expected);
+        }
+        assert_java_string(
+            Tag::Float(f32::MAX.to_bits()).macro_stringify(),
+            "340282346638528859811704183484516925440",
+        );
+        assert_java_string(Tag::Double(f64::INFINITY.to_bits()).macro_stringify(), "∞");
+        assert_java_string(
+            Tag::Double(f64::NEG_INFINITY.to_bits()).macro_stringify(),
+            "-∞",
+        );
+        assert_java_string(Tag::Double(f64::NAN.to_bits()).macro_stringify(), "NaN");
+    }
+
+    #[test]
+    fn primitive_text_reuses_compact_numeric_rendering_and_raw_strings() {
+        let cases = [
+            (Tag::Byte(-1), "-1b"),
+            (Tag::Short(2), "2s"),
+            (Tag::Int(-3), "-3"),
+            (Tag::Long(4), "4L"),
+            (Tag::float(1.0), "1.0f"),
+            (Tag::double(2.0), "2.0d"),
+        ];
+        for (value, expected) in cases {
+            assert_java_string(value.primitive_text().expect("primitive"), expected);
+        }
+
+        let string = JavaString::from_units(vec![0x61, 0xd800, 0x62]);
+        assert_eq!(
+            Tag::String(string.clone())
+                .primitive_text()
+                .expect("string")
+                .units(),
+            string.units()
+        );
+        assert_eq!(Tag::List(Vec::new()).primitive_text(), None);
+    }
+
+    #[test]
+    fn macro_stringify_falls_back_to_compact_sorted_snbt() {
+        let mut compound = CompoundTag::new();
+        compound.insert(JavaString::from("z"), Tag::LongArray(vec![-1, 2]));
+        compound.insert(
+            JavaString::from("alpha"),
+            Tag::List(vec![
+                Tag::Byte(1),
+                Tag::Short(2),
+                Tag::Int(3),
+                Tag::Long(4),
+                Tag::float(1.0),
+                Tag::double(2.0),
+            ]),
+        );
+        compound.insert(JavaString::from("true"), Tag::String(JavaString::from("x")));
+        compound.insert(JavaString::from("bytes"), Tag::ByteArray(vec![-1, 2]));
+        compound.insert(JavaString::from("ints"), Tag::IntArray(vec![-3, 4]));
+
+        assert_java_string(
+            Tag::Compound(compound).macro_stringify(),
+            r#"{alpha:[1b,2s,3,4L,1.0f,2.0d],bytes:[B;-1B,2B],ints:[I;-3,4],"true":"x",z:[L;-1L,2L]}"#,
+        );
+    }
+
+    #[test]
+    fn compact_snbt_quoting_preserves_java_utf16() {
+        let value = JavaString::from_units(vec![0x22, 0x27, 0x5c, 0x08, 0x00, 0xd800]);
+        assert_eq!(
+            compact_stringify(&Tag::String(value)).units(),
+            &[
+                0x27, 0x22, 0x5c, 0x27, 0x5c, 0x5c, 0x5c, 0x62, 0x5c, 0x78, 0x30, 0x30, 0xd800,
+                0x27
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_snbt_key_rules_match_string_tag_visitor() {
+        for key in ["alpha", ".path", "_name", "a+1", "a-1"] {
+            assert!(is_unquoted_compound_key(&JavaString::from(key)), "{key}");
+        }
+        for key in ["", "+name", "-name", "1name", "true", "FALSE", "é"] {
+            assert!(!is_unquoted_compound_key(&JavaString::from(key)), "{key}");
         }
     }
 }
