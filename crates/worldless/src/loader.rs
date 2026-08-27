@@ -34,9 +34,9 @@ use crate::{
     program::{
         Command as CompiledCommand, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation,
         DataSource, DataStringSubstring, FunctionArguments, Instruction, Modifier,
-        PredicateCondition, Program, ScoreComparison, ScoreCondition, ScorePredicate, ScoreRange,
-        ScoreReference, ScoreboardCommand, ScoreboardOperation, StorageCondition,
-        StorageNumberType, StoreKind,
+        PredicateCondition, Program, ScoreComparison, ScoreCondition, ScoreHolderSet,
+        ScorePredicate, ScoreRange, ScoreReference, ScoreboardCommand, ScoreboardOperation,
+        StorageCondition, StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier, is_allowed_in_identifier},
     resource_json,
@@ -1686,21 +1686,43 @@ impl CommandCompiler {
                 ScoreboardCommand::AddObjective { objective },
             ))
         });
+        let list_objectives: Command<LoweringSource> = Rc::new(|context| {
+            context.source().record(CompiledCommand::Scoreboard(
+                ScoreboardCommand::ListObjectives,
+            ))
+        });
+        let remove_objective: Command<LoweringSource> = Rc::new(|context| {
+            let objective = command_string(context, "objective");
+            context.source().record(CompiledCommand::Scoreboard(
+                ScoreboardCommand::RemoveObjective { objective },
+            ))
+        });
+        let list_players: Command<LoweringSource> = Rc::new(|context| {
+            context
+                .source()
+                .record(CompiledCommand::Scoreboard(ScoreboardCommand::ListPlayers))
+        });
+        let list_player_scores: Command<LoweringSource> = Rc::new(|context| {
+            let holder = score_holders(context, "target");
+            context.source().record(CompiledCommand::Scoreboard(
+                ScoreboardCommand::ListPlayerScores { holder },
+            ))
+        });
         let set_score: Command<LoweringSource> = Rc::new(|context| {
-            let holder = score_holder(context, "targets");
+            let holders = score_holders(context, "targets");
             let objective = command_string(context, "objective");
             let value = IntegerArgumentType::get_integer(context, "score")
                 .expect("the set executor is attached below its integer argument");
             context
                 .source()
                 .record(CompiledCommand::Scoreboard(ScoreboardCommand::SetScore {
-                    holder,
+                    holders,
                     objective,
                     value,
                 }))
         });
         let get_score: Command<LoweringSource> = Rc::new(|context| {
-            let holder = score_holder(context, "target");
+            let holder = score_holders(context, "target");
             let objective = command_string(context, "objective");
             context
                 .source()
@@ -1710,46 +1732,71 @@ impl CommandCompiler {
                 }))
         });
         let add_score: Command<LoweringSource> = Rc::new(|context| {
-            let holder = score_holder(context, "targets");
+            let holders = score_holders(context, "targets");
             let objective = command_string(context, "objective");
             let value = IntegerArgumentType::get_integer(context, "score")
                 .expect("the add executor is attached below its integer argument");
             context
                 .source()
                 .record(CompiledCommand::Scoreboard(ScoreboardCommand::AddScore {
-                    holder,
+                    holders,
                     objective,
                     value,
                 }))
         });
         let remove_score: Command<LoweringSource> = Rc::new(|context| {
-            let holder = score_holder(context, "targets");
+            let holders = score_holders(context, "targets");
             let objective = command_string(context, "objective");
             let value = IntegerArgumentType::get_integer(context, "score")
                 .expect("the remove executor is attached below its integer argument");
             context.source().record(CompiledCommand::Scoreboard(
                 ScoreboardCommand::RemoveScore {
-                    holder,
+                    holders,
                     objective,
                     value,
                 },
             ))
         });
+        let reset_scores: Command<LoweringSource> = Rc::new(|context| {
+            let holders = score_holders(context, "targets");
+            context.source().record(CompiledCommand::Scoreboard(
+                ScoreboardCommand::ResetScores {
+                    holders,
+                    objective: None,
+                },
+            ))
+        });
+        let reset_score: Command<LoweringSource> = Rc::new(|context| {
+            let holders = score_holders(context, "targets");
+            let objective = command_string(context, "objective");
+            context.source().record(CompiledCommand::Scoreboard(
+                ScoreboardCommand::ResetScores {
+                    holders,
+                    objective: Some(objective),
+                },
+            ))
+        });
         let operate_score: Command<LoweringSource> = Rc::new(|context| {
-            let target = score_reference(context, "targets", "targetObjective");
+            let targets = score_holders(context, "targets");
+            let target_objective = command_string(context, "targetObjective");
             let operation = scoreboard_operation(context, "operation");
-            let source = score_reference(context, "source", "sourceObjective");
+            let sources = score_holders(context, "source");
+            let source_objective = command_string(context, "sourceObjective");
             context
                 .source()
                 .record(CompiledCommand::Scoreboard(ScoreboardCommand::Operation {
-                    target,
+                    targets,
+                    target_objective,
                     operation,
-                    source,
+                    sources,
+                    source_objective,
                 }))
         });
         let scoreboard = LiteralArgumentBuilder::literal("scoreboard")
             .then(
                 LiteralArgumentBuilder::literal("objectives")
+                    .then(LiteralArgumentBuilder::literal("list").executes(list_objectives))
+                    .expect("the objectives literal can contain the list literal")
                     .then(
                         LiteralArgumentBuilder::literal("add")
                             .then(
@@ -1765,11 +1812,33 @@ impl CommandCompiler {
                             )
                             .expect("the objectives add literal can contain an objective name"),
                     )
-                    .expect("the objectives literal can contain the add literal"),
+                    .expect("the objectives literal can contain the add literal")
+                    .then(
+                        LiteralArgumentBuilder::literal("remove")
+                            .then(
+                                RequiredArgumentBuilder::argument(
+                                    "objective",
+                                    StringArgumentType::word(),
+                                )
+                                .executes(remove_objective),
+                            )
+                            .expect("the objectives remove literal can contain an objective name"),
+                    )
+                    .expect("the objectives literal can contain the remove literal"),
             )
             .expect("the scoreboard literal can contain objectives commands")
             .then(
                 LiteralArgumentBuilder::literal("players")
+                    .then(
+                        LiteralArgumentBuilder::literal("list")
+                            .executes(list_players)
+                            .then(
+                                RequiredArgumentBuilder::argument("target", ScoreHolderArgument)
+                                    .executes(list_player_scores),
+                            )
+                            .expect("the players list literal can contain a score holder"),
+                    )
+                    .expect("the players literal can contain the list literal")
                     .then(
                         LiteralArgumentBuilder::literal("set")
                             .then(
@@ -1813,6 +1882,23 @@ impl CommandCompiler {
                     .expect("the players literal can contain the add literal")
                     .then(score_delta_branch("remove", remove_score))
                     .expect("the players literal can contain the remove literal")
+                    .then(
+                        LiteralArgumentBuilder::literal("reset")
+                            .then(
+                                RequiredArgumentBuilder::argument("targets", ScoreHolderArgument)
+                                    .executes(reset_scores)
+                                    .then(
+                                        RequiredArgumentBuilder::argument(
+                                            "objective",
+                                            StringArgumentType::word(),
+                                        )
+                                        .executes(reset_score),
+                                    )
+                                    .expect("a reset score holder can contain an objective"),
+                            )
+                            .expect("the players reset literal can contain a score holder"),
+                    )
+                    .expect("the players literal can contain the reset literal")
                     .then(
                         LiteralArgumentBuilder::literal("operation")
                             .then(
@@ -2677,12 +2763,12 @@ fn store_branch(
                             .redirect_with_modifier(
                                 execute.clone(),
                                 Rc::new(move |context| {
-                                    let holder = score_holder(context, "targets");
+                                    let holders = score_holders(context, "targets");
                                     let objective = command_string(context, "objective");
                                     Ok(Rc::new(context.source().with_modifier(
                                         Modifier::StoreScore {
                                             kind,
-                                            holder,
+                                            holders,
                                             objective,
                                         },
                                     )))
@@ -2836,11 +2922,11 @@ fn compound_tag(context: &CommandContext<LoweringSource>, name: &str) -> Compoun
         .expect("the command executor is attached below the requested compound tag")
 }
 
-fn score_holder(context: &CommandContext<LoweringSource>, name: &str) -> JavaString {
+fn score_holders(context: &CommandContext<LoweringSource>, name: &str) -> ScoreHolderSet {
     context
-        .argument::<JavaString>(name)
-        .map(|holder| (*holder).clone())
-        .expect("the command executor is attached below the requested score holder argument")
+        .argument::<ScoreHolderSet>(name)
+        .map(|holders| (*holders).clone())
+        .expect("the command executor is attached below the requested score holders argument")
 }
 
 fn score_reference(
@@ -2849,7 +2935,7 @@ fn score_reference(
     objective: &str,
 ) -> ScoreReference {
     ScoreReference {
-        holder: score_holder(context, holder),
+        holder: score_holders(context, holder),
         objective: command_string(context, objective),
     }
 }
@@ -3085,7 +3171,7 @@ fn parse_nbt_argument<T>(
 struct ScoreHolderArgument;
 
 impl ArgumentType<LoweringSource> for ScoreHolderArgument {
-    type Value = JavaString;
+    type Value = ScoreHolderSet;
 
     fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
         let start = reader.cursor();
@@ -3093,19 +3179,21 @@ impl ArgumentType<LoweringSource> for ScoreHolderArgument {
             reader.skip();
         }
         let holder = JavaString::from_units(reader.substring_utf16(start, reader.cursor()));
-        if holder.units().first() == Some(&u16::from(b'#')) {
-            Ok(holder)
+        if holder.units() == [u16::from(b'*')] {
+            Ok(ScoreHolderSet::Wildcard)
+        } else if holder.units().first() == Some(&u16::from(b'#')) {
+            Ok(ScoreHolderSet::Named(holder))
         } else {
             reader.set_cursor(start);
             Err(SimpleCommandExceptionType::new(LiteralMessage::new(
-                "only score holders whose names start with `#` are supported",
+                "only `*` or score holders whose names start with `#` are supported",
             ))
             .create_with_context(reader))
         }
     }
 
     fn examples(&self) -> Vec<String> {
-        vec!["#value".to_owned()]
+        vec!["#value".to_owned(), "*".to_owned()]
     }
 
     fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
@@ -3519,7 +3607,7 @@ mod tests {
                 .unwrap()
                 .command,
             CompiledCommand::Scoreboard(ScoreboardCommand::SetScore {
-                ref holder,
+                holders: ScoreHolderSet::Named(ref holder),
                 ref objective,
                 value: -7
             }) if holder == "#value" && objective == "values"
@@ -3531,7 +3619,7 @@ mod tests {
             Instruction {
                 ref modifiers,
                 command: CompiledCommand::Scoreboard(ScoreboardCommand::GetScore {
-                    ref holder,
+                    holder: ScoreHolderSet::Named(ref holder),
                     ref objective
                 })
             } if matches!(modifiers.as_slice(), [Modifier::ReturnRun])
@@ -3546,7 +3634,13 @@ mod tests {
                 arguments: None
             } if reference.to_string() == "#example:tag"
         ));
-        assert!(compiler.compile("scoreboard objectives list").is_err());
+        assert!(matches!(
+            compiler
+                .compile("scoreboard objectives list")
+                .unwrap()
+                .command,
+            CompiledCommand::Scoreboard(ScoreboardCommand::ListObjectives)
+        ));
         assert!(
             compiler
                 .compile("scoreboard objectives add values trigger")
@@ -3562,7 +3656,16 @@ mod tests {
                 .compile("scoreboard players get @s values")
                 .is_err()
         );
-        assert!(compiler.compile("scoreboard players get * values").is_err());
+        assert!(matches!(
+            compiler
+                .compile("scoreboard players get * values")
+                .unwrap()
+                .command,
+            CompiledCommand::Scoreboard(ScoreboardCommand::GetScore {
+                holder: ScoreHolderSet::Wildcard,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3578,12 +3681,12 @@ mod tests {
             [
                 Modifier::StoreScore {
                     kind: StoreKind::Result,
-                    holder: first,
+                    holders: ScoreHolderSet::Named(first),
                     objective: first_objective
                 },
                 Modifier::StoreScore {
                     kind: StoreKind::Success,
-                    holder: second,
+                    holders: ScoreHolderSet::Named(second),
                     objective: second_objective
                 },
                 Modifier::ReturnRun
@@ -3595,7 +3698,7 @@ mod tests {
         assert!(matches!(
             instruction.command,
             CompiledCommand::Scoreboard(ScoreboardCommand::GetScore {
-                ref holder,
+                holder: ScoreHolderSet::Named(ref holder),
                 ref objective
             }) if holder == "#source" && objective == "values"
         ));

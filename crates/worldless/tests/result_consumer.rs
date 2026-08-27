@@ -306,7 +306,6 @@ fn rejects_commands_outside_the_worldless_scoreboard_slice() {
     for command in [
         "scoreboard players get player values",
         "scoreboard players get @s values",
-        "scoreboard players get * values",
         "scoreboard players get 00000000-0000-0000-0000-000000000000 values",
         "execute store result score player values run return 1",
         "scoreboard objectives add values trigger",

@@ -7,9 +7,9 @@ use crate::{
     number_provider::LegacyRandom,
     program::{
         Command, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation, DataSource,
-        FunctionArguments, Instruction, Modifier, PredicateCondition, Program, ResolvedFunctions,
-        ScoreCondition, Scoreboard, ScoreboardCommand, StorageCondition, StorageNumberType,
-        StoreKind,
+        FunctionArguments, Instruction, Modifier, ObjectiveId, PredicateCondition, Program,
+        ResolvedFunctions, ScoreCondition, ScoreHolderSet, Scoreboard, ScoreboardCommand,
+        StorageCondition, StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier},
 };
@@ -82,8 +82,8 @@ impl CommandResult {
 enum StoreAction {
     Score {
         kind: StoreKind,
-        holder: JavaString,
-        objective: String,
+        holders: Vec<JavaString>,
+        objective: ObjectiveId,
     },
     Storage {
         kind: StoreKind,
@@ -156,15 +156,13 @@ impl ResultConsumer {
             match store {
                 StoreAction::Score {
                     kind,
-                    holder,
+                    holders,
                     objective,
                 } => {
                     let value = stored_command_value(*kind, result);
-                    let stored = scoreboard.set_score(holder, objective, value);
-                    assert!(
-                        stored,
-                        "store objectives are resolved before command execution"
-                    );
+                    for holder in holders {
+                        scoreboard.set_score_by_id(holder, *objective, value);
+                    }
                 }
                 StoreAction::Storage {
                     kind,
@@ -364,14 +362,20 @@ pub(crate) fn execute(
                     match modifier {
                         Modifier::StoreScore {
                             kind,
-                            holder,
+                            holders,
                             objective,
                         } => {
                             quota.increment();
                             if !active {
                                 continue;
                             }
-                            if !scoreboard.contains_objective(objective) {
+                            let Some((holders, objective)) =
+                                scoreboard.resolve_holders(holders).and_then(|holders| {
+                                    scoreboard
+                                        .objective_id(objective)
+                                        .map(|objective| (holders, objective))
+                                })
+                            else {
                                 if forked {
                                     active = false;
                                     continue;
@@ -382,14 +386,14 @@ pub(crate) fn execute(
                                     );
                                 }
                                 break false;
-                            }
+                            };
                             stores
                                 .as_mut()
                                 .expect("the stores have not been queued")
                                 .push(StoreAction::Score {
                                     kind: *kind,
-                                    holder: holder.clone(),
-                                    objective: objective.clone(),
+                                    holders,
+                                    objective,
                                 });
                         }
                         Modifier::StoreStorage {
@@ -1003,43 +1007,68 @@ fn execute_scoreboard_command(
     command: &ScoreboardCommand,
 ) -> CommandResult {
     match command {
+        ScoreboardCommand::ListObjectives => CommandResult::success(scoreboard.list_objectives()),
         ScoreboardCommand::AddObjective { objective } => scoreboard
             .add_objective(objective)
             .map_or(CommandResult::FAILURE, CommandResult::success),
+        ScoreboardCommand::RemoveObjective { objective } => scoreboard
+            .remove_objective(objective)
+            .map_or(CommandResult::FAILURE, CommandResult::success),
+        ScoreboardCommand::ListPlayers => CommandResult::success(scoreboard.list_players()),
+        ScoreboardCommand::ListPlayerScores {
+            holder: ScoreHolderSet::Named(holder),
+        } => CommandResult::success(scoreboard.list_player_scores(holder)),
+        ScoreboardCommand::ListPlayerScores {
+            holder: ScoreHolderSet::Wildcard,
+        } => CommandResult::FAILURE,
         ScoreboardCommand::SetScore {
-            holder,
+            holders,
             objective,
             value,
-        } => {
-            if scoreboard.set_score(holder, objective, *value) {
-                CommandResult::success(*value)
-            } else {
-                CommandResult::FAILURE
-            }
-        }
-        ScoreboardCommand::GetScore { holder, objective } => scoreboard
+        } => scoreboard
+            .set_scores(holders, objective, *value)
+            .map_or(CommandResult::FAILURE, CommandResult::success),
+        ScoreboardCommand::GetScore {
+            holder: ScoreHolderSet::Named(holder),
+            objective,
+        } => scoreboard
             .score(holder, objective)
             .map_or(CommandResult::FAILURE, CommandResult::success),
+        ScoreboardCommand::GetScore {
+            holder: ScoreHolderSet::Wildcard,
+            ..
+        } => CommandResult::FAILURE,
         ScoreboardCommand::AddScore {
-            holder,
+            holders,
             objective,
             value,
         } => scoreboard
-            .add_score(holder, objective, *value)
+            .add_scores(holders, objective, *value)
             .map_or(CommandResult::FAILURE, CommandResult::success),
         ScoreboardCommand::RemoveScore {
-            holder,
+            holders,
             objective,
             value,
         } => scoreboard
-            .remove_score(holder, objective, *value)
+            .remove_scores(holders, objective, *value)
+            .map_or(CommandResult::FAILURE, CommandResult::success),
+        ScoreboardCommand::ResetScores { holders, objective } => scoreboard
+            .reset_scores(holders, objective.as_deref())
             .map_or(CommandResult::FAILURE, CommandResult::success),
         ScoreboardCommand::Operation {
-            target,
+            targets,
+            target_objective,
             operation,
-            source,
+            sources,
+            source_objective,
         } => scoreboard
-            .apply_operation(target, *operation, source)
+            .apply_operation(
+                targets,
+                target_objective,
+                *operation,
+                sources,
+                source_objective,
+            )
             .map_or(CommandResult::FAILURE, CommandResult::success),
     }
 }

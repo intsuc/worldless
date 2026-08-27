@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, btree_map::Entry},
+    sync::Arc,
+};
 
 use crate::macro_function::Function;
 use crate::nbt::{CompoundTag, JavaString, NbtPath, Tag};
@@ -63,7 +66,7 @@ pub(crate) struct Instruction {
 pub(crate) enum Modifier {
     StoreScore {
         kind: StoreKind,
-        holder: JavaString,
+        holders: ScoreHolderSet,
         objective: String,
     },
     StoreStorage {
@@ -209,8 +212,14 @@ pub(crate) struct DataStringSubstring {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ScoreHolderSet {
+    Named(JavaString),
+    Wildcard,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScoreReference {
-    pub(crate) holder: JavaString,
+    pub(crate) holder: ScoreHolderSet,
     pub(crate) objective: String,
 }
 
@@ -263,38 +272,57 @@ pub(crate) enum ScoreboardOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ScoreboardCommand {
+    ListObjectives,
     AddObjective {
         objective: String,
     },
+    RemoveObjective {
+        objective: String,
+    },
+    ListPlayers,
+    ListPlayerScores {
+        holder: ScoreHolderSet,
+    },
     SetScore {
-        holder: JavaString,
+        holders: ScoreHolderSet,
         objective: String,
         value: i32,
     },
     GetScore {
-        holder: JavaString,
+        holder: ScoreHolderSet,
         objective: String,
     },
     AddScore {
-        holder: JavaString,
+        holders: ScoreHolderSet,
         objective: String,
         value: i32,
     },
     RemoveScore {
-        holder: JavaString,
+        holders: ScoreHolderSet,
         objective: String,
         value: i32,
     },
+    ResetScores {
+        holders: ScoreHolderSet,
+        objective: Option<String>,
+    },
     Operation {
-        target: ScoreReference,
+        targets: ScoreHolderSet,
+        target_objective: String,
         operation: ScoreboardOperation,
-        source: ScoreReference,
+        sources: ScoreHolderSet,
+        source_objective: String,
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ObjectiveId(u64);
+
 #[derive(Debug, Default)]
 pub(crate) struct Scoreboard {
-    objectives: HashMap<String, HashMap<JavaString, i32>>,
+    objectives: HashMap<String, ObjectiveId>,
+    holders: BTreeMap<JavaString, HashMap<ObjectiveId, i32>>,
+    next_objective_id: u64,
 }
 
 impl Scoreboard {
@@ -302,99 +330,166 @@ impl Scoreboard {
         self.objectives.contains_key(objective)
     }
 
+    pub(crate) fn objective_id(&self, objective: &str) -> Option<ObjectiveId> {
+        self.objectives.get(objective).copied()
+    }
+
     pub(crate) fn add_objective(&mut self, objective: &str) -> Option<i32> {
         if self.objectives.contains_key(objective) {
             return None;
         }
 
-        self.objectives.insert(objective.to_owned(), HashMap::new());
-        Some(
-            i32::try_from(self.objectives.len())
-                .expect("a scoreboard cannot contain more than i32::MAX objectives"),
+        let next_objective_id = self
+            .next_objective_id
+            .checked_add(1)
+            .expect("a scoreboard cannot create more than u64::MAX objectives");
+        let id = ObjectiveId(self.next_objective_id);
+        self.next_objective_id = next_objective_id;
+        self.objectives.insert(objective.to_owned(), id);
+        Some(self.list_objectives())
+    }
+
+    pub(crate) fn list_objectives(&self) -> i32 {
+        scoreboard_count(self.objectives.len(), "objectives")
+    }
+
+    pub(crate) fn remove_objective(&mut self, objective: &str) -> Option<i32> {
+        let id = self.objectives.remove(objective)?;
+        for scores in self.holders.values_mut() {
+            scores.remove(&id);
+        }
+        Some(self.list_objectives())
+    }
+
+    pub(crate) fn list_players(&self) -> i32 {
+        scoreboard_count(self.holders.len(), "score holders")
+    }
+
+    pub(crate) fn list_player_scores(&self, holder: &JavaString) -> i32 {
+        scoreboard_count(
+            self.holders.get(holder).map_or(0, HashMap::len),
+            "scores for one holder",
         )
     }
 
-    pub(crate) fn set_score(&mut self, holder: &JavaString, objective: &str, value: i32) -> bool {
-        let Some(scores) = self.objectives.get_mut(objective) else {
-            return false;
-        };
-        scores.insert(holder.clone(), value);
-        true
+    pub(crate) fn resolve_holders(&self, holders: &ScoreHolderSet) -> Option<Vec<JavaString>> {
+        match holders {
+            ScoreHolderSet::Named(holder) => Some(vec![holder.clone()]),
+            ScoreHolderSet::Wildcard if self.holders.is_empty() => None,
+            ScoreHolderSet::Wildcard => Some(self.holders.keys().cloned().collect()),
+        }
+    }
+
+    pub(crate) fn set_score_by_id(
+        &mut self,
+        holder: &JavaString,
+        objective: ObjectiveId,
+        value: i32,
+    ) {
+        self.holders
+            .entry(holder.clone())
+            .or_default()
+            .insert(objective, value);
     }
 
     pub(crate) fn score(&self, holder: &JavaString, objective: &str) -> Option<i32> {
-        self.objectives
-            .get(objective)
-            .and_then(|scores| scores.get(holder))
-            .copied()
+        self.objective_id(objective)
+            .and_then(|objective| self.score_by_id(holder, objective))
     }
 
-    pub(crate) fn add_score(
+    pub(crate) fn set_scores(
         &mut self,
-        holder: &JavaString,
+        holders: &ScoreHolderSet,
         objective: &str,
         value: i32,
     ) -> Option<i32> {
-        let score = self
-            .objectives
-            .get_mut(objective)?
-            .entry(holder.to_owned())
-            .or_default();
-        *score = score.wrapping_add(value);
-        Some(*score)
+        let holders = self.resolve_holders(holders)?;
+        let objective = self.objective_id(objective)?;
+        let mut total = 0i32;
+        for holder in holders {
+            self.set_score_by_id(&holder, objective, value);
+            total = total.wrapping_add(value);
+        }
+        Some(total)
     }
 
-    pub(crate) fn remove_score(
+    pub(crate) fn add_scores(
         &mut self,
-        holder: &JavaString,
+        holders: &ScoreHolderSet,
         objective: &str,
         value: i32,
     ) -> Option<i32> {
-        let score = self
-            .objectives
-            .get_mut(objective)?
-            .entry(holder.to_owned())
-            .or_default();
-        *score = score.wrapping_sub(value);
-        Some(*score)
+        self.change_scores(holders, objective, value, i32::wrapping_add)
+    }
+
+    pub(crate) fn remove_scores(
+        &mut self,
+        holders: &ScoreHolderSet,
+        objective: &str,
+        value: i32,
+    ) -> Option<i32> {
+        self.change_scores(holders, objective, value, i32::wrapping_sub)
+    }
+
+    pub(crate) fn reset_scores(
+        &mut self,
+        holders: &ScoreHolderSet,
+        objective: Option<&str>,
+    ) -> Option<i32> {
+        let holders = self.resolve_holders(holders)?;
+        let objective = match objective {
+            Some(objective) => Some(self.objective_id(objective)?),
+            None => None,
+        };
+        let count = scoreboard_count(holders.len(), "selected score holders");
+
+        if let Some(objective) = objective {
+            for holder in holders {
+                if let Entry::Occupied(mut entry) = self.holders.entry(holder) {
+                    entry.get_mut().remove(&objective);
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
+                }
+            }
+        } else {
+            for holder in holders {
+                self.holders.remove(&holder);
+            }
+        }
+        Some(count)
     }
 
     pub(crate) fn apply_operation(
         &mut self,
-        target: &ScoreReference,
+        targets: &ScoreHolderSet,
+        target_objective: &str,
         operation: ScoreboardOperation,
-        source: &ScoreReference,
+        sources: &ScoreHolderSet,
+        source_objective: &str,
     ) -> Option<i32> {
-        if !self.contains_objective(&target.objective)
-            || !self.contains_objective(&source.objective)
-        {
-            return None;
+        let targets = self.resolve_holders(targets)?;
+        let target_objective = self.objective_id(target_objective)?;
+        let sources = self.resolve_holders(sources)?;
+        let source_objective = self.objective_id(source_objective)?;
+        let mut total = 0i32;
+
+        for target in targets {
+            for source in &sources {
+                self.apply_single_operation(
+                    &target,
+                    target_objective,
+                    operation,
+                    source,
+                    source_objective,
+                )?;
+            }
+            let value = self
+                .score_by_id(&target, target_objective)
+                .expect("an operation creates its target score");
+            total = total.wrapping_add(value);
         }
-
-        let left = self.score(&target.holder, &target.objective).unwrap_or(0);
-        let right = self.score(&source.holder, &source.objective).unwrap_or(0);
-        self.create_score(target);
-        self.create_score(source);
-
-        if matches!(operation, ScoreboardOperation::Swap) {
-            self.set_existing_score(target, right);
-            self.set_existing_score(source, left);
-            return Some(right);
-        }
-
-        let result = match operation {
-            ScoreboardOperation::Assign => right,
-            ScoreboardOperation::Add => left.wrapping_add(right),
-            ScoreboardOperation::Subtract => left.wrapping_sub(right),
-            ScoreboardOperation::Multiply => left.wrapping_mul(right),
-            ScoreboardOperation::Divide => floor_div_mod(left, right)?.0,
-            ScoreboardOperation::Modulo => floor_div_mod(left, right)?.1,
-            ScoreboardOperation::Min => left.min(right),
-            ScoreboardOperation::Max => left.max(right),
-            ScoreboardOperation::Swap => unreachable!("swap is handled before simple operations"),
-        };
-        self.set_existing_score(target, result);
-        Some(result)
+        Some(total)
     }
 
     pub(crate) fn evaluate_condition(&self, condition: &ScoreCondition) -> Option<bool> {
@@ -409,14 +504,19 @@ impl Scoreboard {
                 comparison,
                 right,
             } => {
+                let (ScoreHolderSet::Named(left_holder), ScoreHolderSet::Named(right_holder)) =
+                    (&left.holder, &right.holder)
+                else {
+                    return None;
+                };
                 if !self.contains_objective(&left.objective)
                     || !self.contains_objective(&right.objective)
                 {
                     return None;
                 }
                 let (Some(left), Some(right)) = (
-                    self.score(&left.holder, &left.objective),
-                    self.score(&right.holder, &right.objective),
+                    self.score(left_holder, &left.objective),
+                    self.score(right_holder, &right.objective),
                 ) else {
                     return Some(false);
                 };
@@ -429,10 +529,13 @@ impl Scoreboard {
                 })
             }
             ScorePredicate::Matches { score, range } => {
+                let ScoreHolderSet::Named(holder) = &score.holder else {
+                    return None;
+                };
                 if !self.contains_objective(&score.objective) {
                     return None;
                 }
-                let Some(value) = self.score(&score.holder, &score.objective) else {
+                let Some(value) = self.score(holder, &score.objective) else {
                     return Some(false);
                 };
                 Some(
@@ -443,22 +546,69 @@ impl Scoreboard {
         }
     }
 
-    fn create_score(&mut self, score: &ScoreReference) {
-        self.objectives
-            .get_mut(&score.objective)
-            .expect("score objectives are resolved before score creation")
-            .entry(score.holder.clone())
-            .or_default();
+    fn score_by_id(&self, holder: &JavaString, objective: ObjectiveId) -> Option<i32> {
+        self.holders
+            .get(holder)
+            .and_then(|scores| scores.get(&objective))
+            .copied()
     }
 
-    fn set_existing_score(&mut self, score: &ScoreReference, value: i32) {
-        *self
-            .objectives
-            .get_mut(&score.objective)
-            .expect("score objectives are resolved before operation")
-            .get_mut(&score.holder)
-            .expect("operation scores are created before mutation") = value;
+    fn change_scores(
+        &mut self,
+        holders: &ScoreHolderSet,
+        objective: &str,
+        value: i32,
+        operation: fn(i32, i32) -> i32,
+    ) -> Option<i32> {
+        let holders = self.resolve_holders(holders)?;
+        let objective = self.objective_id(objective)?;
+        let mut total = 0i32;
+        for holder in holders {
+            let result = operation(self.score_by_id(&holder, objective).unwrap_or(0), value);
+            self.set_score_by_id(&holder, objective, result);
+            total = total.wrapping_add(result);
+        }
+        Some(total)
     }
+
+    fn apply_single_operation(
+        &mut self,
+        target: &JavaString,
+        target_objective: ObjectiveId,
+        operation: ScoreboardOperation,
+        source: &JavaString,
+        source_objective: ObjectiveId,
+    ) -> Option<i32> {
+        let left = self.score_by_id(target, target_objective).unwrap_or(0);
+        let right = self.score_by_id(source, source_objective).unwrap_or(0);
+        self.set_score_by_id(target, target_objective, left);
+        self.set_score_by_id(source, source_objective, right);
+
+        if matches!(operation, ScoreboardOperation::Swap) {
+            self.set_score_by_id(target, target_objective, right);
+            self.set_score_by_id(source, source_objective, left);
+            return Some(right);
+        }
+
+        let result = match operation {
+            ScoreboardOperation::Assign => right,
+            ScoreboardOperation::Add => left.wrapping_add(right),
+            ScoreboardOperation::Subtract => left.wrapping_sub(right),
+            ScoreboardOperation::Multiply => left.wrapping_mul(right),
+            ScoreboardOperation::Divide => floor_div_mod(left, right)?.0,
+            ScoreboardOperation::Modulo => floor_div_mod(left, right)?.1,
+            ScoreboardOperation::Min => left.min(right),
+            ScoreboardOperation::Max => left.max(right),
+            ScoreboardOperation::Swap => unreachable!("swap is handled before simple operations"),
+        };
+        self.set_score_by_id(target, target_objective, result);
+        Some(result)
+    }
+}
+
+fn scoreboard_count(count: usize, subject: &str) -> i32 {
+    i32::try_from(count)
+        .unwrap_or_else(|_| panic!("a scoreboard cannot contain more than i32::MAX {subject}"))
 }
 
 fn floor_div_mod(left: i32, right: i32) -> Option<(i32, i32)> {

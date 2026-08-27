@@ -2,7 +2,7 @@
 //! data packs.
 //!
 //! The current slice supports function calls and returns, persistent named
-//! scoreboard arithmetic, command storage and NBT data operations, number
+//! scoreboard state and arithmetic, command storage and NBT data operations, number
 //! providers, worldless loot predicates and `compute`, function macros and
 //! tags, supported `execute` conditions, and result propagation. Supported
 //! resources can be compiled from an expanded directory data pack or in-memory
