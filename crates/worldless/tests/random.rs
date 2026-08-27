@@ -17,7 +17,7 @@ fn returned(value: i32) -> ExecutionOutcome {
 fn load(
     functions: &[(&str, &str)],
     providers: &[(&str, &str)],
-    world_seed: Option<i64>,
+    world_seed: i64,
 ) -> Result<Vm, LoadError> {
     let functions = functions
         .iter()
@@ -43,7 +43,7 @@ fn unnamed_values_share_the_vm_random_stream_and_ignore_the_world_seed() {
     ];
     let providers = [("example:uniform", r#"{"type":"uniform","min":0,"max":10}"#)];
 
-    for world_seed in [None, Some(-8_765_432_101)] {
+    for world_seed in [0, -8_765_432_101] {
         let mut vm = load(&functions, &providers, world_seed).unwrap();
         assert_eq!(execute(&mut vm, "example:random").unwrap(), returned(0));
         assert_eq!(execute(&mut vm, "example:compute").unwrap(), returned(6));
@@ -63,7 +63,7 @@ fn named_values_match_minecraft_and_persist_until_reset() {
             ("example:clear", "return run random reset *\n"),
         ],
         &[],
-        Some(0),
+        0,
     )
     .unwrap();
 
@@ -93,7 +93,7 @@ fn explicit_seed_settings_match_negative_salt_and_identifier_vector() {
             ),
         ],
         &[],
-        Some(1_234_567_890_123_456_789),
+        1_234_567_890_123_456_789,
     )
     .unwrap();
 
@@ -104,73 +104,6 @@ fn explicit_seed_settings_match_negative_salt_and_identifier_vector() {
             returned(expected)
         );
     }
-}
-
-#[test]
-fn missing_world_seed_is_explicit_and_failed_resets_are_atomic() {
-    let mut vm = load(
-        &[
-            (
-                "example:default_value",
-                "return run random value 0..100 minecraft:test\n",
-            ),
-            (
-                "example:explicit_reset",
-                "return run random reset minecraft:test -1 false true\n",
-            ),
-            (
-                "example:default_reset",
-                "return run random reset minecraft:test\n",
-            ),
-            (
-                "example:set_seed_required_default",
-                "return run random reset * 7 true false\n",
-            ),
-            ("example:clear", "return run random reset *\n"),
-        ],
-        &[],
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(
-        execute(&mut vm, "example:default_value"),
-        Err(ExecutionError::MissingWorldSeed {
-            sequence: "minecraft:test".to_owned()
-        })
-    );
-    assert_eq!(execute(&mut vm, "example:clear").unwrap(), returned(0));
-
-    assert_eq!(
-        execute(&mut vm, "example:explicit_reset").unwrap(),
-        returned(1)
-    );
-    assert_eq!(
-        execute(&mut vm, "example:default_value").unwrap(),
-        returned(35)
-    );
-    assert_eq!(
-        execute(&mut vm, "example:default_reset"),
-        Err(ExecutionError::MissingWorldSeed {
-            sequence: "minecraft:test".to_owned()
-        })
-    );
-    assert_eq!(
-        execute(&mut vm, "example:default_value").unwrap(),
-        returned(20)
-    );
-
-    assert_eq!(
-        execute(&mut vm, "example:set_seed_required_default").unwrap(),
-        returned(1)
-    );
-    assert_eq!(
-        execute(&mut vm, "example:default_value"),
-        Err(ExecutionError::MissingWorldSeed {
-            sequence: "minecraft:test".to_owned()
-        })
-    );
-    assert_eq!(execute(&mut vm, "example:clear").unwrap(), returned(0));
 }
 
 #[test]
@@ -193,13 +126,9 @@ fn excluding_the_sequence_id_gives_equal_independent_streams() {
                 "example:value_b",
                 "return run random value 0..100 example:b\n",
             ),
-            (
-                "example:default_value",
-                "return run random value 0..100 example:default\n",
-            ),
         ],
         &[],
-        None,
+        0,
     )
     .unwrap();
 
@@ -210,10 +139,6 @@ fn excluding_the_sequence_id_gives_equal_independent_streams() {
         let b = execute(&mut vm, "example:value_b").unwrap();
         assert_eq!(a, b);
     }
-    assert!(matches!(
-        execute(&mut vm, "example:default_value"),
-        Err(ExecutionError::MissingWorldSeed { .. })
-    ));
 }
 
 #[test]
@@ -242,7 +167,7 @@ fn invalid_runtime_ranges_do_not_report_or_consume_a_result() {
             ),
         ],
         &[],
-        Some(0),
+        0,
     )
     .unwrap();
 
@@ -270,7 +195,7 @@ fn invalid_runtime_ranges_do_not_report_or_consume_a_result() {
             "random value 5 example:counted\nreturn run random reset *\n",
         )],
         &[],
-        Some(0),
+        0,
     )
     .unwrap();
     assert_eq!(
@@ -298,7 +223,7 @@ fn zero_results_are_successful_and_reset_all_reports_zero() {
             ("example:clear", "return run random reset *\n"),
         ],
         &[],
-        None,
+        0,
     )
     .unwrap();
 
@@ -323,7 +248,7 @@ fn roll_and_malformed_random_commands_are_rejected_during_loading() {
         "random reset * 0 neither",
     ] {
         assert!(matches!(
-            load(&[("example:invalid", command)], &[], None),
+            load(&[("example:invalid", command)], &[], 0),
             Err(LoadError::InvalidFunction { .. })
         ));
     }

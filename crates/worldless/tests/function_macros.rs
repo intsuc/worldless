@@ -23,7 +23,7 @@ where
         [Pack::memory(functions.into_iter().map(|(id, source)| {
             MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
         }))],
-        None,
+        0,
     )
 }
 
@@ -42,7 +42,7 @@ where
     let tags = tags.into_iter().map(|(id, source)| {
         MemoryResource::new(ResourceKind::FunctionTag, id.as_ref(), source.as_ref())
     });
-    Vm::from_packs([Pack::memory(functions.chain(tags))], None)
+    Vm::from_packs([Pack::memory(functions.chain(tags))], 0)
 }
 
 fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {

@@ -21,7 +21,7 @@ where
         [Pack::memory(functions.into_iter().map(|(id, source)| {
             MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
         }))],
-        None,
+        0,
     )
 }
 

@@ -119,6 +119,8 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
         low.root().as_os_str(),
         "--pack".as_ref(),
         high.root().as_os_str(),
+        "--world-seed".as_ref(),
+        "0".as_ref(),
         "--command-limit".as_ref(),
         "16".as_ref(),
         "--position".as_ref(),
@@ -157,6 +159,8 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
         low.root().as_os_str(),
         "--pack".as_ref(),
         high.root().as_os_str(),
+        "--world-seed".as_ref(),
+        "0".as_ref(),
         "function".as_ref(),
         "example:default_context".as_ref(),
     ]);
@@ -182,7 +186,13 @@ fn run_executes_macro_arguments_function_tags_and_one_raw_command() {
     );
 
     let run = |target: &[&std::ffi::OsStr]| {
-        let mut arguments = vec!["run".as_ref(), "--pack".as_ref(), pack.root().as_os_str()];
+        let mut arguments = vec![
+            "run".as_ref(),
+            "--pack".as_ref(),
+            pack.root().as_os_str(),
+            "--world-seed".as_ref(),
+            "0".as_ref(),
+        ];
         arguments.extend_from_slice(target);
         worldless(&arguments)
     };
@@ -209,7 +219,7 @@ fn run_executes_macro_arguments_function_tags_and_one_raw_command() {
 }
 
 #[test]
-fn run_world_seed_initializes_named_random_sequences() {
+fn check_is_seedless_and_run_requires_a_seed_for_named_random_sequences() {
     let pack = TestPack::new();
     pack.write_function(
         "example:random",
@@ -226,13 +236,14 @@ fn run_world_seed_initializes_named_random_sequences() {
         "function".as_ref(),
         "example:random".as_ref(),
     ]);
-    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert!(
-        text(&output.stderr).contains("requires a configured world seed"),
+        text(&output.stderr).contains("missing required --world-seed"),
         "{}",
         text(&output.stderr)
     );
+    assert!(text(&output.stderr).contains("usage: worldless"));
 
     let output = worldless(&[
         "run".as_ref(),
@@ -266,6 +277,8 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
         "run".as_ref(),
         "--pack".as_ref(),
         missing.as_os_str(),
+        "--world-seed".as_ref(),
+        "0".as_ref(),
         "--command-limit".as_ref(),
         "invalid".as_ref(),
         "function".as_ref(),
@@ -291,6 +304,8 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
         "run".as_ref(),
         "--pack".as_ref(),
         pack.root().as_os_str(),
+        "--world-seed".as_ref(),
+        "0".as_ref(),
         "example:main".as_ref(),
     ]);
     assert_eq!(output.status.code(), Some(2));
@@ -301,6 +316,8 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
         "run".as_ref(),
         "--pack".as_ref(),
         pack.root().as_os_str(),
+        "--world-seed".as_ref(),
+        "0".as_ref(),
         "function".as_ref(),
         "--arguments".as_ref(),
         "not-a-compound".as_ref(),
@@ -319,6 +336,8 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
         "run".as_ref(),
         "--pack".as_ref(),
         pack.root().as_os_str(),
+        "--world-seed".as_ref(),
+        "0".as_ref(),
         "command".as_ref(),
         "--not-a-command".as_ref(),
     ]);
@@ -332,6 +351,8 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
         "run".as_ref(),
         "--pack".as_ref(),
         pack.root().as_os_str(),
+        "--world-seed".as_ref(),
+        "0".as_ref(),
         "--command-limit".as_ref(),
         "0".as_ref(),
         "--position".as_ref(),

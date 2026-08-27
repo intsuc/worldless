@@ -31,7 +31,7 @@ where
     let tags = tags.into_iter().map(|(id, source)| {
         MemoryResource::new(ResourceKind::FunctionTag, id.as_ref(), source.as_ref())
     });
-    Vm::from_packs([Pack::memory(functions.chain(tags))], None)
+    Vm::from_packs([Pack::memory(functions.chain(tags))], 0)
 }
 
 #[test]

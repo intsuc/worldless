@@ -84,12 +84,12 @@ where
         [Pack::memory(functions.into_iter().map(|(id, source)| {
             MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
         }))],
-        None,
+        0,
     )
 }
 
 fn load_directory_pack(path: impl AsRef<Path>) -> Result<Vm, LoadError> {
-    Vm::from_packs([Pack::directory(path.as_ref())], None)
+    Vm::from_packs([Pack::directory(path.as_ref())], 0)
 }
 
 #[test]

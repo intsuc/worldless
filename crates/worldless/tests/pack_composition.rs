@@ -122,7 +122,7 @@ fn later_packs_override_ordinary_resources_without_hiding_unrelated_resources() 
         predicate("example:condition", r#"{"type":"all_of","terms":[]}"#),
     ]);
 
-    let mut vm = Vm::from_packs([low, high], None).unwrap();
+    let mut vm = Vm::from_packs([low, high], 0).unwrap();
     for (id, value) in [
         ("example:function_winner", 2),
         ("example:low_only", 4),
@@ -155,7 +155,7 @@ fn only_the_selected_ordinary_resource_is_validated() {
         predicate("example:condition", r#"{"type":"all_of","terms":[]}"#),
     ]);
 
-    let mut vm = Vm::from_packs([low, high], None).unwrap();
+    let mut vm = Vm::from_packs([low, high], 0).unwrap();
     assert_function(&mut vm, "example:function_winner", returned(8));
     assert_function(&mut vm, "example:provider_result", returned(6));
     assert_function(&mut vm, "example:predicate_result", returned(9));
@@ -165,7 +165,7 @@ fn only_the_selected_ordinary_resource_is_validated() {
             Pack::memory([function("example:broken", "return 1\n")]),
             Pack::memory([function("example:broken", "not a command\n")]),
         ],
-        None,
+        0,
     )
     .unwrap_err();
     assert!(matches!(
@@ -187,7 +187,7 @@ fn only_the_selected_ordinary_resource_is_validated() {
             Pack::memory([function("example:broken", "return 1\n")]),
             Pack::directory(directory.root()),
         ],
-        None,
+        0,
     )
     .unwrap_err();
     assert!(matches!(
@@ -255,7 +255,7 @@ fn function_tags_append_replace_and_resolve_after_all_packs_are_composed() {
         ),
     ]);
 
-    let mut vm = Vm::from_packs([low, high], None).unwrap();
+    let mut vm = Vm::from_packs([low, high], 0).unwrap();
     assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:run_append", returned(123));
     assert_function(&mut vm, "example:reset", ExecutionOutcome::NoResult);
@@ -301,7 +301,7 @@ fn registry_resource_tags_are_composed_before_their_consumers_are_resolved() {
         ),
     ]);
 
-    let mut vm = Vm::from_packs([low, high], None).unwrap();
+    let mut vm = Vm::from_packs([low, high], 0).unwrap();
     assert_function(&mut vm, "example:provider_result", returned(3));
     assert_function(&mut vm, "example:predicate_result", returned(7));
 }
@@ -313,7 +313,7 @@ fn duplicate_normalized_ids_are_rejected_within_one_pack_but_legal_across_packs(
             function("value", "return 1\n"),
             function("minecraft:value", "return 2\n"),
         ])],
-        None,
+        0,
     )
     .unwrap_err();
     assert!(matches!(
@@ -330,7 +330,7 @@ fn duplicate_normalized_ids_are_rejected_within_one_pack_but_legal_across_packs(
             Pack::memory([function("value", "return 1\n")]),
             Pack::memory([function("minecraft:value", "return 2\n")]),
         ],
-        None,
+        0,
     )
     .unwrap();
     assert_function(&mut vm, "minecraft:value", returned(2));
@@ -350,7 +350,7 @@ fn directory_and_memory_packs_share_the_same_priority_order() {
             Pack::directory(directory.root()),
             Pack::memory([function("example:winner", "return 2\n")]),
         ],
-        None,
+        0,
     )
     .unwrap();
     assert_function(&mut memory_wins, "example:winner", returned(2));
@@ -361,7 +361,7 @@ fn directory_and_memory_packs_share_the_same_priority_order() {
             Pack::memory([function("example:winner", "return 2\n")]),
             Pack::directory(directory.root()),
         ],
-        None,
+        0,
     )
     .unwrap();
     assert_function(&mut directory_wins, "example:winner", returned(1));
@@ -369,7 +369,7 @@ fn directory_and_memory_packs_share_the_same_priority_order() {
 
 #[test]
 fn an_empty_pack_stack_builds_an_empty_vm() {
-    let mut vm = Vm::from_packs(std::iter::empty::<Pack>(), None).unwrap();
+    let mut vm = Vm::from_packs(std::iter::empty::<Pack>(), 0).unwrap();
     assert_eq!(
         vm.execute_function("example:missing", None, context(), LIMIT)
             .unwrap(),
@@ -395,7 +395,7 @@ fn filters_and_overlays_remain_explicitly_unsupported() {
         )
         .unwrap();
 
-        let error = Vm::from_packs([Pack::directory(directory.root())], None).unwrap_err();
+        let error = Vm::from_packs([Pack::directory(directory.root())], 0).unwrap_err();
         assert!(matches!(
             error,
             LoadError::UnsupportedPack {

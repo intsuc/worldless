@@ -104,6 +104,7 @@ pub(crate) enum Command {
         success: bool,
         value: i32,
     },
+    Seed,
     Scoreboard(ScoreboardCommand),
     Condition(ScoreCondition),
     StorageCondition(StorageCondition),

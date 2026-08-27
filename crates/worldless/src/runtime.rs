@@ -31,7 +31,6 @@ pub enum ExecutionError {
     CommandCompilationFailed { reason: String },
     PredicateEvaluationFailed { reason: String },
     NumberProviderEvaluationFailed { reason: String },
-    MissingWorldSeed { sequence: String },
     CommandLimitExceeded { limit: usize },
 }
 
@@ -49,12 +48,6 @@ impl fmt::Display for ExecutionError {
             }
             Self::NumberProviderEvaluationFailed { reason } => {
                 write!(formatter, "number provider evaluation failed: {reason}")
-            }
-            Self::MissingWorldSeed { sequence } => {
-                write!(
-                    formatter,
-                    "random sequence `{sequence}` requires a configured world seed"
-                )
             }
             Self::CommandLimitExceeded { limit } => {
                 write!(
@@ -694,6 +687,7 @@ fn execute_instruction(
                         discard_at_depth_or_higher(&mut queue, frame.discard_depth);
                     }
                     Command::Scoreboard(_)
+                    | Command::Seed
                     | Command::Condition(_)
                     | Command::StorageCondition(_)
                     | Command::PredicateCondition(_)
@@ -723,6 +717,7 @@ fn execute_instruction(
                     Command::Scoreboard(command) => {
                         Some(execute_scoreboard_command(scoreboard, command))
                     }
+                    Command::Seed => Some(CommandResult::success(random.world_seed() as i32)),
                     Command::Condition(condition) => Some(execute_condition(scoreboard, condition)),
                     Command::StorageCondition(condition) => {
                         Some(execute_storage_condition(command_storage, condition))
@@ -757,7 +752,7 @@ fn execute_instruction(
                     )
                     .map(Some)
                     .map_err(|reason| ExecutionError::NumberProviderEvaluationFailed { reason })?,
-                    Command::Random(command) => execute_random_command(random, command)?,
+                    Command::Random(command) => execute_random_command(random, command),
                     Command::Function { .. } | Command::Return { .. } => {
                         unreachable!("only ordinary commands are queued for ordinary execution")
                     }
@@ -1292,54 +1287,42 @@ fn execute_compute_command(
 fn execute_random_command(
     random: &mut RandomState,
     command: &RandomCommand,
-) -> Result<Option<CommandResult>, ExecutionError> {
+) -> Option<CommandResult> {
     let (random, sequences) = random.parts();
     match command {
         RandomCommand::Value { range, sequence } => {
             if let Some(sequence) = sequence {
-                sequences
-                    .materialize(sequence)
-                    .map_err(missing_world_seed)?;
+                sequences.materialize(sequence);
             }
             let min = range.min.unwrap_or(i32::MIN);
             let max = range.max.unwrap_or(i32::MAX);
             let span = i64::from(max) - i64::from(min);
             if span == 0 || span >= i64::from(i32::MAX) {
-                return Ok(None);
+                return None;
             }
             let bound = i32::try_from(span + 1)
                 .expect("an accepted random range has a positive Java int bound");
             let offset = match sequence {
-                Some(sequence) => sequences
-                    .next_int(sequence, bound)
-                    .map_err(missing_world_seed)?,
+                Some(sequence) => sequences.next_int(sequence, bound),
                 None => random
                     .next_int(bound)
                     .expect("an accepted random range has a positive bound"),
             };
-            Ok(Some(CommandResult::success(min + offset)))
+            Some(CommandResult::success(min + offset))
         }
         RandomCommand::Reset { sequence, settings } => {
-            sequences
-                .reset(sequence.clone(), *settings)
-                .map_err(missing_world_seed)?;
-            Ok(Some(CommandResult::success(1)))
+            sequences.reset(sequence.clone(), *settings);
+            Some(CommandResult::success(1))
         }
         RandomCommand::ResetAll { settings } => {
             let count = match settings {
                 Some(settings) => sequences.set_defaults_and_clear(*settings),
                 None => sequences.clear(),
             };
-            Ok(Some(CommandResult::success(i32::try_from(count).expect(
-                "the number of random sequences fits in a Java int",
-            ))))
+            Some(CommandResult::success(
+                i32::try_from(count).expect("the number of random sequences fits in a Java int"),
+            ))
         }
-    }
-}
-
-fn missing_world_seed(error: crate::random::MissingWorldSeed) -> ExecutionError {
-    ExecutionError::MissingWorldSeed {
-        sequence: error.sequence().to_string(),
     }
 }
 

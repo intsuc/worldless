@@ -1407,6 +1407,12 @@ impl CommandCompiler {
             .register(return_command)
             .expect("the command tree contains no conflicting return literal");
 
+        let seed: Command<LoweringSource> =
+            Rc::new(|context| context.source().record(CompiledCommand::Seed));
+        dispatcher
+            .register(LiteralArgumentBuilder::literal("seed").executes(seed))
+            .expect("the command tree contains no conflicting seed literal");
+
         let add_objective: Command<LoweringSource> = Rc::new(|context| {
             let objective = command_string(context, "objective");
             context.source().record(CompiledCommand::Scoreboard(

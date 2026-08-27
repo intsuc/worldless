@@ -23,7 +23,7 @@ and result required by its Minecraft semantics can be represented using only:
 
 - static data-pack resources supplied as program input;
 - explicit invocation values whose meaning is independent of a world or live
-  server identity, except for the named-random-sequence seed described below;
+  server identity, except for the configured level seed described below;
   and
 - logical computation state owned entirely by the VM and whose meaning and
   transitions do not require a world or live server.
@@ -90,18 +90,21 @@ Minecraft operation. A pure operation over the resulting value can be a
 separate in-scope operation, but it is not an implementation of the world
 query.
 
-## Named random-sequence world seed
+## Configured level seed
 
-A caller may explicitly configure a signed 64-bit world seed solely where
-Minecraft uses it to initialize or reset a named random sequence. This narrow
-exception admits the sequence-state transition because it requires no other
-world observation or simulation. It does not seed the unnamed level random
-stream.
+Every executable Worldless VM is constructed with exactly one explicitly
+configured signed 64-bit level seed. This immutable scalar is part of the VM's
+execution environment. An operation may observe or use it only when every
+other observation and effect required by that operation satisfies this scope
+boundary.
 
-The configured seed does not represent a loaded physical world and does not
-bring world generation, world queries, blocks, entities, players, dimensions,
-or other seed-dependent behavior into scope. A composed behavior using a named
-random sequence remains subject to the mixed-behavior rule above.
+The configured seed does not establish a level identity or represent a loaded
+or generated physical world. It does not bring world generation, world
+queries, blocks, entities, players, dimensions, biomes, structures, or other
+physical-world behavior into scope, even when a result could be derived
+deterministically from the seed. It also does not seed the unnamed level random
+stream. A composed behavior using the seed remains subject to the
+mixed-behavior rule above.
 
 ## Unsupported and unimplemented behavior
 

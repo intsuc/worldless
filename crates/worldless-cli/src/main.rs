@@ -7,9 +7,10 @@ use std::{
 
 use worldless::{
     ExecutionContext, ExecutionOutcome, FunctionArguments, Pack, Position, Rotation, Vm,
+    validate_packs,
 };
 
-const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] [--world-seed <I64>] [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] function [--arguments <COMPOUND_SNBT>] <FUNCTION_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] [--world-seed <I64>] [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] tag [--arguments <COMPOUND_SNBT>] <TAG_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] [--world-seed <I64>] [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] command <COMMAND>";
+const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] function [--arguments <COMPOUND_SNBT>] <FUNCTION_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] tag [--arguments <COMPOUND_SNBT>] <TAG_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] command <COMMAND>";
 const DEFAULT_COMMAND_LIMIT: usize = 65_536;
 const DEFAULT_POSITION: Position = Position::new(0.0, 0.0, 0.0);
 const DEFAULT_ROTATION: Rotation = Rotation::new(0.0, 0.0);
@@ -24,7 +25,7 @@ enum CliCommand {
     },
     Run {
         packs: Vec<PathBuf>,
-        world_seed: Option<i64>,
+        world_seed: i64,
         command_limit: usize,
         context: ExecutionContext,
         invocation: CliInvocation,
@@ -58,88 +59,74 @@ fn main() -> ExitCode {
         }
     };
 
-    let (packs, world_seed, operation) = match command {
-        CliCommand::Check { packs } => (packs, None, Operation::Check),
+    match command {
+        CliCommand::Check { packs } => {
+            if let Err(error) = validate_packs(packs.into_iter().map(Pack::directory)) {
+                eprintln!("error: {error}");
+                return ExitCode::from(EXIT_LOAD);
+            }
+            println!("ok");
+        }
         CliCommand::Run {
             packs,
             world_seed,
             command_limit,
             context,
             invocation,
-        } => (
-            packs,
-            world_seed,
-            Operation::Run {
-                command_limit,
-                context,
-                invocation: match invocation {
-                    CliInvocation::Function {
+        } => {
+            let invocation = match invocation {
+                CliInvocation::Function {
+                    reference,
+                    arguments,
+                } => {
+                    let arguments = match arguments
+                        .as_deref()
+                        .map(FunctionArguments::from_snbt)
+                        .transpose()
+                    {
+                        Ok(arguments) => arguments,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            return ExitCode::from(EXIT_EXECUTION);
+                        }
+                    };
+                    Invocation::Function {
                         reference,
                         arguments,
-                    } => {
-                        let arguments = match arguments
-                            .as_deref()
-                            .map(FunctionArguments::from_snbt)
-                            .transpose()
-                        {
-                            Ok(arguments) => arguments,
-                            Err(error) => {
-                                eprintln!("error: {error}");
-                                return ExitCode::from(EXIT_EXECUTION);
-                            }
-                        };
-                        Invocation::Function {
-                            reference,
-                            arguments,
-                        }
                     }
-                    CliInvocation::Command(command) => Invocation::Command(command),
-                },
-            },
-        ),
-    };
-    let mut vm = match Vm::from_packs(packs.into_iter().map(Pack::directory), world_seed) {
-        Ok(vm) => vm,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::from(EXIT_LOAD);
+                }
+                CliInvocation::Command(command) => Invocation::Command(command),
+            };
+            let mut vm = match Vm::from_packs(packs.into_iter().map(Pack::directory), world_seed) {
+                Ok(vm) => vm,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(EXIT_LOAD);
+                }
+            };
+            let outcome = match invocation {
+                Invocation::Function {
+                    reference,
+                    arguments,
+                } => vm.execute_function(&reference, arguments.as_ref(), context, command_limit),
+                Invocation::Command(command) => {
+                    vm.execute_command(&command, context, command_limit)
+                }
+            };
+            match outcome {
+                Ok(ExecutionOutcome::NoResult) => println!("no-result"),
+                Ok(ExecutionOutcome::Result { success, value }) => {
+                    println!("result success={success} value={value}")
+                }
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(EXIT_EXECUTION);
+                }
+            }
         }
-    };
-
-    match operation {
-        Operation::Check => println!("ok"),
-        Operation::Run {
-            command_limit,
-            context,
-            invocation,
-        } => match match invocation {
-            Invocation::Function {
-                reference,
-                arguments,
-            } => vm.execute_function(&reference, arguments.as_ref(), context, command_limit),
-            Invocation::Command(command) => vm.execute_command(&command, context, command_limit),
-        } {
-            Ok(ExecutionOutcome::NoResult) => println!("no-result"),
-            Ok(ExecutionOutcome::Result { success, value }) => {
-                println!("result success={success} value={value}")
-            }
-            Err(error) => {
-                eprintln!("error: {error}");
-                return ExitCode::from(EXIT_EXECUTION);
-            }
-        },
     }
 
     ExitCode::SUCCESS
-}
-
-enum Operation {
-    Check,
-    Run {
-        command_limit: usize,
-        context: ExecutionContext,
-        invocation: Invocation,
-    },
 }
 
 enum Invocation {
@@ -188,15 +175,14 @@ fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, Us
     }
     require_pack(&packs)?;
 
-    let world_seed = if arguments
+    if !arguments
         .peek()
         .is_some_and(|argument| argument == "--world-seed")
     {
-        arguments.next();
-        Some(parse_world_seed(arguments.next())?)
-    } else {
-        None
-    };
+        return Err(usage_error("missing required --world-seed"));
+    }
+    arguments.next();
+    let world_seed = parse_world_seed(arguments.next())?;
 
     let command_limit = if arguments
         .peek()
@@ -235,10 +221,9 @@ fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, Us
         DEFAULT_ROTATION
     };
 
-    if world_seed.is_some()
-        && arguments
-            .peek()
-            .is_some_and(|argument| argument == "--world-seed")
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == "--world-seed")
     {
         return Err(usage_error("duplicate --world-seed"));
     }
@@ -259,7 +244,7 @@ fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, Us
     };
 
     if let Some(argument) = arguments.next() {
-        if world_seed.is_some() && argument == "--world-seed" {
+        if argument == "--world-seed" {
             return Err(usage_error("duplicate --world-seed"));
         }
         if argument == "--command-limit" {
@@ -545,7 +530,7 @@ mod tests {
             .unwrap(),
             CliCommand::Run {
                 packs: vec![PathBuf::from("low"), PathBuf::from("high")],
-                world_seed: Some(-123),
+                world_seed: -123,
                 command_limit: 12,
                 context: ExecutionContext::new(
                     Position::new(-1.5, 2.0, -3.25),
@@ -560,7 +545,7 @@ mod tests {
     fn parses_function_tags_arguments_and_single_commands() {
         let defaults = |invocation| CliCommand::Run {
             packs: vec![PathBuf::from("pack")],
-            world_seed: None,
+            world_seed: 0,
             command_limit: DEFAULT_COMMAND_LIMIT,
             context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
             invocation,
@@ -571,6 +556,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "function",
                 "--arguments",
                 r#"{name:"Ada",count:3}"#,
@@ -587,6 +574,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "tag",
                 "--arguments",
                 "{phase:test}",
@@ -603,6 +592,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "command",
                 "scoreboard players get #value example",
             ])
@@ -612,7 +603,16 @@ mod tests {
             ))
         );
         assert_eq!(
-            parse(&["run", "--pack", "pack", "command", "--not-a-command"]).unwrap(),
+            parse(&[
+                "run",
+                "--pack",
+                "pack",
+                "--world-seed",
+                "0",
+                "command",
+                "--not-a-command",
+            ])
+            .unwrap(),
             defaults(CliInvocation::Command("--not-a-command".to_owned()))
         );
     }
@@ -620,15 +620,49 @@ mod tests {
     #[test]
     fn requires_explicit_run_target_and_exact_target_grammar() {
         for arguments in [
-            &["run", "--pack", "pack", "example:main"][..],
-            &["run", "--pack", "pack"],
-            &["run", "--pack", "pack", "function"],
-            &["run", "--pack", "pack", "tag"],
-            &["run", "--pack", "pack", "command"],
-            &["run", "--pack", "pack", "function", "example:main", "extra"],
-            &["run", "--pack", "pack", "command", "return 1", "extra"],
-            &["run", "--pack", "pack", "function", "#example:main"],
-            &["run", "--pack", "pack", "tag", "#example:entries"],
+            &["run", "--pack", "pack", "--world-seed", "0", "example:main"][..],
+            &["run", "--pack", "pack", "--world-seed", "0"],
+            &["run", "--pack", "pack", "--world-seed", "0", "function"],
+            &["run", "--pack", "pack", "--world-seed", "0", "tag"],
+            &["run", "--pack", "pack", "--world-seed", "0", "command"],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--world-seed",
+                "0",
+                "function",
+                "example:main",
+                "extra",
+            ],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--world-seed",
+                "0",
+                "command",
+                "return 1",
+                "extra",
+            ],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--world-seed",
+                "0",
+                "function",
+                "#example:main",
+            ],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--world-seed",
+                "0",
+                "tag",
+                "#example:entries",
+            ],
         ] {
             assert!(parse(arguments).is_err(), "accepted {arguments:?}");
         }
@@ -638,6 +672,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "function",
                 "--arguments",
                 "{}",
@@ -650,17 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn run_options_have_independent_defaults() {
-        assert_eq!(
-            parse(&["run", "--pack", "pack", "function", "example:main"]).unwrap(),
-            CliCommand::Run {
-                packs: vec![PathBuf::from("pack")],
-                world_seed: None,
-                command_limit: DEFAULT_COMMAND_LIMIT,
-                context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
-                invocation: function("example:main"),
-            }
-        );
+    fn run_options_have_defaults_after_the_required_world_seed() {
         assert_eq!(
             parse(&[
                 "run",
@@ -674,7 +700,7 @@ mod tests {
             .unwrap(),
             CliCommand::Run {
                 packs: vec![PathBuf::from("pack")],
-                world_seed: Some(123),
+                world_seed: 123,
                 command_limit: DEFAULT_COMMAND_LIMIT,
                 context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
                 invocation: function("example:main"),
@@ -685,6 +711,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "123",
                 "--command-limit",
                 "12",
                 "function",
@@ -693,7 +721,7 @@ mod tests {
             .unwrap(),
             CliCommand::Run {
                 packs: vec![PathBuf::from("pack")],
-                world_seed: None,
+                world_seed: 123,
                 command_limit: 12,
                 context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
                 invocation: function("example:main"),
@@ -704,6 +732,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "123",
                 "--position",
                 "1",
                 "2",
@@ -714,7 +744,7 @@ mod tests {
             .unwrap(),
             CliCommand::Run {
                 packs: vec![PathBuf::from("pack")],
-                world_seed: None,
+                world_seed: 123,
                 command_limit: DEFAULT_COMMAND_LIMIT,
                 context: ExecutionContext::new(Position::new(1.0, 2.0, 3.0), DEFAULT_ROTATION),
                 invocation: function("example:main"),
@@ -725,6 +755,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "123",
                 "--rotation",
                 "90",
                 "-45",
@@ -734,7 +766,7 @@ mod tests {
             .unwrap(),
             CliCommand::Run {
                 packs: vec![PathBuf::from("pack")],
-                world_seed: None,
+                world_seed: 123,
                 command_limit: DEFAULT_COMMAND_LIMIT,
                 context: ExecutionContext::new(DEFAULT_POSITION, Rotation::new(90.0, -45.0)),
                 invocation: function("example:main"),
@@ -781,7 +813,7 @@ mod tests {
                 .unwrap(),
                 CliCommand::Run {
                     packs: vec![PathBuf::from("pack")],
-                    world_seed: Some(value),
+                    world_seed: value,
                     command_limit: DEFAULT_COMMAND_LIMIT,
                     context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
                     invocation: function("example:main"),
@@ -834,6 +866,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "1",
                 "--world-seed",
@@ -861,6 +895,10 @@ mod tests {
             );
         }
 
+        assert_eq!(
+            parse(&["run", "--pack", "pack", "function", "example:main"]),
+            Err(usage_error("missing required --world-seed"))
+        );
         assert_eq!(
             parse(&["run", "--pack", "pack", "--world-seed"]),
             Err(usage_error("missing value for --world-seed"))
@@ -896,11 +934,20 @@ mod tests {
     #[test]
     fn validates_explicit_command_limits() {
         for arguments in [
-            &["run", "--pack", "pack", "--command-limit"][..],
             &[
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
+                "--command-limit",
+            ][..],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "--pack",
                 "other",
@@ -909,6 +956,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "-1",
                 "function",
@@ -918,6 +967,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "+1",
                 "function",
@@ -927,6 +978,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "1.0",
                 "function",
@@ -936,6 +989,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "1",
                 "--command-limit",
@@ -953,6 +1008,8 @@ mod tests {
                 OsString::from("run"),
                 OsString::from("--pack"),
                 OsString::from("pack"),
+                OsString::from("--world-seed"),
+                OsString::from("0"),
                 OsString::from("--command-limit"),
                 OsString::from(overflow),
                 OsString::from("function"),
@@ -969,6 +1026,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "1",
                 "--position",
@@ -984,6 +1043,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "1",
                 "--position",
@@ -999,6 +1060,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "1",
                 "--position",
@@ -1015,6 +1078,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "1",
                 "--position",
@@ -1031,6 +1096,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "1",
                 "--position",
@@ -1047,6 +1114,8 @@ mod tests {
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "1",
                 "--position",
@@ -1071,11 +1140,22 @@ mod tests {
             &["check", "--"],
             &["check", "--pack=pack"],
             &["check", "pack"],
-            &["run", "--pack", "pack", "--command-limit", "1", "--unknown"],
             &[
                 "run",
                 "--pack",
                 "pack",
+                "--world-seed",
+                "0",
+                "--command-limit",
+                "1",
+                "--unknown",
+            ],
+            &[
+                "run",
+                "--pack",
+                "pack",
+                "--world-seed",
+                "0",
                 "--command-limit",
                 "1",
                 "--position",

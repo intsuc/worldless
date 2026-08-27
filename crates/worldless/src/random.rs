@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt};
+use std::collections::HashMap;
 
 use md5::{Digest, Md5};
 
@@ -14,11 +14,15 @@ pub(crate) struct RandomState {
 }
 
 impl RandomState {
-    pub(crate) fn new(world_seed: Option<i64>) -> Self {
+    pub(crate) fn new(world_seed: i64) -> Self {
         Self {
             unnamed: LegacyRandom::default(),
             sequences: RandomSequences::new(world_seed),
         }
+    }
+
+    pub(crate) fn world_seed(&self) -> i64 {
+        self.sequences.world_seed()
     }
 
     pub(crate) fn unnamed(&mut self) -> &mut LegacyRandom {
@@ -86,38 +90,15 @@ impl Default for LegacyRandom {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MissingWorldSeed {
-    sequence: Identifier,
-}
-
-impl MissingWorldSeed {
-    pub(crate) fn sequence(&self) -> &Identifier {
-        &self.sequence
-    }
-}
-
-impl fmt::Display for MissingWorldSeed {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "random sequence `{}` requires a configured world seed",
-            self.sequence
-        )
-    }
-}
-
-impl std::error::Error for MissingWorldSeed {}
-
 #[derive(Debug)]
 pub(crate) struct RandomSequences {
-    world_seed: Option<i64>,
+    world_seed: i64,
     defaults: RandomSequenceSettings,
     sequences: HashMap<Identifier, XoroshiroRandomSource>,
 }
 
 impl RandomSequences {
-    pub(crate) fn new(world_seed: Option<i64>) -> Self {
+    pub(crate) fn new(world_seed: i64) -> Self {
         Self {
             world_seed,
             defaults: RandomSequenceSettings::minecraft_default(0),
@@ -125,36 +106,29 @@ impl RandomSequences {
         }
     }
 
-    pub(crate) fn materialize(&mut self, id: &Identifier) -> Result<(), MissingWorldSeed> {
-        if self.sequences.contains_key(id) {
-            return Ok(());
-        }
-        let source = self.create_sequence(id, &self.defaults)?;
-        self.sequences.insert(id.clone(), source);
-        Ok(())
+    pub(crate) fn world_seed(&self) -> i64 {
+        self.world_seed
     }
 
-    pub(crate) fn next_int(
-        &mut self,
-        id: &Identifier,
-        bound: i32,
-    ) -> Result<i32, MissingWorldSeed> {
-        self.materialize(id)?;
-        Ok(self
-            .sequences
+    pub(crate) fn materialize(&mut self, id: &Identifier) {
+        if self.sequences.contains_key(id) {
+            return;
+        }
+        let source = self.create_sequence(id, &self.defaults);
+        self.sequences.insert(id.clone(), source);
+    }
+
+    pub(crate) fn next_int(&mut self, id: &Identifier, bound: i32) -> i32 {
+        self.materialize(id);
+        self.sequences
             .get_mut(id)
             .expect("the named random sequence was materialized")
-            .next_int(bound))
+            .next_int(bound)
     }
 
-    pub(crate) fn reset(
-        &mut self,
-        id: Identifier,
-        settings: Option<RandomSequenceSettings>,
-    ) -> Result<(), MissingWorldSeed> {
-        let source = self.create_sequence(&id, settings.as_ref().unwrap_or(&self.defaults))?;
+    pub(crate) fn reset(&mut self, id: Identifier, settings: Option<RandomSequenceSettings>) {
+        let source = self.create_sequence(&id, settings.as_ref().unwrap_or(&self.defaults));
         self.sequences.insert(id, source);
-        Ok(())
     }
 
     pub(crate) fn clear(&mut self) -> usize {
@@ -172,11 +146,9 @@ impl RandomSequences {
         &self,
         id: &Identifier,
         settings: &RandomSequenceSettings,
-    ) -> Result<XoroshiroRandomSource, MissingWorldSeed> {
+    ) -> XoroshiroRandomSource {
         let world_seed = if settings.include_world_seed {
-            self.world_seed.ok_or_else(|| MissingWorldSeed {
-                sequence: id.clone(),
-            })?
+            self.world_seed
         } else {
             0
         };
@@ -185,7 +157,7 @@ impl RandomSequences {
         if settings.include_sequence_id {
             upgraded = upgraded.xor(seed_for_key(id));
         }
-        Ok(XoroshiroRandomSource::new(upgraded.mixed()))
+        XoroshiroRandomSource::new(upgraded.mixed())
     }
 }
 
@@ -315,7 +287,7 @@ mod tests {
     }
 
     fn next_longs(sequences: &mut RandomSequences, id: &Identifier, count: usize) -> Vec<u64> {
-        sequences.materialize(id).unwrap();
+        sequences.materialize(id);
         let source = sequences.sequences.get_mut(id).unwrap();
         (0..count).map(|_| source.generator.next_long()).collect()
     }
@@ -376,7 +348,7 @@ mod tests {
     #[test]
     fn named_sequences_match_world_seed_salt_and_id_vectors() {
         let sequence = id("minecraft:test");
-        let mut defaults = RandomSequences::new(Some(0));
+        let mut defaults = RandomSequences::new(0);
         assert_eq!(
             next_longs(&mut defaults, &sequence, 4),
             [
@@ -388,7 +360,7 @@ mod tests {
         );
 
         let sequence = id("test:sequence");
-        let mut negative_salt = RandomSequences::new(Some(1_234_567_890_123_456_789));
+        let mut negative_salt = RandomSequences::new(1_234_567_890_123_456_789);
         negative_salt.set_defaults_and_clear(settings(-123_456_789, true, true));
         assert_eq!(
             next_longs(&mut negative_salt, &sequence, 4),
@@ -400,7 +372,7 @@ mod tests {
             ]
         );
 
-        let mut no_id = RandomSequences::new(Some(1_234_567_890_123_456_789));
+        let mut no_id = RandomSequences::new(1_234_567_890_123_456_789);
         no_id.set_defaults_and_clear(settings(-123_456_789, true, false));
         assert_eq!(
             next_longs(&mut no_id, &sequence, 4),
@@ -414,71 +386,37 @@ mod tests {
     }
 
     #[test]
-    fn missing_world_seed_is_reported_before_state_is_created_or_replaced() {
-        let sequence = id("minecraft:test");
-        let mut sequences = RandomSequences::new(None);
-        let error = sequences.materialize(&sequence).unwrap_err();
-        assert_eq!(error.sequence(), &sequence);
-        assert!(sequences.sequences.is_empty());
-
-        sequences
-            .reset(sequence.clone(), Some(settings(-1, false, true)))
-            .unwrap();
-        let first = sequences
-            .sequences
-            .get_mut(&sequence)
-            .unwrap()
-            .generator
-            .next_long();
-        assert_eq!(first, 0xdc54_644d_5ad3_315d);
-
-        let error = sequences
-            .reset(sequence.clone(), Some(settings(0, true, true)))
-            .unwrap_err();
-        assert_eq!(error.sequence(), &sequence);
-        let second = sequences
-            .sequences
-            .get_mut(&sequence)
-            .unwrap()
-            .generator
-            .next_long();
-        assert_eq!(second, 0xa251_96e4_33e9_49a3);
-    }
-
-    #[test]
     fn reset_and_clear_follow_minecraft_state_semantics() {
         let first = id("example:first");
         let second = id("example:second");
-        let mut sequences = RandomSequences::new(Some(0));
+        let mut sequences = RandomSequences::new(0);
         let initial = next_longs(&mut sequences, &first, 1)[0];
         next_longs(&mut sequences, &second, 1);
 
-        sequences.reset(first.clone(), None).unwrap();
+        sequences.reset(first.clone(), None);
         assert_eq!(next_longs(&mut sequences, &first, 1), [initial]);
         assert_eq!(sequences.clear(), 2);
         assert_eq!(sequences.clear(), 0);
 
-        sequences.reset(first.clone(), None).unwrap();
+        sequences.reset(first.clone(), None);
         assert_eq!(
             sequences.set_defaults_and_clear(settings(7, false, false)),
             1
         );
         assert!(sequences.sequences.is_empty());
-        sequences.materialize(&first).unwrap();
+        sequences.materialize(&first);
     }
 
     #[test]
     fn explicit_reset_does_not_change_global_defaults() {
         let explicit = id("example:explicit");
         let lazy = id("example:lazy");
-        let mut sequences = RandomSequences::new(Some(0));
-        sequences
-            .reset(explicit, Some(settings(9, false, false)))
-            .unwrap();
+        let mut sequences = RandomSequences::new(0);
+        sequences.reset(explicit, Some(settings(9, false, false)));
         sequences.clear();
 
         let actual = next_longs(&mut sequences, &lazy, 1)[0];
-        let mut expected = RandomSequences::new(Some(0));
+        let mut expected = RandomSequences::new(0);
         assert_eq!(actual, next_longs(&mut expected, &lazy, 1)[0]);
     }
 }

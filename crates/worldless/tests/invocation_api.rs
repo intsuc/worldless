@@ -18,7 +18,7 @@ fn compile(functions: &[(&str, &str)], tags: &[(&str, &str)]) -> Vm {
     let tags = tags
         .iter()
         .map(|(id, source)| MemoryResource::new(ResourceKind::FunctionTag, *id, *source));
-    Vm::from_packs([Pack::memory(functions.chain(tags))], None).unwrap()
+    Vm::from_packs([Pack::memory(functions.chain(tags))], 0).unwrap()
 }
 
 #[test]

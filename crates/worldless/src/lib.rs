@@ -3,8 +3,8 @@
 //!
 //! The current slice supports function calls and returns, persistent named
 //! scoreboard state and arithmetic, command storage and NBT data operations, number
-//! providers, worldless loot predicates, `compute`, and value/reset forms of
-//! `random`, function macros and tags, supported `execute` conditions and pure
+//! providers, worldless loot predicates, `compute`, `seed`, and value/reset
+//! forms of `random`, function macros and tags, supported `execute` conditions and pure
 //! context transformations, and result propagation. Supported resources can
 //! be compiled from a statically composed, ordered mixture of expanded
 //! directory data packs and in-memory packs. Construction is atomic: an invalid
@@ -66,6 +66,12 @@ impl fmt::Display for FunctionArgumentsParseError {
 
 impl Error for FunctionArgumentsParseError {}
 
+/// Statically composes and validates the supplied data packs without creating
+/// an executable VM.
+pub fn validate_packs(packs: impl IntoIterator<Item = Pack>) -> Result<(), LoadError> {
+    loader::load_packs(packs).map(drop)
+}
+
 /// A loaded worldless data-pack program.
 #[derive(Debug)]
 pub struct Vm {
@@ -82,12 +88,11 @@ impl Vm {
     /// resource replaces a lower resource with the same identifier. Tag files
     /// instead compose in pack order and may discard accumulated lower entries
     /// with their `replace` field.
-    /// `world_seed` is used only to initialize named random sequences. It does
-    /// not seed the VM's unnamed random stream or represent a loaded world.
-    /// Passing `None` leaves seed-dependent sequence initialization unavailable.
+    /// `world_seed` is the VM's immutable configured level seed. It does not
+    /// seed the VM's unnamed random stream or represent a loaded world.
     pub fn from_packs(
         packs: impl IntoIterator<Item = Pack>,
-        world_seed: Option<i64>,
+        world_seed: i64,
     ) -> Result<Self, LoadError> {
         loader::load_packs(packs).map(|program| Self::new(program, world_seed))
     }
@@ -145,7 +150,7 @@ impl Vm {
         )
     }
 
-    fn new(program: Program, world_seed: Option<i64>) -> Self {
+    fn new(program: Program, world_seed: i64) -> Self {
         Self {
             program,
             scoreboard: Scoreboard::default(),
