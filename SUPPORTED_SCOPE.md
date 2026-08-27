@@ -23,7 +23,8 @@ and result required by its Minecraft semantics can be represented using only:
 
 - static data-pack resources supplied as program input;
 - explicit invocation values whose meaning is independent of a world or live
-  server identity; and
+  server identity, except for the named-random-sequence seed described below;
+  and
 - logical computation state owned entirely by the VM and whose meaning and
   transitions do not require a world or live server.
 
@@ -88,6 +89,19 @@ query callback, or precomputed answer does not reclassify a world-dependent
 Minecraft operation. A pure operation over the resulting value can be a
 separate in-scope operation, but it is not an implementation of the world
 query.
+
+## Named random-sequence world seed
+
+A caller may explicitly configure a signed 64-bit world seed solely where
+Minecraft uses it to initialize or reset a named random sequence. This narrow
+exception admits the sequence-state transition because it requires no other
+world observation or simulation. It does not seed the unnamed level random
+stream.
+
+The configured seed does not represent a loaded physical world and does not
+bring world generation, world queries, blocks, entities, players, dimensions,
+or other seed-dependent behavior into scope. A composed behavior using a named
+random sequence remains subject to the mixed-behavior rule above.
 
 ## Unsupported and unimplemented behavior
 

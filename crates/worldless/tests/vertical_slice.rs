@@ -80,13 +80,16 @@ where
     N: AsRef<str>,
     S: AsRef<str>,
 {
-    Vm::from_packs([Pack::memory(functions.into_iter().map(|(id, source)| {
-        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
-    }))])
+    Vm::from_packs(
+        [Pack::memory(functions.into_iter().map(|(id, source)| {
+            MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+        }))],
+        None,
+    )
 }
 
 fn load_directory_pack(path: impl AsRef<Path>) -> Result<Vm, LoadError> {
-    Vm::from_packs([Pack::directory(path.as_ref())])
+    Vm::from_packs([Pack::directory(path.as_ref())], None)
 }
 
 #[test]

@@ -110,6 +110,39 @@ pub(crate) enum Command {
     PredicateCondition(PredicateCondition),
     Data(DataCommand),
     Compute(ComputeCommand),
+    Random(RandomCommand),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RandomCommand {
+    Value {
+        range: IntegerRange,
+        sequence: Option<Identifier>,
+    },
+    Reset {
+        sequence: Identifier,
+        settings: Option<RandomSequenceSettings>,
+    },
+    ResetAll {
+        settings: Option<RandomSequenceSettings>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RandomSequenceSettings {
+    pub(crate) salt: i32,
+    pub(crate) include_world_seed: bool,
+    pub(crate) include_sequence_id: bool,
+}
+
+impl RandomSequenceSettings {
+    pub(crate) const fn minecraft_default(salt: i32) -> Self {
+        Self {
+            salt,
+            include_world_seed: true,
+            include_sequence_id: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -235,7 +268,7 @@ pub(crate) enum ScoreComparison {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ScoreRange {
+pub(crate) struct IntegerRange {
     pub(crate) min: Option<i32>,
     pub(crate) max: Option<i32>,
 }
@@ -249,7 +282,7 @@ pub(crate) enum ScorePredicate {
     },
     Matches {
         score: ScoreReference,
-        range: ScoreRange,
+        range: IntegerRange,
     },
 }
 

@@ -82,7 +82,7 @@ fn compile_with_tags(
 }
 
 fn load_memory(resources: impl IntoIterator<Item = MemoryResource>) -> Result<Vm, LoadError> {
-    Vm::from_packs([Pack::memory(resources)])
+    Vm::from_packs([Pack::memory(resources)], None)
 }
 
 fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
@@ -672,7 +672,7 @@ fn directory_loader_reads_number_provider_resources_and_tags() {
         r#"{"values":["example:one","example:two"]}"#,
     );
 
-    let mut vm = Vm::from_packs([Pack::directory(pack.root())]).unwrap();
+    let mut vm = Vm::from_packs([Pack::directory(pack.root())], None).unwrap();
     assert_function(&mut vm, "example:main", returned(true, 3));
 }
 
@@ -692,7 +692,7 @@ fn directory_loader_applies_a_worldless_override_of_the_fast_cooking_predicate()
         "return run compute default minecraft:cooking/speed_default integer\n",
     );
 
-    let mut vm = Vm::from_packs([Pack::directory(pack.root())]).unwrap();
+    let mut vm = Vm::from_packs([Pack::directory(pack.root())], None).unwrap();
     assert_function(&mut vm, "example:burn_time", returned(true, 25));
     assert_function(&mut vm, "example:speed", returned(true, 2));
 }

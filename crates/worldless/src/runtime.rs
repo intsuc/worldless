@@ -5,13 +5,13 @@ use crate::{
     loader::CommandCompiler,
     macro_function::Function,
     nbt::{CommandStorage, JavaString, Tag},
-    number_provider::LegacyRandom,
     program::{
         Command, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation, DataSource,
         FunctionArguments, Instruction, Modifier, ObjectiveId, PredicateCondition, Program,
-        ResolvedFunctions, ScoreCondition, ScoreHolderSet, Scoreboard, ScoreboardCommand,
-        StorageCondition, StorageNumberType, StoreKind,
+        RandomCommand, ResolvedFunctions, ScoreCondition, ScoreHolderSet, Scoreboard,
+        ScoreboardCommand, StorageCondition, StorageNumberType, StoreKind,
     },
+    random::{LegacyRandom, RandomState},
     resource::{FunctionReference, Identifier},
 };
 
@@ -31,6 +31,7 @@ pub enum ExecutionError {
     UnknownFunction { id: String },
     FunctionInstantiationFailed { id: String, reason: String },
     NumberProviderEvaluationFailed { reason: String },
+    MissingWorldSeed { sequence: String },
     CommandLimitExceeded { limit: usize },
 }
 
@@ -46,6 +47,12 @@ impl fmt::Display for ExecutionError {
             }
             Self::NumberProviderEvaluationFailed { reason } => {
                 write!(formatter, "number provider evaluation failed: {reason}")
+            }
+            Self::MissingWorldSeed { sequence } => {
+                write!(
+                    formatter,
+                    "random sequence `{sequence}` requires a configured world seed"
+                )
             }
             Self::CommandLimitExceeded { limit } => {
                 write!(
@@ -292,7 +299,7 @@ pub(crate) fn execute(
     program: &Program,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
-    random: &mut LegacyRandom,
+    random: &mut RandomState,
     input: &str,
     context: ExecutionContext,
     command_limit: usize,
@@ -459,7 +466,7 @@ pub(crate) fn execute(
                                         scoreboard,
                                         command_storage,
                                         &context,
-                                        random,
+                                        random.unnamed(),
                                     )
                                     .map_err(|reason| {
                                         ExecutionError::NumberProviderEvaluationFailed { reason }
@@ -620,7 +627,8 @@ pub(crate) fn execute(
                     | Command::StorageCondition(_)
                     | Command::PredicateCondition(_)
                     | Command::Data(_)
-                    | Command::Compute(_) => {
+                    | Command::Compute(_)
+                    | Command::Random(_) => {
                         queue.push_front(QueueEntry::ExecuteOrdinary {
                             frame,
                             context,
@@ -642,41 +650,53 @@ pub(crate) fn execute(
                 let command = &frame.function[instruction].command;
                 let result = match command {
                     Command::Scoreboard(command) => {
-                        Ok(execute_scoreboard_command(scoreboard, command))
+                        Some(execute_scoreboard_command(scoreboard, command))
                     }
-                    Command::Condition(condition) => Ok(execute_condition(scoreboard, condition)),
+                    Command::Condition(condition) => Some(execute_condition(scoreboard, condition)),
                     Command::StorageCondition(condition) => {
-                        Ok(execute_storage_condition(command_storage, condition))
+                        Some(execute_storage_condition(command_storage, condition))
                     }
                     Command::PredicateCondition(condition) => execute_predicate_condition(
                         program,
                         scoreboard,
                         command_storage,
                         &context,
-                        random,
+                        random.unnamed(),
                         condition,
-                    ),
+                    )
+                    .map(Some)
+                    .map_err(|reason| ExecutionError::NumberProviderEvaluationFailed { reason })?,
                     Command::Data(command) => execute_data_command(
                         program,
                         scoreboard,
                         command_storage,
                         &context,
-                        random,
+                        random.unnamed(),
                         command,
-                    ),
+                    )
+                    .map(Some)
+                    .map_err(|reason| ExecutionError::NumberProviderEvaluationFailed { reason })?,
                     Command::Compute(command) => execute_compute_command(
                         program,
                         scoreboard,
                         command_storage,
                         &context,
-                        random,
+                        random.unnamed(),
                         command,
-                    ),
+                    )
+                    .map(Some)
+                    .map_err(|reason| ExecutionError::NumberProviderEvaluationFailed { reason })?,
+                    Command::Random(command) => execute_random_command(random, command)?,
                     Command::Function { .. } | Command::Return { .. } => {
                         unreachable!("only ordinary commands are queued for ordinary execution")
                     }
-                }
-                .map_err(|reason| ExecutionError::NumberProviderEvaluationFailed { reason })?;
+                };
+                let Some(result) = result else {
+                    if !return_run {
+                        schedule_next_instruction(&mut queue, frame);
+                    }
+                    continue;
+                };
                 ResultConsumer::ignoring(stores).accept(
                     result,
                     scoreboard,
@@ -1182,6 +1202,60 @@ fn execute_compute_command(
         ),
     };
     value.map(CommandResult::success)
+}
+
+fn execute_random_command(
+    random: &mut RandomState,
+    command: &RandomCommand,
+) -> Result<Option<CommandResult>, ExecutionError> {
+    let (random, sequences) = random.parts();
+    match command {
+        RandomCommand::Value { range, sequence } => {
+            if let Some(sequence) = sequence {
+                sequences
+                    .materialize(sequence)
+                    .map_err(missing_world_seed)?;
+            }
+            let min = range.min.unwrap_or(i32::MIN);
+            let max = range.max.unwrap_or(i32::MAX);
+            let span = i64::from(max) - i64::from(min);
+            if span == 0 || span >= i64::from(i32::MAX) {
+                return Ok(None);
+            }
+            let bound = i32::try_from(span + 1)
+                .expect("an accepted random range has a positive Java int bound");
+            let offset = match sequence {
+                Some(sequence) => sequences
+                    .next_int(sequence, bound)
+                    .map_err(missing_world_seed)?,
+                None => random
+                    .next_int(bound)
+                    .expect("an accepted random range has a positive bound"),
+            };
+            Ok(Some(CommandResult::success(min + offset)))
+        }
+        RandomCommand::Reset { sequence, settings } => {
+            sequences
+                .reset(sequence.clone(), *settings)
+                .map_err(missing_world_seed)?;
+            Ok(Some(CommandResult::success(1)))
+        }
+        RandomCommand::ResetAll { settings } => {
+            let count = match settings {
+                Some(settings) => sequences.set_defaults_and_clear(*settings),
+                None => sequences.clear(),
+            };
+            Ok(Some(CommandResult::success(i32::try_from(count).expect(
+                "the number of random sequences fits in a Java int",
+            ))))
+        }
+    }
+}
+
+fn missing_world_seed(error: crate::random::MissingWorldSeed) -> ExecutionError {
+    ExecutionError::MissingWorldSeed {
+        sequence: error.sequence().to_string(),
+    }
 }
 
 fn stored_command_value(kind: StoreKind, result: CommandResult) -> i32 {

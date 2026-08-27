@@ -165,6 +165,44 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
 }
 
 #[test]
+fn run_world_seed_initializes_named_random_sequences() {
+    let pack = TestPack::new();
+    pack.write_function(
+        "example:random",
+        "return run random value 0..100 minecraft:test\n",
+    );
+
+    let output = worldless(&["check".as_ref(), "--pack".as_ref(), pack.root().as_os_str()]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let output = worldless(&[
+        "run".as_ref(),
+        "--pack".as_ref(),
+        pack.root().as_os_str(),
+        "example:random".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stdout.is_empty());
+    assert!(
+        text(&output.stderr).contains("requires a configured world seed"),
+        "{}",
+        text(&output.stderr)
+    );
+
+    let output = worldless(&[
+        "run".as_ref(),
+        "--pack".as_ref(),
+        pack.root().as_os_str(),
+        "--world-seed".as_ref(),
+        "0".as_ref(),
+        "example:random".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(text(&output.stdout), "returned success=true value=78\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn usage_load_and_execution_failures_have_distinct_exit_codes() {
     let missing = std::env::temp_dir().join(format!(
         "worldless-cli-missing-{}-{}",

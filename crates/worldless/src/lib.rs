@@ -3,12 +3,13 @@
 //!
 //! The current slice supports function calls and returns, persistent named
 //! scoreboard state and arithmetic, command storage and NBT data operations, number
-//! providers, worldless loot predicates and `compute`, function macros and
-//! tags, supported `execute` conditions and pure context transformations, and
-//! result propagation. Supported resources can be compiled from a statically
-//! composed, ordered mixture of expanded directory data packs and in-memory
-//! packs. Construction is atomic: an invalid selected resource rejects the
-//! whole program instead of leaving a partially populated VM.
+//! providers, worldless loot predicates, `compute`, and value/reset forms of
+//! `random`, function macros and tags, supported `execute` conditions and pure
+//! context transformations, and result propagation. Supported resources can
+//! be compiled from a statically composed, ordered mixture of expanded
+//! directory data packs and in-memory packs. Construction is atomic: an invalid
+//! selected resource rejects the whole program instead of leaving a partially
+//! populated VM.
 
 mod execution_context;
 mod loader;
@@ -18,6 +19,7 @@ mod number_provider;
 mod pack;
 mod predicate;
 mod program;
+mod random;
 mod resource;
 mod resource_json;
 mod runtime;
@@ -28,8 +30,8 @@ pub use pack::{MemoryResource, Pack, ResourceKind};
 pub use runtime::{ExecutionError, FunctionOutcome};
 
 use nbt::CommandStorage;
-use number_provider::LegacyRandom;
 use program::{Program, Scoreboard};
+use random::RandomState;
 
 /// A loaded worldless data-pack program.
 #[derive(Debug)]
@@ -37,7 +39,7 @@ pub struct Vm {
     program: Program,
     scoreboard: Scoreboard,
     command_storage: CommandStorage,
-    random: LegacyRandom,
+    random: RandomState,
 }
 
 impl Vm {
@@ -47,8 +49,14 @@ impl Vm {
     /// resource replaces a lower resource with the same identifier. Tag files
     /// instead compose in pack order and may discard accumulated lower entries
     /// with their `replace` field.
-    pub fn from_packs(packs: impl IntoIterator<Item = Pack>) -> Result<Self, LoadError> {
-        loader::load_packs(packs).map(Self::new)
+    /// `world_seed` is used only to initialize named random sequences. It does
+    /// not seed the VM's unnamed random stream or represent a loaded world.
+    /// Passing `None` leaves seed-dependent sequence initialization unavailable.
+    pub fn from_packs(
+        packs: impl IntoIterator<Item = Pack>,
+        world_seed: Option<i64>,
+    ) -> Result<Self, LoadError> {
+        loader::load_packs(packs).map(|program| Self::new(program, world_seed))
     }
 
     /// Executes a function without a physical Minecraft world.
@@ -81,12 +89,12 @@ impl Vm {
         )
     }
 
-    fn new(program: Program) -> Self {
+    fn new(program: Program, world_seed: Option<i64>) -> Self {
         Self {
             program,
             scoreboard: Scoreboard::default(),
             command_storage: CommandStorage::default(),
-            random: LegacyRandom::default(),
+            random: RandomState::new(world_seed),
         }
     }
 }

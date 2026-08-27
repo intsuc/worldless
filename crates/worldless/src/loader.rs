@@ -13,11 +13,11 @@ use serde_json::{Map, Value};
 use worldless_brigadier::{
     Command, CommandDispatcher, LiteralMessage, SINGLE_SUCCESS, StringReader,
     arguments::{
-        ArgumentType, DoubleArgumentType, FloatArgumentType, IntegerArgumentType,
+        ArgumentType, BoolArgumentType, DoubleArgumentType, FloatArgumentType, IntegerArgumentType,
         StringArgumentType,
     },
     builder::{ArgumentBuilder, LiteralArgumentBuilder, RequiredArgumentBuilder},
-    context::CommandContext,
+    context::{CommandContext, ContextError},
     exceptions::{CommandSyntaxException, SimpleCommandExceptionType},
 };
 
@@ -38,10 +38,10 @@ use crate::{
     },
     program::{
         Command as CompiledCommand, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation,
-        DataSource, DataStringSubstring, FunctionArguments, Instruction, Modifier,
-        PredicateCondition, Program, ScoreComparison, ScoreCondition, ScoreHolderSet,
-        ScorePredicate, ScoreRange, ScoreReference, ScoreboardCommand, ScoreboardOperation,
-        StorageCondition, StorageNumberType, StoreKind,
+        DataSource, DataStringSubstring, FunctionArguments, Instruction, IntegerRange, Modifier,
+        PredicateCondition, Program, RandomCommand, RandomSequenceSettings, ScoreComparison,
+        ScoreCondition, ScoreHolderSet, ScorePredicate, ScoreReference, ScoreboardCommand,
+        ScoreboardOperation, StorageCondition, StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier, is_allowed_in_identifier},
     resource_json,
@@ -1327,7 +1327,7 @@ impl CommandCompiler {
             context.source().record(CompiledCommand::Function {
                 reference: function_reference(context),
                 arguments: Some(FunctionArguments::Storage {
-                    storage: storage_identifier(context, "source"),
+                    storage: identifier(context, "source"),
                     path: None,
                 }),
             })
@@ -1336,12 +1336,12 @@ impl CommandCompiler {
             context.source().record(CompiledCommand::Function {
                 reference: function_reference(context),
                 arguments: Some(FunctionArguments::Storage {
-                    storage: storage_identifier(context, "source"),
+                    storage: identifier(context, "source"),
                     path: Some(nbt_path(context, "path")),
                 }),
             })
         });
-        let storage_source = RequiredArgumentBuilder::argument("source", StorageIdentifierArgument)
+        let storage_source = RequiredArgumentBuilder::argument("source", IdentifierArgument)
             .executes(function_with_storage)
             .then(
                 RequiredArgumentBuilder::argument("path", NbtPathArgument)
@@ -1678,6 +1678,10 @@ impl CommandCompiler {
             .expect("the command tree contains no conflicting compute literal");
 
         dispatcher
+            .register(random_command_branch())
+            .expect("the command tree contains no conflicting random literal");
+
+        dispatcher
             .register(data_command_branch(Arc::clone(&loot_registry)))
             .expect("the command tree contains no conflicting data literal");
 
@@ -1909,6 +1913,148 @@ fn compute_command_branch(
         .expect("compute can contain the default context")
 }
 
+fn random_command_branch() -> LiteralArgumentBuilder<LoweringSource> {
+    let value: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Random(RandomCommand::Value {
+                range: integer_range(context, "range"),
+                sequence: None,
+            }))
+    });
+    let named_value: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Random(RandomCommand::Value {
+                range: integer_range(context, "range"),
+                sequence: Some(identifier(context, "sequence")),
+            }))
+    });
+    let reset_all: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Random(RandomCommand::ResetAll {
+                settings: None,
+            }))
+    });
+    let reset_all_with_settings: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Random(RandomCommand::ResetAll {
+                settings: Some(random_sequence_settings(context)),
+            }))
+    });
+    let reset_sequence: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Random(RandomCommand::Reset {
+                sequence: identifier(context, "sequence"),
+                settings: None,
+            }))
+    });
+    let reset_sequence_with_settings: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Random(RandomCommand::Reset {
+                sequence: identifier(context, "sequence"),
+                settings: Some(random_sequence_settings(context)),
+            }))
+    });
+    let unsupported_roll: Command<LoweringSource> = Rc::new(|_| {
+        Err(syntax_error(
+            "random roll is outside Worldless scope because it broadcasts to live players",
+        ))
+    });
+
+    let value_branch = LiteralArgumentBuilder::literal("value")
+        .then(
+            RequiredArgumentBuilder::argument("range", IntegerRangeArgument)
+                .executes(value)
+                .then(
+                    RequiredArgumentBuilder::argument("sequence", IdentifierArgument)
+                        .executes(named_value),
+                )
+                .expect("a random range can contain a sequence identifier"),
+        )
+        .expect("the random value literal can contain an integer range");
+    let reset_branch = LiteralArgumentBuilder::literal("reset")
+        .then(random_reset_settings_branch(
+            LiteralArgumentBuilder::literal("*").executes(reset_all),
+            reset_all_with_settings,
+        ))
+        .expect("the random reset literal can contain the all target")
+        .then(random_reset_settings_branch(
+            RequiredArgumentBuilder::argument("sequence", IdentifierArgument)
+                .executes(reset_sequence),
+            reset_sequence_with_settings,
+        ))
+        .expect("the random reset literal can contain a sequence target");
+    let roll_branch = LiteralArgumentBuilder::literal("roll")
+        .executes(Rc::clone(&unsupported_roll))
+        .then(
+            RequiredArgumentBuilder::argument("arguments", StringArgumentType::greedy_string())
+                .executes(unsupported_roll),
+        )
+        .expect("the unsupported roll literal can consume its arguments");
+
+    LiteralArgumentBuilder::literal("random")
+        .then(value_branch)
+        .expect("the random literal can contain value")
+        .then(reset_branch)
+        .expect("the random literal can contain reset")
+        .then(roll_branch)
+        .expect("the random literal can reject roll")
+}
+
+fn random_reset_settings_branch(
+    target: impl Into<ArgumentBuilder<LoweringSource>>,
+    executor: Command<LoweringSource>,
+) -> ArgumentBuilder<LoweringSource> {
+    target
+        .into()
+        .then(
+            RequiredArgumentBuilder::argument("seed", IntegerArgumentType::integer())
+                .executes(Rc::clone(&executor))
+                .then(
+                    RequiredArgumentBuilder::argument("includeWorldSeed", BoolArgumentType::bool())
+                        .executes(Rc::clone(&executor))
+                        .then(
+                            RequiredArgumentBuilder::argument(
+                                "includeSequenceId",
+                                BoolArgumentType::bool(),
+                            )
+                            .executes(executor),
+                        )
+                        .expect("includeWorldSeed can contain includeSequenceId"),
+                )
+                .expect("a random seed can contain includeWorldSeed"),
+        )
+        .expect("a random reset target can contain settings")
+}
+
+fn random_sequence_settings(context: &CommandContext<LoweringSource>) -> RandomSequenceSettings {
+    let salt = IntegerArgumentType::get_integer(context, "seed")
+        .expect("random reset settings are attached below their seed argument");
+    let mut settings = RandomSequenceSettings::minecraft_default(salt);
+    settings.include_world_seed =
+        optional_random_bool(context, "includeWorldSeed", settings.include_world_seed);
+    settings.include_sequence_id =
+        optional_random_bool(context, "includeSequenceId", settings.include_sequence_id);
+    settings
+}
+
+fn optional_random_bool(
+    context: &CommandContext<LoweringSource>,
+    name: &str,
+    default: bool,
+) -> bool {
+    match BoolArgumentType::get_bool(context, name) {
+        Ok(value) => value,
+        Err(ContextError::MissingArgument(_)) => default,
+        Err(error) => panic!("invalid parsed random boolean argument: {error}"),
+    }
+}
+
 type ModifyOperationFactory = fn(&CommandContext<LoweringSource>) -> DataModifyOperation;
 
 fn data_command_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuilder<LoweringSource> {
@@ -1916,7 +2062,7 @@ fn data_command_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuild
         context
             .source()
             .record(CompiledCommand::Data(DataCommand::Merge {
-                storage: storage_identifier(context, "target"),
+                storage: identifier(context, "target"),
                 value: compound_tag(context, "nbt"),
             }))
     });
@@ -1924,14 +2070,14 @@ fn data_command_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuild
         context
             .source()
             .record(CompiledCommand::Data(DataCommand::Get {
-                storage: storage_identifier(context, "target"),
+                storage: identifier(context, "target"),
             }))
     });
     let get_path: Command<LoweringSource> = Rc::new(|context| {
         context
             .source()
             .record(CompiledCommand::Data(DataCommand::GetPath {
-                storage: storage_identifier(context, "target"),
+                storage: identifier(context, "target"),
                 path: nbt_path(context, "path"),
                 scale: None,
             }))
@@ -1940,7 +2086,7 @@ fn data_command_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuild
         context
             .source()
             .record(CompiledCommand::Data(DataCommand::GetPath {
-                storage: storage_identifier(context, "target"),
+                storage: identifier(context, "target"),
                 path: nbt_path(context, "path"),
                 scale: Some(
                     DoubleArgumentType::get_double(context, "scale")
@@ -1952,7 +2098,7 @@ fn data_command_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuild
         context
             .source()
             .record(CompiledCommand::Data(DataCommand::Remove {
-                storage: storage_identifier(context, "target"),
+                storage: identifier(context, "target"),
                 path: nbt_path(context, "path"),
             }))
     });
@@ -1963,7 +2109,7 @@ fn data_command_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuild
                 .then(
                     LiteralArgumentBuilder::literal("storage")
                         .then(
-                            RequiredArgumentBuilder::argument("target", StorageIdentifierArgument)
+                            RequiredArgumentBuilder::argument("target", IdentifierArgument)
                                 .then(
                                     RequiredArgumentBuilder::argument("nbt", CompoundTagArgument)
                                         .executes(merge),
@@ -1980,7 +2126,7 @@ fn data_command_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuild
                 .then(
                     LiteralArgumentBuilder::literal("storage")
                         .then(
-                            RequiredArgumentBuilder::argument("target", StorageIdentifierArgument)
+                            RequiredArgumentBuilder::argument("target", IdentifierArgument)
                                 .executes(get)
                                 .then(
                                     RequiredArgumentBuilder::argument("path", NbtPathArgument)
@@ -2006,7 +2152,7 @@ fn data_command_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuild
                 .then(
                     LiteralArgumentBuilder::literal("storage")
                         .then(
-                            RequiredArgumentBuilder::argument("target", StorageIdentifierArgument)
+                            RequiredArgumentBuilder::argument("target", IdentifierArgument)
                                 .then(
                                     RequiredArgumentBuilder::argument("path", NbtPathArgument)
                                         .executes(remove),
@@ -2055,7 +2201,7 @@ fn data_modify_branch(loot_registry: Arc<LootRegistry>) -> LiteralArgumentBuilde
         .then(
             LiteralArgumentBuilder::literal("storage")
                 .then(
-                    RequiredArgumentBuilder::argument("target", StorageIdentifierArgument)
+                    RequiredArgumentBuilder::argument("target", IdentifierArgument)
                         .then(target_path)
                         .expect("a modify target can contain a path"),
                 )
@@ -2241,7 +2387,7 @@ fn modify_storage_source(
         .then(
             LiteralArgumentBuilder::literal("storage")
                 .then(
-                    RequiredArgumentBuilder::argument("source", StorageIdentifierArgument)
+                    RequiredArgumentBuilder::argument("source", IdentifierArgument)
                         .executes(root_command)
                         .then(source_path)
                         .expect("a storage source can contain a path"),
@@ -2257,7 +2403,7 @@ fn storage_data_source(
     path: Option<NbtPath>,
     substring: Option<DataStringSubstring>,
 ) -> DataSource {
-    let storage = storage_identifier(context, "source");
+    let storage = identifier(context, "source");
     if string {
         DataSource::String {
             storage,
@@ -2278,7 +2424,7 @@ fn record_data_modify(
     context
         .source()
         .record(CompiledCommand::Data(DataCommand::Modify {
-            storage: storage_identifier(context, "target"),
+            storage: identifier(context, "target"),
             path: nbt_path(context, "targetPath"),
             operation,
             source,
@@ -2465,7 +2611,7 @@ fn storage_data_condition_branch(
         .then(
             LiteralArgumentBuilder::literal("storage")
                 .then(
-                    RequiredArgumentBuilder::argument("source", StorageIdentifierArgument)
+                    RequiredArgumentBuilder::argument("source", IdentifierArgument)
                         .then(
                             RequiredArgumentBuilder::argument("path", NbtPathArgument)
                                 .executes(terminal)
@@ -2482,7 +2628,7 @@ fn storage_data_condition_branch(
 fn storage_condition(context: &CommandContext<LoweringSource>, expected: bool) -> StorageCondition {
     StorageCondition {
         expected,
-        storage: storage_identifier(context, "source"),
+        storage: identifier(context, "source"),
         path: nbt_path(context, "path"),
     }
 }
@@ -2548,7 +2694,7 @@ fn score_matches_condition_branch(
 
     LiteralArgumentBuilder::literal("matches")
         .then(
-            RequiredArgumentBuilder::argument("range", ScoreRangeArgument)
+            RequiredArgumentBuilder::argument("range", IntegerRangeArgument)
                 .executes(terminal)
                 .fork(execute, modifier)
                 .expect("a complete range match can redirect to execute"),
@@ -2575,15 +2721,11 @@ fn score_matches_condition(
     context: &CommandContext<LoweringSource>,
     expected: bool,
 ) -> ScoreCondition {
-    let range = context
-        .argument::<ScoreRange>("range")
-        .map(|range| *range)
-        .expect("the score condition is attached below its range argument");
     ScoreCondition {
         expected,
         predicate: ScorePredicate::Matches {
             score: score_reference(context, "target", "targetObjective"),
-            range,
+            range: integer_range(context, "range"),
         },
     }
 }
@@ -2678,7 +2820,7 @@ fn store_storage_branch(
 
     LiteralArgumentBuilder::literal("storage")
         .then(
-            RequiredArgumentBuilder::argument("target", StorageIdentifierArgument)
+            RequiredArgumentBuilder::argument("target", IdentifierArgument)
                 .then(path)
                 .expect("a storage target can contain a path"),
         )
@@ -2702,7 +2844,7 @@ fn store_storage_type_branch(
                         Ok(Rc::new(context.source().with_modifier(
                             Modifier::StoreStorage {
                                 kind,
-                                storage: storage_identifier(context, "target"),
+                                storage: identifier(context, "target"),
                                 path: nbt_path(context, "path"),
                                 number_type,
                                 scale,
@@ -2764,11 +2906,18 @@ fn axes(context: &CommandContext<LoweringSource>, name: &str) -> Axes {
         .expect("the command executor is attached below its axes argument")
 }
 
-fn storage_identifier(context: &CommandContext<LoweringSource>, name: &str) -> Identifier {
+fn identifier(context: &CommandContext<LoweringSource>, name: &str) -> Identifier {
     context
         .argument::<Identifier>(name)
         .map(|identifier| (*identifier).clone())
-        .expect("the command executor is attached below the requested storage identifier")
+        .expect("the command executor is attached below the requested resource identifier")
+}
+
+fn integer_range(context: &CommandContext<LoweringSource>, name: &str) -> IntegerRange {
+    context
+        .argument::<IntegerRange>(name)
+        .map(|range| *range)
+        .expect("the command executor is attached below the requested integer range")
 }
 
 fn nbt_path(context: &CommandContext<LoweringSource>, name: &str) -> NbtPath {
@@ -3009,9 +3158,9 @@ fn coordinate_error(reader: &StringReader, message: &'static str) -> CommandSynt
 }
 
 #[derive(Clone, Copy)]
-struct StorageIdentifierArgument;
+struct IdentifierArgument;
 
-impl ArgumentType<LoweringSource> for StorageIdentifierArgument {
+impl ArgumentType<LoweringSource> for IdentifierArgument {
     type Value = Identifier;
 
     fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
@@ -3025,7 +3174,7 @@ impl ArgumentType<LoweringSource> for StorageIdentifierArgument {
         } else {
             reader.set_cursor(start);
             Err(
-                SimpleCommandExceptionType::new(LiteralMessage::new("invalid storage identifier"))
+                SimpleCommandExceptionType::new(LiteralMessage::new("invalid resource identifier"))
                     .create_with_context(reader),
             )
         }
@@ -3301,33 +3450,33 @@ impl ArgumentType<LoweringSource> for ScoreboardOperationArgument {
 }
 
 #[derive(Clone, Copy)]
-struct ScoreRangeArgument;
+struct IntegerRangeArgument;
 
-impl ArgumentType<LoweringSource> for ScoreRangeArgument {
-    type Value = ScoreRange;
+impl ArgumentType<LoweringSource> for IntegerRangeArgument {
+    type Value = IntegerRange;
 
     fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
         let start = reader.cursor();
         let parsed = (|| {
-            let min = parse_score_range_bound(reader)?;
+            let min = parse_integer_range_bound(reader)?;
             let max = if reader.can_read_n(2)
                 && reader.peek() == b'.' as u16
                 && reader.peek_offset(1) == b'.' as u16
             {
                 reader.skip();
                 reader.skip();
-                parse_score_range_bound(reader)?
+                parse_integer_range_bound(reader)?
             } else {
                 min
             };
 
             if min.is_none() && max.is_none() {
-                return Err("empty score range");
+                return Err("empty integer range");
             }
             if min.zip(max).is_some_and(|(min, max)| min > max) {
-                return Err("swapped score range bounds");
+                return Err("swapped integer range bounds");
             }
-            Ok(ScoreRange { min, max })
+            Ok(IntegerRange { min, max })
         })();
 
         parsed.map_err(|message| {
@@ -3349,9 +3498,9 @@ impl ArgumentType<LoweringSource> for ScoreRangeArgument {
     }
 }
 
-fn parse_score_range_bound(reader: &mut StringReader) -> Result<Option<i32>, &'static str> {
+fn parse_integer_range_bound(reader: &mut StringReader) -> Result<Option<i32>, &'static str> {
     let start = reader.cursor();
-    while reader.can_read() && is_allowed_score_range_number(reader) {
+    while reader.can_read() && is_allowed_integer_range_number(reader) {
         reader.skip();
     }
     if start == reader.cursor() {
@@ -3361,10 +3510,10 @@ fn parse_score_range_bound(reader: &mut StringReader) -> Result<Option<i32>, &'s
         .substring(start, reader.cursor())
         .parse()
         .map(Some)
-        .map_err(|_| "invalid integer in score range")
+        .map_err(|_| "invalid integer in integer range")
 }
 
-fn is_allowed_score_range_number(reader: &StringReader) -> bool {
+fn is_allowed_integer_range_number(reader: &StringReader) -> bool {
     match reader.peek() {
         unit if matches!(unit, 0x30..=0x39) || unit == b'-' as u16 => true,
         unit if unit == b'.' as u16 => {
@@ -3724,6 +3873,83 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn compiler_lowers_random_value_and_reset_forms() {
+        let compiler = CommandCompiler::new();
+
+        assert!(matches!(
+            compiler.compile("random value -4..9").unwrap().command,
+            CompiledCommand::Random(RandomCommand::Value {
+                range: IntegerRange {
+                    min: Some(-4),
+                    max: Some(9)
+                },
+                sequence: None
+            })
+        ));
+        assert!(matches!(
+            compiler
+                .compile("random value ..9 example:sequence")
+                .unwrap()
+                .command,
+            CompiledCommand::Random(RandomCommand::Value {
+                range: IntegerRange {
+                    min: None,
+                    max: Some(9)
+                },
+                sequence: Some(ref sequence)
+            }) if sequence.to_string() == "example:sequence"
+        ));
+        assert!(matches!(
+            compiler.compile("random reset *").unwrap().command,
+            CompiledCommand::Random(RandomCommand::ResetAll { settings: None })
+        ));
+        assert!(matches!(
+            compiler.compile("random reset * -7 false").unwrap().command,
+            CompiledCommand::Random(RandomCommand::ResetAll {
+                settings: Some(RandomSequenceSettings {
+                    salt: -7,
+                    include_world_seed: false,
+                    include_sequence_id: true
+                })
+            })
+        ));
+        assert!(matches!(
+            compiler
+                .compile("random reset sequence 12 true false")
+                .unwrap()
+                .command,
+            CompiledCommand::Random(RandomCommand::Reset {
+                ref sequence,
+                settings: Some(RandomSequenceSettings {
+                    salt: 12,
+                    include_world_seed: true,
+                    include_sequence_id: false
+                })
+            }) if sequence.to_string() == "minecraft:sequence"
+        ));
+
+        for valid_runtime_error in ["random value 5", "random value -1073741824..1073741823"] {
+            assert!(compiler.compile(valid_runtime_error).is_ok());
+        }
+        for invalid in [
+            "random value ..",
+            "random value 5..4",
+            "random value 1..2 Invalid:sequence",
+            "random reset",
+            "random reset * 0 maybe",
+            "random reset sequence 0 true false extra",
+        ] {
+            assert!(compiler.compile(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert!(
+            compiler
+                .compile("random roll 1..2 example:sequence")
+                .unwrap_err()
+                .contains("outside Worldless scope")
+        );
     }
 
     #[test]

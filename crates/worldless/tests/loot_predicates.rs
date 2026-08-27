@@ -74,12 +74,15 @@ fn resources(
     let predicate_tags = predicate_tags
         .iter()
         .map(|(id, source)| MemoryResource::new(ResourceKind::PredicateTag, *id, *source));
-    Vm::from_packs([Pack::memory(
-        functions
-            .chain(number_providers)
-            .chain(predicates)
-            .chain(predicate_tags),
-    )])
+    Vm::from_packs(
+        [Pack::memory(
+            functions
+                .chain(number_providers)
+                .chain(predicates)
+                .chain(predicate_tags),
+        )],
+        None,
+    )
 }
 
 fn compile(
@@ -298,7 +301,7 @@ fn directory_loader_reads_predicate_resources_and_tags() {
         r#"{"values":["example:falsehood","example:truth"]}"#,
     );
 
-    let mut vm = Vm::from_packs([Pack::directory(pack.root())]).unwrap();
+    let mut vm = Vm::from_packs([Pack::directory(pack.root())], None).unwrap();
     assert_function(&mut vm, "example:main", returned(true, 7));
 }
 
@@ -309,7 +312,7 @@ fn directory_loader_reports_the_invalid_predicate_path_and_reason() {
     pack.write(relative_path, r#"{"type":"all_of"}"#);
     let expected_path = pack.root().join(relative_path);
 
-    match Vm::from_packs([Pack::directory(pack.root())]).unwrap_err() {
+    match Vm::from_packs([Pack::directory(pack.root())], None).unwrap_err() {
         LoadError::InvalidPredicate { origin, reason } => {
             assert_eq!(origin, ResourceOrigin::Directory(expected_path));
             assert_eq!(reason, "`root` is missing field `terms`");

@@ -2,10 +2,11 @@ use crate::{
     execution_context::ExecutionContext,
     nbt::{CommandStorage, Tag},
     number_provider::{
-        Input, LegacyRandom, LootRegistry, NumberProviderReference, ascii_string, identifier_field,
-        int_value, parse_reference as parse_number_provider_reference, required_field,
+        Input, LootRegistry, NumberProviderReference, ascii_string, identifier_field, int_value,
+        parse_reference as parse_number_provider_reference, required_field,
     },
     program::Scoreboard,
+    random::LegacyRandom,
     resource::Identifier,
     resource_json,
 };

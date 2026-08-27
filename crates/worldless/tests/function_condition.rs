@@ -21,9 +21,12 @@ where
     N: AsRef<str>,
     S: AsRef<str>,
 {
-    Vm::from_packs([Pack::memory(functions.into_iter().map(|(id, source)| {
-        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
-    }))])
+    Vm::from_packs(
+        [Pack::memory(functions.into_iter().map(|(id, source)| {
+            MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+        }))],
+        None,
+    )
 }
 
 fn load_functions_and_tags<FI, FN, FS, TI, TN, TS>(functions: FI, tags: TI) -> Result<Vm, LoadError>
@@ -41,7 +44,7 @@ where
     let tags = tags.into_iter().map(|(id, source)| {
         MemoryResource::new(ResourceKind::FunctionTag, id.as_ref(), source.as_ref())
     });
-    Vm::from_packs([Pack::memory(functions.chain(tags))])
+    Vm::from_packs([Pack::memory(functions.chain(tags))], None)
 }
 
 #[test]

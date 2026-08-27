@@ -31,7 +31,7 @@ fn location(id: &str, x: &str, y: &str, z: &str) -> MemoryResource {
 }
 
 fn compile(resources: impl IntoIterator<Item = MemoryResource>) -> Vm {
-    Vm::from_packs([Pack::memory(resources)]).unwrap()
+    Vm::from_packs([Pack::memory(resources)], None).unwrap()
 }
 
 fn context(x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> ExecutionContext {

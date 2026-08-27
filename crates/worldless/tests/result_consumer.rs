@@ -17,9 +17,12 @@ where
     N: AsRef<str>,
     S: AsRef<str>,
 {
-    Vm::from_packs([Pack::memory(functions.into_iter().map(|(id, source)| {
-        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
-    }))])
+    Vm::from_packs(
+        [Pack::memory(functions.into_iter().map(|(id, source)| {
+            MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+        }))],
+        None,
+    )
 }
 
 #[test]

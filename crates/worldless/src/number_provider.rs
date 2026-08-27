@@ -10,6 +10,7 @@ use crate::{
         parse_reference as parse_predicate_reference,
     },
     program::Scoreboard,
+    random::LegacyRandom,
     resource::Identifier,
     resource_json,
 };
@@ -76,62 +77,6 @@ pub(crate) struct WeightedProvider {
 pub(crate) struct NumberDispatcherCase {
     pub(crate) condition: PredicateReference,
     pub(crate) number_provider: NumberProviderReference,
-}
-
-#[derive(Debug)]
-pub(crate) struct LegacyRandom {
-    seed: u64,
-}
-
-impl LegacyRandom {
-    const DEFAULT_SEED: i64 = 0;
-    const MASK: u64 = (1_u64 << 48) - 1;
-    const MULTIPLIER: u64 = 25_214_903_917;
-    const INCREMENT: u64 = 11;
-
-    fn new(seed: i64) -> Self {
-        Self {
-            seed: ((seed as u64) ^ Self::MULTIPLIER) & Self::MASK,
-        }
-    }
-
-    fn next_bits(&mut self, bits: u32) -> i32 {
-        self.seed = self
-            .seed
-            .wrapping_mul(Self::MULTIPLIER)
-            .wrapping_add(Self::INCREMENT)
-            & Self::MASK;
-        (self.seed >> (48 - bits)) as i32
-    }
-
-    pub(crate) fn next_float(&mut self) -> f32 {
-        self.next_bits(24) as f32 * 5.960_464_5e-8
-    }
-
-    fn next_int(&mut self, bound: i32) -> Result<i32, String> {
-        if bound <= 0 {
-            return Err("random integer bound must be positive".to_owned());
-        }
-        if bound & bound.wrapping_sub(1) == 0 {
-            return Ok(((i64::from(bound) * i64::from(self.next_bits(31))) >> 31) as i32);
-        }
-        loop {
-            let sample = self.next_bits(31);
-            let modulo = sample % bound;
-            if sample.wrapping_sub(modulo).wrapping_add(bound - 1) >= 0 {
-                return Ok(modulo);
-            }
-        }
-    }
-}
-
-impl Default for LegacyRandom {
-    fn default() -> Self {
-        // Minecraft leaves each level's initial random seed unspecified. The
-        // compatibility contract requires Worldless to choose such results
-        // deterministically for identical VM inputs and state.
-        Self::new(Self::DEFAULT_SEED)
-    }
 }
 
 #[derive(Debug)]
