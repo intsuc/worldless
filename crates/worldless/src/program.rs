@@ -1,28 +1,36 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::macro_function::Function;
 use crate::nbt::{CompoundTag, JavaString, NbtPath, Tag};
+use crate::number_provider::{NumberProviderReference, NumberProviderRegistry};
 use crate::resource::{FunctionReference, Identifier};
 
 #[derive(Debug)]
 pub(crate) struct Program {
     functions: HashMap<Identifier, Function>,
     function_tags: HashMap<Identifier, Vec<Identifier>>,
+    number_providers: Arc<NumberProviderRegistry>,
 }
 
 impl Program {
     pub(crate) fn new(
         functions: HashMap<Identifier, Function>,
         function_tags: HashMap<Identifier, Vec<Identifier>>,
+        number_providers: Arc<NumberProviderRegistry>,
     ) -> Self {
         Self {
             functions,
             function_tags,
+            number_providers,
         }
     }
 
     pub(crate) fn function(&self, id: &Identifier) -> Option<&Function> {
         self.functions.get(id)
+    }
+
+    pub(crate) fn number_providers(&self) -> &Arc<NumberProviderRegistry> {
+        &self.number_providers
     }
 
     pub(crate) fn resolve_functions(
@@ -93,6 +101,19 @@ pub(crate) enum Command {
     Condition(ScoreCondition),
     StorageCondition(StorageCondition),
     Data(DataCommand),
+    Compute(ComputeCommand),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ComputeCommand {
+    pub(crate) provider: NumberProviderReference,
+    pub(crate) mode: ComputeMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ComputeMode {
+    Float { scale: f32 },
+    Integer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,7 +175,7 @@ pub(crate) enum DataModifyOperation {
     Merge,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum DataSource {
     Value(Tag),
     Storage {
@@ -165,6 +186,10 @@ pub(crate) enum DataSource {
         storage: Identifier,
         path: Option<NbtPath>,
         substring: Option<DataStringSubstring>,
+    },
+    Compute {
+        provider: NumberProviderReference,
+        integer: bool,
     },
 }
 

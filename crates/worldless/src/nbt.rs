@@ -1512,6 +1512,14 @@ impl NbtPath {
         }
     }
 
+    pub(crate) fn parse_codec(reader: &mut StringReader) -> Result<Self, String> {
+        if !reader.can_read() || reader.peek() == 0x20 {
+            Ok(Self { nodes: Vec::new() })
+        } else {
+            Self::parse(reader)
+        }
+    }
+
     pub(crate) fn get(&self, root: &CompoundTag) -> Result<Vec<Tag>, String> {
         let mut current = vec![Tag::Compound(root.clone())];
         for node in &self.nodes {
@@ -2205,6 +2213,10 @@ pub(crate) struct CommandStorage {
 }
 
 impl CommandStorage {
+    pub(crate) fn get_ref(&self, id: &Identifier) -> Option<&CompoundTag> {
+        self.values.get(id)
+    }
+
     pub(crate) fn get(&self, id: &Identifier) -> CompoundTag {
         self.values.get(id).cloned().unwrap_or_default()
     }

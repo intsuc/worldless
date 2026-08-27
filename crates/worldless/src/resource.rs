@@ -27,6 +27,14 @@ impl Identifier {
                 path: path.to_owned(),
             })
     }
+
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 impl fmt::Display for Identifier {

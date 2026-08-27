@@ -2,17 +2,20 @@
 //! data packs.
 //!
 //! The current slice supports function calls and returns, persistent named
-//! scoreboard arithmetic, command storage and NBT data operations, function
-//! macros and tags, supported `execute` conditions, and result propagation.
-//! Functions and tags can be compiled from an expanded directory data pack or
-//! in-memory source. Construction is atomic: an invalid supported resource
-//! rejects the whole program instead of leaving a partially populated VM.
+//! scoreboard arithmetic, command storage and NBT data operations, number
+//! providers and `compute`, function macros and tags, supported `execute`
+//! conditions, and result propagation. Supported resources can be compiled
+//! from an expanded directory data pack or in-memory source. Construction is
+//! atomic: an invalid supported resource rejects the whole program instead of
+//! leaving a partially populated VM.
 
 mod loader;
 mod macro_function;
 mod nbt;
+mod number_provider;
 mod program;
 mod resource;
+mod resource_json;
 mod runtime;
 
 use std::path::Path;
@@ -21,6 +24,7 @@ pub use loader::{CompileError, LoadError};
 pub use runtime::{ExecutionError, FunctionOutcome};
 
 use nbt::CommandStorage;
+use number_provider::LegacyRandom;
 use program::{Program, Scoreboard};
 
 /// A loaded worldless data-pack program.
@@ -29,6 +33,7 @@ pub struct Vm {
     program: Program,
     scoreboard: Scoreboard,
     command_storage: CommandStorage,
+    random: LegacyRandom,
 }
 
 impl Vm {
@@ -69,6 +74,27 @@ impl Vm {
         loader::compile_functions_and_tags(functions, function_tags).map(Self::new)
     }
 
+    /// Compiles all resource kinds currently consumed by Worldless without
+    /// reading a data pack from the file system.
+    ///
+    /// Number-provider sources use the JSON representation from
+    /// `data/<namespace>/number_provider`. Number-provider tags use the tag JSON
+    /// representation from `data/<namespace>/tags/number_provider`.
+    pub fn from_resources(
+        functions: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+        function_tags: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+        number_providers: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+        number_provider_tags: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+    ) -> Result<Self, CompileError> {
+        loader::compile_resources(
+            functions,
+            function_tags,
+            number_providers,
+            number_provider_tags,
+        )
+        .map(Self::new)
+    }
+
     /// Loads one expanded data pack from `path`.
     pub fn load_directory(path: impl AsRef<Path>) -> Result<Self, LoadError> {
         loader::load_directory(path.as_ref()).map(Self::new)
@@ -91,6 +117,7 @@ impl Vm {
             &self.program,
             &mut self.scoreboard,
             &mut self.command_storage,
+            &mut self.random,
             id,
             command_limit,
         )
@@ -101,6 +128,7 @@ impl Vm {
             program,
             scoreboard: Scoreboard::default(),
             command_storage: CommandStorage::default(),
+            random: LegacyRandom::default(),
         }
     }
 }

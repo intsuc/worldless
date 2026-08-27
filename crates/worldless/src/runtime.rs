@@ -4,10 +4,11 @@ use crate::{
     loader::CommandCompiler,
     macro_function::Function,
     nbt::{CommandStorage, JavaString, Tag},
+    number_provider::LegacyRandom,
     program::{
-        Command, DataCommand, DataModifyOperation, DataSource, FunctionArguments, Instruction,
-        Modifier, Program, ResolvedFunctions, ScoreCondition, Scoreboard, ScoreboardCommand,
-        StorageCondition, StorageNumberType, StoreKind,
+        Command, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation, DataSource,
+        FunctionArguments, Instruction, Modifier, Program, ResolvedFunctions, ScoreCondition,
+        Scoreboard, ScoreboardCommand, StorageCondition, StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier},
 };
@@ -27,6 +28,7 @@ pub enum ExecutionError {
     InvalidFunctionIdentifier { input: String },
     UnknownFunction { id: String },
     FunctionInstantiationFailed { id: String, reason: String },
+    NumberProviderEvaluationFailed { reason: String },
     CommandLimitExceeded { limit: usize },
 }
 
@@ -39,6 +41,9 @@ impl fmt::Display for ExecutionError {
             Self::UnknownFunction { id } => write!(formatter, "unknown function {id}"),
             Self::FunctionInstantiationFailed { id, reason } => {
                 write!(formatter, "failed to instantiate function {id}: {reason}")
+            }
+            Self::NumberProviderEvaluationFailed { reason } => {
+                write!(formatter, "number provider evaluation failed: {reason}")
             }
             Self::CommandLimitExceeded { limit } => {
                 write!(
@@ -282,6 +287,7 @@ pub(crate) fn execute(
     program: &Program,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
+    random: &mut LegacyRandom,
     input: &str,
     command_limit: usize,
 ) -> Result<FunctionOutcome, ExecutionError> {
@@ -290,12 +296,13 @@ pub(crate) fn execute(
     })?;
     let definition = find_function(program, &id)?;
     let mut compiler = None;
-    let function = instantiate_function(definition, None, &mut compiler).map_err(|reason| {
-        ExecutionError::FunctionInstantiationFailed {
-            id: id.to_string(),
-            reason,
-        }
-    })?;
+    let function =
+        instantiate_function(definition, None, &mut compiler, program.number_providers()).map_err(
+            |reason| ExecutionError::FunctionInstantiationFailed {
+                id: id.to_string(),
+                reason,
+            },
+        )?;
     let mut queue = VecDeque::from([QueueEntry::Call(Frame {
         function,
         next_instruction: 0,
@@ -567,7 +574,8 @@ pub(crate) fn execute(
                     Command::Scoreboard(_)
                     | Command::Condition(_)
                     | Command::StorageCondition(_)
-                    | Command::Data(_) => {
+                    | Command::Data(_)
+                    | Command::Compute(_) => {
                         queue.push_front(QueueEntry::ExecuteOrdinary {
                             frame,
                             instruction,
@@ -586,16 +594,28 @@ pub(crate) fn execute(
                 quota.increment();
                 let command = &frame.function[instruction].command;
                 let result = match command {
-                    Command::Scoreboard(command) => execute_scoreboard_command(scoreboard, command),
-                    Command::Condition(condition) => execute_condition(scoreboard, condition),
-                    Command::StorageCondition(condition) => {
-                        execute_storage_condition(command_storage, condition)
+                    Command::Scoreboard(command) => {
+                        Ok(execute_scoreboard_command(scoreboard, command))
                     }
-                    Command::Data(command) => execute_data_command(command_storage, command),
+                    Command::Condition(condition) => Ok(execute_condition(scoreboard, condition)),
+                    Command::StorageCondition(condition) => {
+                        Ok(execute_storage_condition(command_storage, condition))
+                    }
+                    Command::Data(command) => {
+                        execute_data_command(program, scoreboard, command_storage, random, command)
+                    }
+                    Command::Compute(command) => execute_compute_command(
+                        program,
+                        scoreboard,
+                        command_storage,
+                        random,
+                        command,
+                    ),
                     Command::Function { .. } | Command::Return { .. } => {
                         unreachable!("only ordinary commands are queued for ordinary execution")
                     }
-                };
+                }
+                .map_err(|reason| ExecutionError::NumberProviderEvaluationFailed { reason })?;
                 ResultConsumer::ignoring(stores).accept(
                     result,
                     scoreboard,
@@ -807,7 +827,7 @@ fn instantiate_resolved_prefix(
     let mut instances = Vec::new();
     match functions {
         ResolvedFunctions::Single(function) => {
-            match instantiate_function(function, arguments, compiler) {
+            match instantiate_function(function, arguments, compiler, program.number_providers()) {
                 Ok(instance) => instances.push(instance),
                 Err(_) => return (instances, true),
             }
@@ -817,7 +837,12 @@ fn instantiate_resolved_prefix(
                 let function = program
                     .function(id)
                     .expect("resolved function tags contain loaded functions");
-                match instantiate_function(function, arguments, compiler) {
+                match instantiate_function(
+                    function,
+                    arguments,
+                    compiler,
+                    program.number_providers(),
+                ) {
                     Ok(instance) => instances.push(instance),
                     Err(_) => return (instances, true),
                 }
@@ -1007,6 +1032,25 @@ fn execute_condition(scoreboard: &Scoreboard, condition: &ScoreCondition) -> Com
     }
 }
 
+fn execute_compute_command(
+    program: &Program,
+    scoreboard: &Scoreboard,
+    command_storage: &CommandStorage,
+    random: &mut LegacyRandom,
+    command: &ComputeCommand,
+) -> Result<CommandResult, String> {
+    let providers = program.number_providers();
+    let value = match command.mode {
+        ComputeMode::Float { scale } => providers
+            .get_float(&command.provider, scoreboard, command_storage, random)
+            .map(|value| (value * scale).floor() as i32),
+        ComputeMode::Integer => {
+            providers.get_int(&command.provider, scoreboard, command_storage, random)
+        }
+    };
+    value.map(CommandResult::success)
+}
+
 fn stored_command_value(kind: StoreKind, result: CommandResult) -> i32 {
     match kind {
         StoreKind::Result => result.value,
@@ -1055,9 +1099,12 @@ fn execute_storage_condition(
 }
 
 fn execute_data_command(
+    program: &Program,
+    scoreboard: &Scoreboard,
     command_storage: &mut CommandStorage,
+    random: &mut LegacyRandom,
     command: &DataCommand,
-) -> CommandResult {
+) -> Result<CommandResult, String> {
     let result = match command {
         DataCommand::Merge { storage, value } => merge_storage(command_storage, storage, value),
         DataCommand::Get { .. } => Ok(1),
@@ -1077,9 +1124,19 @@ fn execute_data_command(
             path,
             operation,
             source,
-        } => modify_storage(command_storage, storage, path, *operation, source),
+        } => {
+            let source_values =
+                match resolve_data_source(program, scoreboard, command_storage, random, source) {
+                    Ok(values) => values,
+                    Err(reason) if matches!(source, DataSource::Compute { .. }) => {
+                        return Err(reason);
+                    }
+                    Err(_) => return Ok(CommandResult::FAILURE),
+                };
+            modify_storage(command_storage, storage, path, *operation, &source_values)
+        }
     };
-    result.map_or(CommandResult::FAILURE, CommandResult::success)
+    Ok(result.map_or(CommandResult::FAILURE, CommandResult::success))
 }
 
 fn merge_storage(
@@ -1139,12 +1196,11 @@ fn modify_storage(
     storage: &Identifier,
     path: &crate::nbt::NbtPath,
     operation: DataModifyOperation,
-    source: &DataSource,
+    source: &[Tag],
 ) -> Result<i32, String> {
-    let source = resolve_data_source(command_storage, source)?;
     command_storage.edit(storage, |target| {
         let changed = match operation {
-            DataModifyOperation::Insert(index) => path.insert(index, target, &source)?,
+            DataModifyOperation::Insert(index) => path.insert(index, target, source)?,
             DataModifyOperation::Set => path.set(
                 target,
                 source
@@ -1152,7 +1208,7 @@ fn modify_storage(
                     .expect("data modification sources contain at least one value")
                     .clone(),
             )?,
-            DataModifyOperation::Merge => path.merge(target, &source)?,
+            DataModifyOperation::Merge => path.merge(target, source)?,
         };
         (changed != 0)
             .then_some(changed)
@@ -1161,7 +1217,10 @@ fn modify_storage(
 }
 
 fn resolve_data_source(
+    program: &Program,
+    scoreboard: &Scoreboard,
     command_storage: &CommandStorage,
+    random: &mut LegacyRandom,
     source: &DataSource,
 ) -> Result<Vec<Tag>, String> {
     match source {
@@ -1197,6 +1256,14 @@ fn resolve_data_source(
                 })
                 .collect()
         }
+        DataSource::Compute { provider, integer } => {
+            let providers = program.number_providers();
+            Ok(vec![if *integer {
+                Tag::Int(providers.get_int(provider, scoreboard, command_storage, random)?)
+            } else {
+                Tag::float(providers.get_float(provider, scoreboard, command_storage, random)?)
+            }])
+        }
     }
 }
 
@@ -1227,12 +1294,15 @@ fn instantiate_function(
     function: &Function,
     arguments: Option<&crate::nbt::CompoundTag>,
     compiler: &mut Option<CommandCompiler>,
+    number_providers: &Arc<crate::number_provider::NumberProviderRegistry>,
 ) -> Result<Arc<[Instruction]>, String> {
     match function {
         Function::Plain(instructions) => Ok(Arc::clone(instructions)),
         Function::Macro(function) => function.instantiate(arguments, |command| {
             compiler
-                .get_or_insert_with(CommandCompiler::new)
+                .get_or_insert_with(|| {
+                    CommandCompiler::with_number_providers(Arc::clone(number_providers))
+                })
                 .compile_utf16(command)
         }),
     }

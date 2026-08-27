@@ -293,16 +293,20 @@ fn directory_loader_reports_invalid_function_tags() {
 
 #[test]
 fn rejects_unsupported_pack_features() {
-    let pack = TestPack::new();
-    fs::write(
-        pack.root().join("pack.mcmeta"),
-        r#"{"pack":{"description":"test","min_format":118,"max_format":118},"overlays":{"entries":[]}}"#,
-    )
-    .unwrap();
-    assert!(matches!(
-        Vm::load_directory(pack.root()),
-        Err(LoadError::UnsupportedPack { .. })
-    ));
+    for extra in [r#""overlays":{"entries":[]}"#, r#""filter":{"block":[]}"#] {
+        let pack = TestPack::new();
+        fs::write(
+            pack.root().join("pack.mcmeta"),
+            format!(
+                r#"{{"pack":{{"description":"test","min_format":118,"max_format":118}},{extra}}}"#
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            Vm::load_directory(pack.root()),
+            Err(LoadError::UnsupportedPack { .. })
+        ));
+    }
 }
 
 #[test]

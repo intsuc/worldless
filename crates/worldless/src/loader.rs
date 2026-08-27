@@ -5,12 +5,16 @@ use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
 };
 
 use serde_json::{Map, Value};
 use worldless_brigadier::{
     Command, CommandDispatcher, LiteralMessage, SINGLE_SUCCESS, StringReader,
-    arguments::{ArgumentType, DoubleArgumentType, IntegerArgumentType, StringArgumentType},
+    arguments::{
+        ArgumentType, DoubleArgumentType, FloatArgumentType, IntegerArgumentType,
+        StringArgumentType,
+    },
     builder::{ArgumentBuilder, LiteralArgumentBuilder, RequiredArgumentBuilder},
     context::CommandContext,
     exceptions::{CommandSyntaxException, SimpleCommandExceptionType},
@@ -19,13 +23,18 @@ use worldless_brigadier::{
 use crate::{
     macro_function::{Function, FunctionBuilder, MAX_COMMAND_LENGTH},
     nbt::{CompoundTag, JavaString, NbtPath, Tag, parse_compound, parse_path, parse_tag},
+    number_provider::{
+        NumberProviderReference, NumberProviderRegistry, RegistryValidationError, parse_inline_tag,
+        parse_json as parse_number_provider_json,
+    },
     program::{
-        Command as CompiledCommand, DataCommand, DataModifyOperation, DataSource,
-        DataStringSubstring, FunctionArguments, Instruction, Modifier, Program, ScoreComparison,
-        ScoreCondition, ScorePredicate, ScoreRange, ScoreReference, ScoreboardCommand,
-        ScoreboardOperation, StorageCondition, StorageNumberType, StoreKind,
+        Command as CompiledCommand, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation,
+        DataSource, DataStringSubstring, FunctionArguments, Instruction, Modifier, Program,
+        ScoreComparison, ScoreCondition, ScorePredicate, ScoreRange, ScoreReference,
+        ScoreboardCommand, ScoreboardOperation, StorageCondition, StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier, is_allowed_in_identifier},
+    resource_json,
 };
 
 const TARGET_PACK_FORMAT: PackFormat = PackFormat {
@@ -58,9 +67,21 @@ pub enum LoadError {
         path: PathBuf,
         reason: String,
     },
+    InvalidNumberProvider {
+        path: PathBuf,
+        reason: String,
+    },
+    InvalidNumberProviderTag {
+        path: PathBuf,
+        reason: String,
+    },
+    UnsupportedResource {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
-/// An error encountered while compiling in-memory function source.
+/// An error encountered while compiling in-memory data-pack resources.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompileError {
     InvalidFunctionIdentifier {
@@ -81,6 +102,26 @@ pub enum CompileError {
         id: String,
     },
     InvalidFunctionTag {
+        id: String,
+        reason: String,
+    },
+    InvalidNumberProviderIdentifier {
+        input: String,
+    },
+    DuplicateNumberProvider {
+        id: String,
+    },
+    InvalidNumberProvider {
+        id: String,
+        reason: String,
+    },
+    InvalidNumberProviderTagIdentifier {
+        input: String,
+    },
+    DuplicateNumberProviderTag {
+        id: String,
+    },
+    InvalidNumberProviderTag {
         id: String,
         reason: String,
     },
@@ -109,6 +150,27 @@ impl fmt::Display for CompileError {
             }
             Self::InvalidFunctionTag { id, reason } => {
                 write!(formatter, "invalid function tag `{id}`: {reason}")
+            }
+            Self::InvalidNumberProviderIdentifier { input } => {
+                write!(formatter, "invalid number provider identifier `{input}`")
+            }
+            Self::DuplicateNumberProvider { id } => {
+                write!(formatter, "duplicate number provider `{id}`")
+            }
+            Self::InvalidNumberProvider { id, reason } => {
+                write!(formatter, "invalid number provider `{id}`: {reason}")
+            }
+            Self::InvalidNumberProviderTagIdentifier { input } => {
+                write!(
+                    formatter,
+                    "invalid number provider tag identifier `{input}`"
+                )
+            }
+            Self::DuplicateNumberProviderTag { id } => {
+                write!(formatter, "duplicate number provider tag `{id}`")
+            }
+            Self::InvalidNumberProviderTag { id, reason } => {
+                write!(formatter, "invalid number provider tag `{id}`: {reason}")
             }
         }
     }
@@ -144,6 +206,23 @@ impl fmt::Display for LoadError {
                 "invalid function tag {}: {reason}",
                 path.display()
             ),
+            Self::InvalidNumberProvider { path, reason } => write!(
+                formatter,
+                "invalid number provider {}: {reason}",
+                path.display()
+            ),
+            Self::InvalidNumberProviderTag { path, reason } => write!(
+                formatter,
+                "invalid number provider tag {}: {reason}",
+                path.display()
+            ),
+            Self::UnsupportedResource { path, reason } => {
+                write!(
+                    formatter,
+                    "unsupported resource {}: {reason}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -165,12 +244,120 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
     }
     validate_pack_metadata(root)?;
 
-    let compiler = CommandCompiler::new();
-    let mut functions = HashMap::new();
-    let mut unresolved_tags = HashMap::new();
-    let mut tag_paths = HashMap::new();
     let data = root.join("data");
-    for namespace_dir in child_directories(&data)? {
+    let namespace_dirs = child_directories(&data)?;
+    let mut number_providers = HashMap::new();
+    let mut number_provider_paths = HashMap::new();
+    let mut unresolved_number_provider_tags = HashMap::new();
+    let mut number_provider_tag_paths = HashMap::new();
+    for namespace_dir in &namespace_dirs {
+        let Some(namespace) = namespace_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if Identifier::from_parts(namespace, "").is_none() {
+            continue;
+        }
+
+        if namespace == "minecraft" {
+            let predicate_root = namespace_dir.join("predicate");
+            for path in regular_files_recursive(&predicate_root)? {
+                if resource_path(&predicate_root, &path).as_deref()
+                    == Some("block/fast_cooking.json")
+                {
+                    return Err(LoadError::UnsupportedResource {
+                        path,
+                        reason: "overrides the predicate used by vanilla cooking number providers"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+
+        let provider_root = namespace_dir.join("number_provider");
+        for path in regular_files_recursive(&provider_root)? {
+            let Some(relative) = resource_path(&provider_root, &path) else {
+                continue;
+            };
+            if !relative.ends_with(".json") {
+                continue;
+            }
+            let full_resource_path = format!("number_provider/{relative}");
+            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
+                continue;
+            }
+            let provider_path = &relative[..relative.len() - ".json".len()];
+            let id = Identifier::from_parts(namespace, provider_path)
+                .expect("removing a valid suffix preserves an identifier path");
+            let contents = read_to_string(&path)?;
+            let provider = parse_number_provider_json(&contents).map_err(|reason| {
+                LoadError::InvalidNumberProvider {
+                    path: path.clone(),
+                    reason,
+                }
+            })?;
+            number_provider_paths.insert(id.clone(), path);
+            number_providers.insert(id, provider);
+        }
+
+        let tag_root = namespace_dir.join("tags/number_provider");
+        for path in regular_files_recursive(&tag_root)? {
+            let Some(relative) = resource_path(&tag_root, &path) else {
+                continue;
+            };
+            if !relative.ends_with(".json") {
+                continue;
+            }
+            let full_resource_path = format!("tags/number_provider/{relative}");
+            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
+                continue;
+            }
+            let tag_path = &relative[..relative.len() - ".json".len()];
+            let id = Identifier::from_parts(namespace, tag_path)
+                .expect("removing a valid suffix preserves an identifier path");
+            let contents = read_to_string(&path)?;
+            let tag = parse_resource_tag(&contents).map_err(|reason| {
+                LoadError::InvalidNumberProviderTag {
+                    path: path.clone(),
+                    reason,
+                }
+            })?;
+            number_provider_tag_paths.insert(id.clone(), path);
+            unresolved_number_provider_tags.insert(id, tag);
+        }
+    }
+
+    let mut provider_ids = NumberProviderRegistry::empty().provider_ids();
+    provider_ids.extend(number_providers.keys().cloned());
+    let number_provider_tags = resolve_resource_tags(
+        &provider_ids,
+        &unresolved_number_provider_tags,
+        "number provider",
+        "number provider tag",
+    )
+    .map_err(|error| LoadError::InvalidNumberProviderTag {
+        path: number_provider_tag_paths
+            .get(&error.tag)
+            .expect("every unresolved directory tag has a source path")
+            .clone(),
+        reason: error.reason,
+    })?;
+    let number_providers = Arc::new(
+        NumberProviderRegistry::new(number_providers, number_provider_tags).map_err(
+            |RegistryValidationError { provider, reason }| LoadError::InvalidNumberProvider {
+                path: number_provider_paths
+                    .get(&provider)
+                    .expect("supported built-in number providers are valid")
+                    .clone(),
+                reason,
+            },
+        )?,
+    );
+
+    let compiler = CommandCompiler::with_number_providers(Arc::clone(&number_providers));
+    let mut functions = HashMap::new();
+    let mut unresolved_function_tags = HashMap::new();
+    let mut function_tag_paths = HashMap::new();
+    for namespace_dir in namespace_dirs {
         let Some(namespace) = namespace_dir.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
@@ -221,25 +408,30 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
                 .expect("removing a valid suffix preserves an identifier path");
             let contents = read_to_string(&path)?;
             let tag =
-                parse_function_tag(&contents).map_err(|reason| LoadError::InvalidFunctionTag {
+                parse_resource_tag(&contents).map_err(|reason| LoadError::InvalidFunctionTag {
                     path: path.clone(),
                     reason,
                 })?;
-            tag_paths.insert(id.clone(), path);
-            unresolved_tags.insert(id, tag);
+            function_tag_paths.insert(id.clone(), path);
+            unresolved_function_tags.insert(id, tag);
         }
     }
 
-    let function_tags = resolve_function_tags(&functions, &unresolved_tags).map_err(|error| {
-        LoadError::InvalidFunctionTag {
-            path: tag_paths
-                .get(&error.tag)
-                .expect("every unresolved directory tag has a source path")
-                .clone(),
-            reason: error.reason,
-        }
+    let function_ids = functions.keys().cloned().collect();
+    let function_tags = resolve_resource_tags(
+        &function_ids,
+        &unresolved_function_tags,
+        "function",
+        "function tag",
+    )
+    .map_err(|error| LoadError::InvalidFunctionTag {
+        path: function_tag_paths
+            .get(&error.tag)
+            .expect("every unresolved directory tag has a source path")
+            .clone(),
+        reason: error.reason,
     })?;
-    Ok(Program::new(functions, function_tags))
+    Ok(Program::new(functions, function_tags, number_providers))
 }
 
 pub(crate) fn compile_functions<I, N, S>(functions: I) -> Result<Program, CompileError>
@@ -248,8 +440,10 @@ where
     N: AsRef<str>,
     S: AsRef<str>,
 {
-    compile_functions_and_tags(
+    compile_resources(
         functions,
+        std::iter::empty::<(&'static str, &'static str)>(),
+        std::iter::empty::<(&'static str, &'static str)>(),
         std::iter::empty::<(&'static str, &'static str)>(),
     )
 }
@@ -266,7 +460,101 @@ where
     TN: AsRef<str>,
     TS: AsRef<str>,
 {
-    let compiler = CommandCompiler::new();
+    compile_resources(
+        functions,
+        function_tags,
+        std::iter::empty::<(&'static str, &'static str)>(),
+        std::iter::empty::<(&'static str, &'static str)>(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_resources<FI, FN, FS, FTI, FTN, FTS, NPI, NPN, NPS, NPTI, NPTN, NPTS>(
+    functions: FI,
+    function_tags: FTI,
+    number_providers: NPI,
+    number_provider_tags: NPTI,
+) -> Result<Program, CompileError>
+where
+    FI: IntoIterator<Item = (FN, FS)>,
+    FN: AsRef<str>,
+    FS: AsRef<str>,
+    FTI: IntoIterator<Item = (FTN, FTS)>,
+    FTN: AsRef<str>,
+    FTS: AsRef<str>,
+    NPI: IntoIterator<Item = (NPN, NPS)>,
+    NPN: AsRef<str>,
+    NPS: AsRef<str>,
+    NPTI: IntoIterator<Item = (NPTN, NPTS)>,
+    NPTN: AsRef<str>,
+    NPTS: AsRef<str>,
+{
+    let mut providers = HashMap::new();
+    for (raw_id, source) in number_providers {
+        let raw_id = raw_id.as_ref();
+        let id = Identifier::parse(raw_id).ok_or_else(|| {
+            CompileError::InvalidNumberProviderIdentifier {
+                input: raw_id.to_owned(),
+            }
+        })?;
+        match providers.entry(id) {
+            Entry::Occupied(entry) => {
+                return Err(CompileError::DuplicateNumberProvider {
+                    id: entry.key().to_string(),
+                });
+            }
+            Entry::Vacant(entry) => {
+                let id = entry.key().to_string();
+                let provider = parse_number_provider_json(source.as_ref())
+                    .map_err(|reason| CompileError::InvalidNumberProvider { id, reason })?;
+                entry.insert(provider);
+            }
+        }
+    }
+
+    let mut unresolved_provider_tags = HashMap::new();
+    for (raw_id, source) in number_provider_tags {
+        let raw_id = raw_id.as_ref();
+        let id = Identifier::parse(raw_id).ok_or_else(|| {
+            CompileError::InvalidNumberProviderTagIdentifier {
+                input: raw_id.to_owned(),
+            }
+        })?;
+        match unresolved_provider_tags.entry(id) {
+            Entry::Occupied(entry) => {
+                return Err(CompileError::DuplicateNumberProviderTag {
+                    id: entry.key().to_string(),
+                });
+            }
+            Entry::Vacant(entry) => {
+                let id = entry.key().to_string();
+                let tag = parse_resource_tag(source.as_ref())
+                    .map_err(|reason| CompileError::InvalidNumberProviderTag { id, reason })?;
+                entry.insert(tag);
+            }
+        }
+    }
+    let mut provider_ids = NumberProviderRegistry::empty().provider_ids();
+    provider_ids.extend(providers.keys().cloned());
+    let provider_tags = resolve_resource_tags(
+        &provider_ids,
+        &unresolved_provider_tags,
+        "number provider",
+        "number provider tag",
+    )
+    .map_err(|error| CompileError::InvalidNumberProviderTag {
+        id: error.tag.to_string(),
+        reason: error.reason,
+    })?;
+    let number_providers = Arc::new(
+        NumberProviderRegistry::new(providers, provider_tags).map_err(
+            |RegistryValidationError { provider, reason }| CompileError::InvalidNumberProvider {
+                id: provider.to_string(),
+                reason,
+            },
+        )?,
+    );
+    let compiler = CommandCompiler::with_number_providers(Arc::clone(&number_providers));
     let mut compiled = HashMap::new();
     for (raw_id, source) in functions {
         let raw_id = raw_id.as_ref();
@@ -310,95 +598,103 @@ where
             }
             Entry::Vacant(entry) => {
                 let id = entry.key().to_string();
-                let tag = parse_function_tag(source.as_ref())
+                let tag = parse_resource_tag(source.as_ref())
                     .map_err(|reason| CompileError::InvalidFunctionTag { id, reason })?;
                 entry.insert(tag);
             }
         }
     }
-    let function_tags = resolve_function_tags(&compiled, &unresolved_tags).map_err(|error| {
-        CompileError::InvalidFunctionTag {
-            id: error.tag.to_string(),
-            reason: error.reason,
-        }
-    })?;
-    Ok(Program::new(compiled, function_tags))
+    let function_ids = compiled.keys().cloned().collect();
+    let function_tags =
+        resolve_resource_tags(&function_ids, &unresolved_tags, "function", "function tag")
+            .map_err(|error| CompileError::InvalidFunctionTag {
+                id: error.tag.to_string(),
+                reason: error.reason,
+            })?;
+    Ok(Program::new(compiled, function_tags, number_providers))
 }
 
 #[derive(Debug)]
-struct UnresolvedFunctionTag {
-    entries: Vec<FunctionTagEntry>,
+struct UnresolvedResourceTag {
+    entries: Vec<ResourceTagEntry>,
 }
 
 #[derive(Debug)]
-struct FunctionTagEntry {
-    reference: FunctionReference,
+struct ResourceTagEntry {
+    reference: ResourceTagReference,
     required: bool,
 }
 
 #[derive(Debug)]
-struct FunctionTagResolutionError {
+enum ResourceTagReference {
+    Element(Identifier),
+    Tag(Identifier),
+}
+
+#[derive(Debug)]
+struct ResourceTagResolutionError {
     tag: Identifier,
     reason: String,
 }
 
-fn parse_function_tag(contents: &str) -> Result<UnresolvedFunctionTag, String> {
-    let value: Value =
-        serde_json::from_str(contents).map_err(|error| format!("invalid JSON: {error}"))?;
+fn parse_resource_tag(contents: &str) -> Result<UnresolvedResourceTag, String> {
+    let value = resource_json::parse(contents)?;
     let object = value
         .as_object()
         .ok_or_else(|| "the root value must be an object".to_owned())?;
-    if object
-        .get("replace")
-        .is_some_and(|value| !value.is_boolean())
-    {
+    if resource_json::field(object, "replace").is_some_and(|value| !value.is_boolean()) {
         return Err("`replace` must be a boolean".to_owned());
     }
-    let values = object
-        .get("values")
+    let values = resource_json::field(object, "values")
         .and_then(Value::as_array)
         .ok_or_else(|| "missing array field `values`".to_owned())?;
     let entries = values
         .iter()
         .enumerate()
-        .map(|(index, value)| parse_function_tag_entry(index, value))
+        .map(|(index, value)| parse_resource_tag_entry(index, value))
         .collect::<Result<_, _>>()?;
-    Ok(UnresolvedFunctionTag { entries })
+    Ok(UnresolvedResourceTag { entries })
 }
 
-fn parse_function_tag_entry(index: usize, value: &Value) -> Result<FunctionTagEntry, String> {
+fn parse_resource_tag_entry(index: usize, value: &Value) -> Result<ResourceTagEntry, String> {
     let (raw_id, required) = match value {
-        Value::String(id) => (id.as_str(), true),
+        Value::String(id) => (resource_json::decode_string(id).to_string_lossy(), true),
         Value::Object(object) => {
-            let id = object
-                .get("id")
+            let id = resource_json::field(object, "id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("`values[{index}].id` must be a string"))?;
-            let required = match object.get("required") {
+            let required = match resource_json::field(object, "required") {
                 Some(Value::Bool(required)) => *required,
                 Some(_) => {
                     return Err(format!("`values[{index}].required` must be a boolean"));
                 }
                 None => true,
             };
-            (id, required)
+            (resource_json::decode_string(id).to_string_lossy(), required)
         }
         _ => {
             return Err(format!("`values[{index}]` must be a string or an object"));
         }
     };
-    let reference = FunctionReference::parse(raw_id)
+    let reference = raw_id
+        .strip_prefix('#')
+        .map_or_else(
+            || Identifier::parse(&raw_id).map(ResourceTagReference::Element),
+            |id| Identifier::parse(id).map(ResourceTagReference::Tag),
+        )
         .ok_or_else(|| format!("`values[{index}]` has invalid identifier `{raw_id}`"))?;
-    Ok(FunctionTagEntry {
+    Ok(ResourceTagEntry {
         reference,
         required,
     })
 }
 
-fn resolve_function_tags(
-    functions: &HashMap<Identifier, Function>,
-    tags: &HashMap<Identifier, UnresolvedFunctionTag>,
-) -> Result<HashMap<Identifier, Vec<Identifier>>, FunctionTagResolutionError> {
+fn resolve_resource_tags(
+    elements: &HashSet<Identifier>,
+    tags: &HashMap<Identifier, UnresolvedResourceTag>,
+    element_kind: &str,
+    tag_kind: &str,
+) -> Result<HashMap<Identifier, Vec<Identifier>>, ResourceTagResolutionError> {
     let mut tag_ids = tags.keys().cloned().collect::<Vec<_>>();
     tag_ids.sort_by_key(ToString::to_string);
 
@@ -413,25 +709,25 @@ fn resolve_function_tags(
             .expect("the tag identifier came from the tag map");
         for entry in &tag.entries {
             match &entry.reference {
-                FunctionReference::Function(function) if entry.required => {
-                    if !functions.contains_key(function) {
-                        return Err(invalid_function_tag_reference(
+                ResourceTagReference::Element(element) if entry.required => {
+                    if !elements.contains(element) {
+                        return Err(invalid_resource_tag_reference(
                             tag_id,
-                            format!("required function `{function}` does not exist"),
+                            format!("required {element_kind} `{element}` does not exist"),
                         ));
                     }
                 }
-                FunctionReference::Tag(dependency) if entry.required => {
+                ResourceTagReference::Tag(dependency) if entry.required => {
                     if !tags.contains_key(dependency) {
-                        return Err(invalid_function_tag_reference(
+                        return Err(invalid_resource_tag_reference(
                             tag_id,
-                            format!("required function tag `#{dependency}` does not exist"),
+                            format!("required {tag_kind} `#{dependency}` does not exist"),
                         ));
                     }
                     if creates_tag_cycle(&dependencies, tag_id, dependency) {
-                        return Err(invalid_function_tag_reference(
+                        return Err(invalid_resource_tag_reference(
                             tag_id,
-                            format!("required function tag reference `#{dependency}` is cyclic"),
+                            format!("required {tag_kind} reference `#{dependency}` is cyclic"),
                         ));
                     }
                     dependencies
@@ -439,7 +735,7 @@ fn resolve_function_tags(
                         .expect("every tag owns a dependency list")
                         .push(dependency.clone());
                 }
-                FunctionReference::Function(_) | FunctionReference::Tag(_) => {}
+                ResourceTagReference::Element(_) | ResourceTagReference::Tag(_) => {}
             }
         }
     }
@@ -450,8 +746,8 @@ fn resolve_function_tags(
             .get(tag_id)
             .expect("the tag identifier came from the tag map");
         for (index, entry) in tag.entries.iter().enumerate() {
-            let FunctionTagEntry {
-                reference: FunctionReference::Tag(dependency),
+            let ResourceTagEntry {
+                reference: ResourceTagReference::Tag(dependency),
                 required: false,
             } = entry
             else {
@@ -501,7 +797,7 @@ fn resolve_function_tags(
     while let Some(tag_id) = ready.get(next).cloned() {
         next += 1;
         let values =
-            flatten_function_tag(&tag_id, functions, tags, &accepted_optional_tags, &resolved);
+            flatten_resource_tag(&tag_id, elements, tags, &accepted_optional_tags, &resolved);
         resolved.insert(tag_id.clone(), values);
 
         for dependent in dependents
@@ -520,7 +816,7 @@ fn resolve_function_tags(
     assert_eq!(
         resolved.len(),
         tags.len(),
-        "the accepted function tag dependency graph is acyclic"
+        "the accepted resource tag dependency graph is acyclic"
     );
     Ok(resolved)
 }
@@ -546,10 +842,10 @@ fn creates_tag_cycle(
     false
 }
 
-fn flatten_function_tag(
+fn flatten_resource_tag(
     id: &Identifier,
-    functions: &HashMap<Identifier, Function>,
-    tags: &HashMap<Identifier, UnresolvedFunctionTag>,
+    elements: &HashSet<Identifier>,
+    tags: &HashMap<Identifier, UnresolvedResourceTag>,
     accepted_optional_tags: &HashSet<(Identifier, usize)>,
     resolved: &HashMap<Identifier, Vec<Identifier>>,
 ) -> Vec<Identifier> {
@@ -563,34 +859,34 @@ fn flatten_function_tag(
         .enumerate()
     {
         match &entry.reference {
-            FunctionReference::Function(function) => {
-                if functions.contains_key(function) && present.insert(function.clone()) {
-                    values.push(function.clone());
+            ResourceTagReference::Element(element) => {
+                if elements.contains(element) && present.insert(element.clone()) {
+                    values.push(element.clone());
                 }
             }
-            FunctionReference::Tag(tag)
+            ResourceTagReference::Tag(tag)
                 if entry.required || accepted_optional_tags.contains(&(id.clone(), index)) =>
             {
-                for function in resolved
+                for element in resolved
                     .get(tag)
                     .expect("accepted tag dependencies are flattened first")
                 {
-                    if present.insert(function.clone()) {
-                        values.push(function.clone());
+                    if present.insert(element.clone()) {
+                        values.push(element.clone());
                     }
                 }
             }
-            FunctionReference::Tag(_) => {}
+            ResourceTagReference::Tag(_) => {}
         }
     }
     values
 }
 
-fn invalid_function_tag_reference(
+fn invalid_resource_tag_reference(
     tag: &Identifier,
     reason: impl Into<String>,
-) -> FunctionTagResolutionError {
-    FunctionTagResolutionError {
+) -> ResourceTagResolutionError {
+    ResourceTagResolutionError {
         tag: tag.clone(),
         reason: reason.into(),
     }
@@ -607,6 +903,7 @@ fn validate_pack_metadata(root: &Path) -> Result<(), LoadError> {
 
     for (field, feature) in [
         ("features", "feature flags"),
+        ("filter", "pack filters"),
         ("overlays", "resource overlays"),
     ] {
         if root_object.contains_key(field) {
@@ -788,21 +1085,25 @@ fn parse_nonnegative_i32(path: &Path, field: &str, value: &Value) -> Result<i32,
 }
 
 fn parse_i32(path: &Path, field: &str, value: &Value) -> Result<i32, LoadError> {
-    value
+    let number = value
         .as_number()
-        .map(java_number_to_i32)
-        .ok_or_else(|| invalid_pack(path, format!("`{field}` must be a number")))
+        .ok_or_else(|| invalid_pack(path, format!("`{field}` must be a number")))?;
+    java_number_to_i32(number)
+        .map_err(|reason| invalid_pack(path, format!("invalid `{field}`: {reason}")))
 }
 
-fn java_number_to_i32(number: &serde_json::Number) -> i32 {
+pub(crate) fn java_number_to_i32(number: &serde_json::Number) -> Result<i32, String> {
     if let Some(value) = number.as_i64() {
-        return value as i32;
+        return Ok(value as i32);
     }
     if let Some(value) = number.as_u64() {
-        return value as i32;
+        return Ok(value as i32);
     }
 
     let number = number.to_string();
+    if number.len() > 10_000 {
+        return Err("number representation exceeds 10000 characters".to_owned());
+    }
     let (negative, unsigned) = match number.strip_prefix('-') {
         Some(unsigned) => (true, unsigned),
         None => (false, number.as_str()),
@@ -815,11 +1116,15 @@ fn java_number_to_i32(number: &serde_json::Number) -> i32 {
     let fraction_length = mantissa
         .split_once('.')
         .map_or(0, |(_, fraction)| fraction.len());
+    let fraction_length = i64::try_from(fraction_length).unwrap_or(i64::MAX);
+    let scale = fraction_length.saturating_sub(exponent);
+    if scale.unsigned_abs() >= 10_000 {
+        return Err("number scale must be between -9999 and 9999".to_owned());
+    }
     let digits = mantissa
         .bytes()
         .filter(u8::is_ascii_digit)
         .collect::<Vec<_>>();
-    let fraction_length = i64::try_from(fraction_length).unwrap_or(i64::MAX);
     let shift = exponent.saturating_sub(fraction_length);
 
     let significant_digits = if shift < 0 {
@@ -851,7 +1156,7 @@ fn java_number_to_i32(number: &serde_json::Number) -> i32 {
     if negative {
         narrowed = 0_u32.wrapping_sub(narrowed);
     }
-    narrowed as i32
+    Ok(narrowed as i32)
 }
 
 fn parse_decimal_exponent(exponent: &str) -> i64 {
@@ -1048,7 +1353,12 @@ pub(crate) struct CommandCompiler {
 }
 
 impl CommandCompiler {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_number_providers(Arc::new(NumberProviderRegistry::empty()))
+    }
+
+    pub(crate) fn with_number_providers(number_providers: Arc<NumberProviderRegistry>) -> Self {
         let dispatcher = CommandDispatcher::new();
 
         let function_without_arguments: Command<LoweringSource> = Rc::new(|context| {
@@ -1331,7 +1641,11 @@ impl CommandCompiler {
             .expect("the command tree contains no conflicting scoreboard literal");
 
         dispatcher
-            .register(data_command_branch())
+            .register(compute_command_branch(Arc::clone(&number_providers)))
+            .expect("the command tree contains no conflicting compute literal");
+
+        dispatcher
+            .register(data_command_branch(Arc::clone(&number_providers)))
             .expect("the command tree contains no conflicting data literal");
 
         let execute = dispatcher
@@ -1387,9 +1701,59 @@ impl CommandCompiler {
     }
 }
 
+fn compute_command_branch(
+    number_providers: Arc<NumberProviderRegistry>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let float: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Compute(ComputeCommand {
+                provider: number_provider(context, "provider"),
+                mode: ComputeMode::Float { scale: 1.0 },
+            }))
+    });
+    let scaled: Command<LoweringSource> = Rc::new(|context| {
+        let scale = FloatArgumentType::get_float(context, "scale")
+            .expect("scaled compute is attached below its scale argument");
+        context
+            .source()
+            .record(CompiledCommand::Compute(ComputeCommand {
+                provider: number_provider(context, "provider"),
+                mode: ComputeMode::Float { scale },
+            }))
+    });
+    let integer: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Compute(ComputeCommand {
+                provider: number_provider(context, "provider"),
+                mode: ComputeMode::Integer,
+            }))
+    });
+    let provider = RequiredArgumentBuilder::argument(
+        "provider",
+        NumberProviderArgument::new(number_providers),
+    )
+    .executes(float)
+    .then(RequiredArgumentBuilder::argument("scale", FloatArgumentType::float()).executes(scaled))
+    .expect("a compute provider can contain a scale")
+    .then(LiteralArgumentBuilder::literal("integer").executes(integer))
+    .expect("a compute provider can contain the integer literal");
+
+    LiteralArgumentBuilder::literal("compute")
+        .then(
+            LiteralArgumentBuilder::literal("default")
+                .then(provider)
+                .expect("the default context can contain a provider"),
+        )
+        .expect("compute can contain the default context")
+}
+
 type ModifyOperationFactory = fn(&CommandContext<LoweringSource>) -> DataModifyOperation;
 
-fn data_command_branch() -> LiteralArgumentBuilder<LoweringSource> {
+fn data_command_branch(
+    number_providers: Arc<NumberProviderRegistry>,
+) -> LiteralArgumentBuilder<LoweringSource> {
     let merge: Command<LoweringSource> = Rc::new(|context| {
         context
             .source()
@@ -1496,27 +1860,39 @@ fn data_command_branch() -> LiteralArgumentBuilder<LoweringSource> {
                 .expect("data remove can contain storage"),
         )
         .expect("data can contain remove")
-        .then(data_modify_branch())
+        .then(data_modify_branch(number_providers))
         .expect("data can contain modify")
 }
 
-fn data_modify_branch() -> LiteralArgumentBuilder<LoweringSource> {
+fn data_modify_branch(
+    number_providers: Arc<NumberProviderRegistry>,
+) -> LiteralArgumentBuilder<LoweringSource> {
     let target_path = RequiredArgumentBuilder::argument("targetPath", NbtPathArgument)
-        .then(modify_insert_branch())
+        .then(modify_insert_branch(Arc::clone(&number_providers)))
         .expect("a modify target path can contain insert")
-        .then(modify_operation_branch("prepend", |_| {
-            DataModifyOperation::Insert(0)
-        }))
+        .then(modify_operation_branch(
+            "prepend",
+            |_| DataModifyOperation::Insert(0),
+            Arc::clone(&number_providers),
+        ))
         .expect("a modify target path can contain prepend")
-        .then(modify_operation_branch("append", |_| {
-            DataModifyOperation::Insert(-1)
-        }))
+        .then(modify_operation_branch(
+            "append",
+            |_| DataModifyOperation::Insert(-1),
+            Arc::clone(&number_providers),
+        ))
         .expect("a modify target path can contain append")
-        .then(modify_operation_branch("set", |_| DataModifyOperation::Set))
+        .then(modify_operation_branch(
+            "set",
+            |_| DataModifyOperation::Set,
+            Arc::clone(&number_providers),
+        ))
         .expect("a modify target path can contain set")
-        .then(modify_operation_branch("merge", |_| {
-            DataModifyOperation::Merge
-        }))
+        .then(modify_operation_branch(
+            "merge",
+            |_| DataModifyOperation::Merge,
+            number_providers,
+        ))
         .expect("a modify target path can contain merge");
 
     LiteralArgumentBuilder::literal("modify")
@@ -1532,7 +1908,9 @@ fn data_modify_branch() -> LiteralArgumentBuilder<LoweringSource> {
         .expect("data modify can contain storage")
 }
 
-fn modify_insert_branch() -> LiteralArgumentBuilder<LoweringSource> {
+fn modify_insert_branch(
+    number_providers: Arc<NumberProviderRegistry>,
+) -> LiteralArgumentBuilder<LoweringSource> {
     LiteralArgumentBuilder::literal("insert")
         .then(modify_sources(
             RequiredArgumentBuilder::argument("index", IntegerArgumentType::integer()),
@@ -1542,6 +1920,7 @@ fn modify_insert_branch() -> LiteralArgumentBuilder<LoweringSource> {
                         .expect("insert sources are attached below the index argument"),
                 )
             },
+            number_providers,
         ))
         .expect("insert can contain an index and source")
 }
@@ -1549,8 +1928,13 @@ fn modify_insert_branch() -> LiteralArgumentBuilder<LoweringSource> {
 fn modify_operation_branch(
     literal: &'static str,
     operation: ModifyOperationFactory,
+    number_providers: Arc<NumberProviderRegistry>,
 ) -> LiteralArgumentBuilder<LoweringSource> {
-    match modify_sources(LiteralArgumentBuilder::literal(literal), operation) {
+    match modify_sources(
+        LiteralArgumentBuilder::literal(literal),
+        operation,
+        number_providers,
+    ) {
         ArgumentBuilder::Literal(builder) => builder,
         ArgumentBuilder::Required(_) => unreachable!("a literal operation remains a literal"),
     }
@@ -1559,6 +1943,7 @@ fn modify_operation_branch(
 fn modify_sources(
     parent: impl Into<ArgumentBuilder<LoweringSource>>,
     operation: ModifyOperationFactory,
+    number_providers: Arc<NumberProviderRegistry>,
 ) -> ArgumentBuilder<LoweringSource> {
     parent
         .into()
@@ -1568,6 +1953,49 @@ fn modify_sources(
         .expect("a modify operation can contain a storage source")
         .then(modify_storage_source("string", operation, true))
         .expect("a modify operation can contain a string storage source")
+        .then(modify_compute_source(operation, number_providers))
+        .expect("a modify operation can contain a computed source")
+}
+
+fn modify_compute_source(
+    operation: ModifyOperationFactory,
+    number_providers: Arc<NumberProviderRegistry>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let float: Command<LoweringSource> = Rc::new(move |context| {
+        record_data_modify(
+            context,
+            operation(context),
+            DataSource::Compute {
+                provider: number_provider(context, "provider"),
+                integer: false,
+            },
+        )
+    });
+    let integer: Command<LoweringSource> = Rc::new(move |context| {
+        record_data_modify(
+            context,
+            operation(context),
+            DataSource::Compute {
+                provider: number_provider(context, "provider"),
+                integer: true,
+            },
+        )
+    });
+    let provider = RequiredArgumentBuilder::argument(
+        "provider",
+        NumberProviderArgument::new(number_providers),
+    )
+    .executes(float)
+    .then(LiteralArgumentBuilder::literal("integer").executes(integer))
+    .expect("a data compute provider can contain the integer literal");
+
+    LiteralArgumentBuilder::literal("compute")
+        .then(
+            LiteralArgumentBuilder::literal("default")
+                .then(provider)
+                .expect("the default context can contain a provider"),
+        )
+        .expect("a computed data source can contain the default context")
 }
 
 fn modify_value_source(
@@ -2096,6 +2524,16 @@ fn function_reference(context: &CommandContext<LoweringSource>) -> FunctionRefer
         .expect("the function executor is attached below its name argument")
 }
 
+fn number_provider(
+    context: &CommandContext<LoweringSource>,
+    name: &str,
+) -> NumberProviderReference {
+    context
+        .argument::<NumberProviderReference>(name)
+        .map(|provider| (*provider).clone())
+        .expect("the command executor is attached below its number provider argument")
+}
+
 fn storage_identifier(context: &CommandContext<LoweringSource>, name: &str) -> Identifier {
     context
         .argument::<Identifier>(name)
@@ -2177,6 +2615,60 @@ impl ArgumentType<LoweringSource> for StorageIdentifierArgument {
 
     fn examples(&self) -> Vec<String> {
         ["foo", "foo:bar", "012"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+#[derive(Clone)]
+struct NumberProviderArgument {
+    registry: Arc<NumberProviderRegistry>,
+}
+
+impl NumberProviderArgument {
+    fn new(registry: Arc<NumberProviderRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+impl ArgumentType<LoweringSource> for NumberProviderArgument {
+    type Value = NumberProviderReference;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let start = reader.cursor();
+        while reader.can_read() && is_allowed_in_identifier(reader.peek()) {
+            reader.skip();
+        }
+        if reader.cursor() != start {
+            let raw = reader.substring(start, reader.cursor());
+            if let Some(identifier) = Identifier::parse(&raw) {
+                if self.registry.contains(&identifier) {
+                    return Ok(NumberProviderReference::Named(identifier));
+                }
+                return Err(SimpleCommandExceptionType::new(LiteralMessage::new(format!(
+                    "number provider `{identifier}` does not exist or is outside Worldless scope"
+                )))
+                .create_with_context(reader));
+            }
+            reader.set_cursor(start);
+        }
+
+        let value = parse_nbt_argument(reader, parse_tag)?;
+        parse_inline_tag(&value, &self.registry)
+            .map(|provider| NumberProviderReference::Inline(Box::new(provider)))
+            .map_err(|reason| {
+                SimpleCommandExceptionType::new(LiteralMessage::new(reason))
+                    .create_with_context(reader)
+            })
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["foo", "foo:bar", "+1", "{type:constant,value:1}"]
             .into_iter()
             .map(str::to_owned)
             .collect()
@@ -2623,12 +3115,18 @@ mod tests {
             ("1.18e2", 118),
             ("4294967414", 118),
             ("-4294967178", 118),
-            ("1e100000", 0),
-            ("1e-100000", 0),
+            ("1e9999", 0),
+            ("1e-9999", 0),
         ] {
             let value: Value = serde_json::from_str(input).unwrap();
             assert_eq!(parse_i32(path, "value", &value).unwrap(), expected);
         }
+        for input in ["1e10000", "1e-10000"] {
+            let value: Value = serde_json::from_str(input).unwrap();
+            assert!(parse_i32(path, "value", &value).is_err());
+        }
+        let value: Value = serde_json::from_str(&"1".repeat(10_001)).unwrap();
+        assert!(parse_i32(path, "value", &value).is_err());
     }
 
     #[test]
@@ -2899,7 +3397,7 @@ mod tests {
         for command in [
             "data get entity @s",
             "data get block 0 0 0",
-            "data modify storage example:state value set compute default example:number",
+            "data modify storage example:state value set compute block 0 0 0 example:number",
             "execute store result entity @s value int 1 run return 1",
             "execute if data entity @s value run return 1",
         ] {
