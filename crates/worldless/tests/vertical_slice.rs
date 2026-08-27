@@ -8,8 +8,8 @@ use std::{
 };
 
 use worldless::{
-    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, ResourceOrigin,
-    Vm,
+    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind,
+    ResourceOrigin, Vm,
 };
 
 static NEXT_PACK: AtomicU64 = AtomicU64::new(0);
@@ -104,8 +104,9 @@ fn executes_nested_paths_and_return_run() {
     ])
     .unwrap();
     assert_eq!(
-        vm.execute_function("example:main", context(), 8).unwrap(),
-        FunctionOutcome::Returned {
+        vm.execute_function("example:main", None, context(), 8)
+            .unwrap(),
+        ExecutionOutcome::Result {
             success: true,
             value: 42
         }
@@ -120,8 +121,9 @@ fn a_normal_child_return_does_not_return_from_its_parent() {
     ])
     .unwrap();
     assert_eq!(
-        vm.execute_function("example:main", context(), 5).unwrap(),
-        FunctionOutcome::Returned {
+        vm.execute_function("example:main", None, context(), 5)
+            .unwrap(),
+        ExecutionOutcome::Result {
             success: true,
             value: 5
         }
@@ -137,20 +139,21 @@ fn reports_failure_and_fallthrough_distinctly() {
     ])
     .unwrap();
     assert_eq!(
-        vm.execute_function("example:failure", context(), 2)
+        vm.execute_function("example:failure", None, context(), 2)
             .unwrap(),
-        FunctionOutcome::Returned {
+        ExecutionOutcome::Result {
             success: false,
             value: 0
         }
     );
     assert_eq!(
-        vm.execute_function("example:empty", context(), 2).unwrap(),
-        FunctionOutcome::FellThrough
+        vm.execute_function("example:empty", None, context(), 2)
+            .unwrap(),
+        ExecutionOutcome::NoResult
     );
     assert_eq!(
-        vm.execute_function("example:", context(), 2).unwrap(),
-        FunctionOutcome::Returned {
+        vm.execute_function("example:", None, context(), 2).unwrap(),
+        ExecutionOutcome::Result {
             success: true,
             value: 8
         }
@@ -166,8 +169,9 @@ fn return_run_converts_child_fallthrough_to_failure() {
     ])
     .unwrap();
     assert_eq!(
-        vm.execute_function("example:main", context(), 4).unwrap(),
-        FunctionOutcome::Returned {
+        vm.execute_function("example:main", None, context(), 4)
+            .unwrap(),
+        ExecutionOutcome::Result {
             success: false,
             value: 0
         }
@@ -179,7 +183,7 @@ fn enforces_the_minecraft_queue_limit_without_rust_recursion() {
     let mut vm = load_functions([("example:loop", "function example:loop\n")]).unwrap();
 
     assert_eq!(
-        vm.execute_function("example:loop", context(), 10),
+        vm.execute_function("example:loop", None, context(), 10),
         Err(ExecutionError::CommandLimitExceeded { limit: 10 })
     );
 }
@@ -189,12 +193,13 @@ fn reaching_the_limit_before_the_first_command_is_an_error() {
     let mut vm = load_functions([("example:main", "return 1\n")]).unwrap();
 
     assert_eq!(
-        vm.execute_function("example:main", context(), 1),
+        vm.execute_function("example:main", None, context(), 1),
         Err(ExecutionError::CommandLimitExceeded { limit: 1 })
     );
     assert_eq!(
-        vm.execute_function("example:main", context(), 2).unwrap(),
-        FunctionOutcome::Returned {
+        vm.execute_function("example:main", None, context(), 2)
+            .unwrap(),
+        ExecutionOutcome::Result {
             success: true,
             value: 1
         }
@@ -210,17 +215,18 @@ fn unresolved_nested_calls_fail_without_stopping_the_function() {
     .unwrap();
 
     assert_eq!(
-        vm.execute_function("example:main", context(), 2).unwrap(),
-        FunctionOutcome::Returned {
+        vm.execute_function("example:main", None, context(), 2)
+            .unwrap(),
+        ExecutionOutcome::Result {
             success: true,
             value: 6
         }
     );
 
     assert_eq!(
-        vm.execute_function("example:only_missing", context(), 2)
+        vm.execute_function("example:only_missing", None, context(), 2)
             .unwrap(),
-        FunctionOutcome::FellThrough
+        ExecutionOutcome::NoResult
     );
 }
 
@@ -233,8 +239,9 @@ fn unresolved_return_run_discards_the_current_frame() {
     .unwrap();
 
     assert_eq!(
-        vm.execute_function("example:main", context(), 3).unwrap(),
-        FunctionOutcome::FellThrough
+        vm.execute_function("example:main", None, context(), 3)
+            .unwrap(),
+        ExecutionOutcome::NoResult
     );
 }
 
@@ -293,8 +300,9 @@ fn loads_function_tags_from_the_target_resource_directory() {
 
     let mut vm = load_directory_pack(pack.root()).unwrap();
     assert_eq!(
-        vm.execute_function("example:main", context(), 3).unwrap(),
-        FunctionOutcome::Returned {
+        vm.execute_function("example:main", None, context(), 3)
+            .unwrap(),
+        ExecutionOutcome::Result {
             success: true,
             value: 42
         }
@@ -399,21 +407,25 @@ fn maps_nested_and_empty_paths_while_ignoring_invalid_resource_paths() {
     fs::write(invalid, "not a supported command\n").unwrap();
 
     let mut vm = load_directory_pack(pack.root()).unwrap();
-    assert!(matches!(
-        vm.execute_function("example:not_loaded", context(), 2),
-        Err(ExecutionError::UnknownFunction { .. })
-    ));
     assert_eq!(
-        vm.execute_function("example:nested/valid", context(), 2)
+        vm.execute_function("example:not_loaded", None, context(), 2)
             .unwrap(),
-        FunctionOutcome::Returned {
+        ExecutionOutcome::Result {
+            success: false,
+            value: 0,
+        }
+    );
+    assert_eq!(
+        vm.execute_function("example:nested/valid", None, context(), 2)
+            .unwrap(),
+        ExecutionOutcome::Result {
             success: true,
             value: 2
         }
     );
     assert_eq!(
-        vm.execute_function("example:", context(), 2).unwrap(),
-        FunctionOutcome::Returned {
+        vm.execute_function("example:", None, context(), 2).unwrap(),
+        ExecutionOutcome::Result {
             success: true,
             value: 3
         }

@@ -2,14 +2,14 @@ mod common;
 
 use common::context;
 use worldless::{
-    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, ResourceOrigin,
-    Vm,
+    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind,
+    ResourceOrigin, Vm,
 };
 
 const LIMIT: usize = 128;
 
-fn returned(success: bool, value: i32) -> FunctionOutcome {
-    FunctionOutcome::Returned { success, value }
+fn returned(success: bool, value: i32) -> ExecutionOutcome {
+    ExecutionOutcome::Result { success, value }
 }
 
 fn compile(functions: &[(&str, &str)], tags: &[(&str, &str)]) -> Vm {
@@ -71,10 +71,10 @@ fn nested_tags_expand_in_first_occurrence_order() {
         ],
     );
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:main", context(), LIMIT)
+        vm.execute_function("example:main", None, context(), LIMIT)
             .unwrap(),
         returned(true, 123)
     );
@@ -117,10 +117,10 @@ fn optional_cycles_omit_only_the_edge_that_closes_the_cycle() {
         ],
     );
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:main", context(), LIMIT)
+        vm.execute_function("example:main", None, context(), LIMIT)
             .unwrap(),
         returned(true, 12)
     );
@@ -194,32 +194,33 @@ fn callbackless_members_use_the_tag_calls_discard_scope() {
         )],
     );
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:normal", context(), LIMIT)
+        vm.execute_function("example:normal", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
 
-    vm.execute_function("example:reset", context(), LIMIT)
+    vm.execute_function("example:reset", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:returning", context(), LIMIT)
+        vm.execute_function("example:returning", None, context(), LIMIT)
             .unwrap(),
-        FunctionOutcome::FellThrough
+        ExecutionOutcome::NoResult
     );
     assert_eq!(
-        vm.execute_function("example:read_trace", context(), LIMIT)
+        vm.execute_function("example:read_trace", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
 
     for function in ["example:if_condition", "example:unless_condition"] {
-        vm.execute_function("example:reset", context(), LIMIT)
+        vm.execute_function("example:reset", None, context(), LIMIT)
             .unwrap();
         assert_eq!(
-            vm.execute_function(function, context(), LIMIT).unwrap(),
+            vm.execute_function(function, None, context(), LIMIT)
+                .unwrap(),
             returned(true, 0)
         );
     }
@@ -278,35 +279,35 @@ fn normal_tag_calls_aggregate_only_multi_member_callbacks() {
         ],
     );
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:single_failure", context(), LIMIT)
+        vm.execute_function("example:single_failure", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:multi_failure", context(), LIMIT)
+        vm.execute_function("example:multi_failure", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:wrapping_sum", context(), LIMIT)
+        vm.execute_function("example:wrapping_sum", None, context(), LIMIT)
             .unwrap(),
         returned(true, i32::MIN)
     );
     assert_eq!(
-        vm.execute_function("example:all_fallthrough", context(), LIMIT)
+        vm.execute_function("example:all_fallthrough", None, context(), LIMIT)
             .unwrap(),
         returned(true, 9)
     );
     assert_eq!(
-        vm.execute_function("example:empty", context(), LIMIT)
+        vm.execute_function("example:empty", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:unknown", context(), LIMIT)
+        vm.execute_function("example:unknown", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
@@ -385,69 +386,69 @@ fn return_run_tags_stop_at_the_first_member_result() {
         ],
     );
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:first_result", context(), LIMIT)
+        vm.execute_function("example:first_result", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7)
     );
     assert_eq!(
-        vm.execute_function("example:read_late", context(), LIMIT)
+        vm.execute_function("example:read_late", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:first_result_stored", context(), LIMIT)
+        vm.execute_function("example:first_result_stored", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7)
     );
     assert_eq!(
-        vm.execute_function("example:read_stored", context(), LIMIT)
+        vm.execute_function("example:read_stored", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7)
     );
-    vm.execute_function("example:reset_stored", context(), LIMIT)
+    vm.execute_function("example:reset_stored", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:all_fallthrough_stored", context(), LIMIT)
+        vm.execute_function("example:all_fallthrough_stored", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:read_stored", context(), LIMIT)
+        vm.execute_function("example:read_stored", None, context(), LIMIT)
             .unwrap(),
         returned(true, 9)
     );
     assert_eq!(
-        vm.execute_function("example:all_fallthrough", context(), LIMIT)
+        vm.execute_function("example:all_fallthrough", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:one_fallthrough", context(), LIMIT)
+        vm.execute_function("example:one_fallthrough", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:empty", context(), LIMIT)
+        vm.execute_function("example:empty", None, context(), LIMIT)
             .unwrap(),
-        FunctionOutcome::FellThrough
+        ExecutionOutcome::NoResult
     );
     assert_eq!(
-        vm.execute_function("example:read_stored", context(), LIMIT)
+        vm.execute_function("example:read_stored", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
-    vm.execute_function("example:reset_stored", context(), LIMIT)
+    vm.execute_function("example:reset_stored", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:unknown", context(), LIMIT)
+        vm.execute_function("example:unknown", None, context(), LIMIT)
             .unwrap(),
-        FunctionOutcome::FellThrough
+        ExecutionOutcome::NoResult
     );
     assert_eq!(
-        vm.execute_function("example:read_stored", context(), LIMIT)
+        vm.execute_function("example:read_stored", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
@@ -535,57 +536,57 @@ fn function_tag_conditions_share_one_isolated_short_circuit() {
         ],
     );
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:if_zero", context(), LIMIT)
+        vm.execute_function("example:if_zero", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:unless_zero", context(), LIMIT)
+        vm.execute_function("example:unless_zero", None, context(), LIMIT)
             .unwrap(),
         returned(true, 5)
     );
     assert_eq!(
-        vm.execute_function("example:read_calls", context(), LIMIT)
+        vm.execute_function("example:read_calls", None, context(), LIMIT)
             .unwrap(),
         returned(true, 22)
     );
     assert_eq!(
-        vm.execute_function("example:passing_store", context(), LIMIT)
+        vm.execute_function("example:passing_store", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7)
     );
     assert_eq!(
-        vm.execute_function("example:read_stored", context(), LIMIT)
+        vm.execute_function("example:read_stored", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7)
     );
     assert_eq!(
-        vm.execute_function("example:all_fallthrough", context(), LIMIT)
+        vm.execute_function("example:all_fallthrough", None, context(), LIMIT)
             .unwrap(),
         returned(true, 12)
     );
     assert_eq!(
-        vm.execute_function("example:empty_if", context(), LIMIT)
+        vm.execute_function("example:empty_if", None, context(), LIMIT)
             .unwrap(),
         returned(true, 6)
     );
     assert_eq!(
-        vm.execute_function("example:empty_unless", context(), LIMIT)
+        vm.execute_function("example:empty_unless", None, context(), LIMIT)
             .unwrap(),
         returned(true, 6)
     );
     assert_eq!(
-        vm.execute_function("example:empty_return", context(), LIMIT)
+        vm.execute_function("example:empty_return", None, context(), LIMIT)
             .unwrap(),
-        FunctionOutcome::FellThrough
+        ExecutionOutcome::NoResult
     );
     assert_eq!(
-        vm.execute_function("example:unknown_return", context(), LIMIT)
+        vm.execute_function("example:unknown_return", None, context(), LIMIT)
             .unwrap(),
-        FunctionOutcome::FellThrough
+        ExecutionOutcome::NoResult
     );
 }
 
@@ -638,68 +639,69 @@ fn tag_member_calls_own_the_only_tag_execution_cost() {
         ],
     );
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:normal", context(), 3),
+        vm.execute_function("example:normal", None, context(), 3),
         Err(ExecutionError::CommandLimitExceeded { limit: 3 })
     );
     assert_eq!(
-        vm.execute_function("example:normal", context(), 4).unwrap(),
+        vm.execute_function("example:normal", None, context(), 4)
+            .unwrap(),
         returned(true, 9)
     );
     assert_eq!(
-        vm.execute_function("example:returning", context(), 3)
+        vm.execute_function("example:returning", None, context(), 3)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:condition", context(), 3)
+        vm.execute_function("example:condition", None, context(), 3)
             .unwrap(),
         returned(true, 9)
     );
     assert_eq!(
-        vm.execute_function("example:recursive", context(), 10),
+        vm.execute_function("example:recursive", None, context(), 10),
         Err(ExecutionError::CommandLimitExceeded { limit: 10 })
     );
     assert_eq!(
-        vm.execute_function("example:aggregate_limit", context(), 3),
+        vm.execute_function("example:aggregate_limit", None, context(), 3),
         Err(ExecutionError::CommandLimitExceeded { limit: 3 })
     );
     assert_eq!(
-        vm.execute_function("example:read_stored", context(), LIMIT)
+        vm.execute_function("example:read_stored", None, context(), LIMIT)
             .unwrap(),
         returned(true, 9)
     );
     assert_eq!(
-        vm.execute_function("example:aggregate_limit", context(), 4),
+        vm.execute_function("example:aggregate_limit", None, context(), 4),
         Err(ExecutionError::CommandLimitExceeded { limit: 4 })
     );
     assert_eq!(
-        vm.execute_function("example:aggregate_limit", context(), 5)
+        vm.execute_function("example:aggregate_limit", None, context(), 5)
             .unwrap(),
-        FunctionOutcome::FellThrough
+        ExecutionOutcome::NoResult
     );
     assert_eq!(
-        vm.execute_function("example:read_stored", context(), LIMIT)
+        vm.execute_function("example:read_stored", None, context(), LIMIT)
             .unwrap(),
         returned(true, 3)
     );
     assert_eq!(
-        vm.execute_function("example:returning_fallthrough", context(), 3),
+        vm.execute_function("example:returning_fallthrough", None, context(), 3),
         Err(ExecutionError::CommandLimitExceeded { limit: 3 })
     );
     assert_eq!(
-        vm.execute_function("example:returning_fallthrough", context(), 4)
+        vm.execute_function("example:returning_fallthrough", None, context(), 4)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:condition_fallthrough", context(), 3),
+        vm.execute_function("example:condition_fallthrough", None, context(), 3),
         Err(ExecutionError::CommandLimitExceeded { limit: 3 })
     );
     assert_eq!(
-        vm.execute_function("example:condition_fallthrough", context(), 4)
+        vm.execute_function("example:condition_fallthrough", None, context(), 4)
             .unwrap(),
         returned(true, 9)
     );

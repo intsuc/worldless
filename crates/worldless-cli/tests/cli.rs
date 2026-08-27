@@ -35,6 +35,10 @@ impl TestPack {
         self.write_resource("predicate", id, "json", source);
     }
 
+    fn write_function_tag(&self, id: &str, source: &str) {
+        self.write_resource("tags/function", id, "json", source);
+    }
+
     fn write_resource(&self, kind: &str, id: &str, extension: &str, source: &str) {
         let (namespace, path) = id.split_once(':').unwrap();
         let path = self
@@ -127,23 +131,24 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
     ];
     let run = |function: &str| {
         let mut arguments = common.clone();
+        arguments.push("function".as_ref());
         arguments.push(function.as_ref());
         worldless(&arguments)
     };
 
     let output = run("example:returned");
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "returned success=false value=0\n");
+    assert_eq!(text(&output.stdout), "result success=false value=0\n");
     assert!(output.stderr.is_empty());
 
     let output = run("example:value");
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "returned success=true value=42\n");
+    assert_eq!(text(&output.stdout), "result success=true value=42\n");
     assert!(output.stderr.is_empty());
 
     let output = run("example:fell_through");
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "fell-through\n");
+    assert_eq!(text(&output.stdout), "no-result\n");
     assert!(output.stderr.is_empty());
 
     let output = worldless(&[
@@ -152,15 +157,54 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
         low.root().as_os_str(),
         "--pack".as_ref(),
         high.root().as_os_str(),
+        "function".as_ref(),
         "example:default_context".as_ref(),
     ]);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "returned success=true value=1\n");
+    assert_eq!(text(&output.stdout), "result success=true value=1\n");
     assert!(output.stderr.is_empty());
 
     let output = run("example:context");
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "returned success=true value=1\n");
+    assert_eq!(text(&output.stdout), "result success=true value=1\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn run_executes_macro_arguments_function_tags_and_one_raw_command() {
+    let pack = TestPack::new();
+    pack.write_function("example:macro", "$return $(value)\n");
+    pack.write_function("example:one", "return 1\n");
+    pack.write_function("example:two", "return 2\n");
+    pack.write_function_tag(
+        "example:both",
+        r#"{"values":["example:one","example:two"]}"#,
+    );
+
+    let run = |target: &[&std::ffi::OsStr]| {
+        let mut arguments = vec!["run".as_ref(), "--pack".as_ref(), pack.root().as_os_str()];
+        arguments.extend_from_slice(target);
+        worldless(&arguments)
+    };
+
+    let output = run(&[
+        "function".as_ref(),
+        "--arguments".as_ref(),
+        "{value:9}".as_ref(),
+        "example:macro".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(text(&output.stdout), "result success=true value=9\n");
+    assert!(output.stderr.is_empty());
+
+    let output = run(&["tag".as_ref(), "example:both".as_ref()]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(text(&output.stdout), "result success=true value=3\n");
+    assert!(output.stderr.is_empty());
+
+    let output = run(&["command".as_ref(), "return 7".as_ref()]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(text(&output.stdout), "result success=true value=7\n");
     assert!(output.stderr.is_empty());
 }
 
@@ -179,6 +223,7 @@ fn run_world_seed_initializes_named_random_sequences() {
         "run".as_ref(),
         "--pack".as_ref(),
         pack.root().as_os_str(),
+        "function".as_ref(),
         "example:random".as_ref(),
     ]);
     assert_eq!(output.status.code(), Some(4));
@@ -195,10 +240,11 @@ fn run_world_seed_initializes_named_random_sequences() {
         pack.root().as_os_str(),
         "--world-seed".as_ref(),
         "0".as_ref(),
+        "function".as_ref(),
         "example:random".as_ref(),
     ]);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "returned success=true value=78\n");
+    assert_eq!(text(&output.stdout), "result success=true value=78\n");
     assert!(output.stderr.is_empty());
 }
 
@@ -222,6 +268,7 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
         missing.as_os_str(),
         "--command-limit".as_ref(),
         "invalid".as_ref(),
+        "function".as_ref(),
         "example:main".as_ref(),
     ]);
     assert_eq!(output.status.code(), Some(2));
@@ -239,6 +286,48 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
 
     let pack = TestPack::new();
     pack.write_function("example:main", "return 1\n");
+
+    let output = worldless(&[
+        "run".as_ref(),
+        "--pack".as_ref(),
+        pack.root().as_os_str(),
+        "example:main".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).contains("usage: worldless"));
+
+    let output = worldless(&[
+        "run".as_ref(),
+        "--pack".as_ref(),
+        pack.root().as_os_str(),
+        "function".as_ref(),
+        "--arguments".as_ref(),
+        "not-a-compound".as_ref(),
+        "example:main".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("error: invalid function arguments:"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("usage: worldless"), "{stderr}");
+
+    let output = worldless(&[
+        "run".as_ref(),
+        "--pack".as_ref(),
+        pack.root().as_os_str(),
+        "command".as_ref(),
+        "--not-a-command".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(stderr.starts_with("error: "), "{stderr}");
+    assert!(!stderr.contains("usage: worldless"), "{stderr}");
+
     let output = worldless(&[
         "run".as_ref(),
         "--pack".as_ref(),
@@ -252,6 +341,7 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
         "--rotation".as_ref(),
         "0".as_ref(),
         "0".as_ref(),
+        "function".as_ref(),
         "example:main".as_ref(),
     ]);
     assert_eq!(output.status.code(), Some(4));

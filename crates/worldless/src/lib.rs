@@ -27,11 +27,44 @@ mod runtime;
 pub use execution_context::{ExecutionContext, Position, Rotation};
 pub use loader::{LoadError, ResourceOrigin};
 pub use pack::{MemoryResource, Pack, ResourceKind};
-pub use runtime::{ExecutionError, FunctionOutcome};
+pub use runtime::{ExecutionError, ExecutionOutcome};
 
-use nbt::CommandStorage;
+use std::{error::Error, fmt};
+
+use nbt::{CommandStorage, CompoundTag};
 use program::{Program, Scoreboard};
 use random::RandomState;
+
+/// A compound NBT value supplied to a function invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionArguments(CompoundTag);
+
+impl FunctionArguments {
+    /// Parses one complete compound SNBT value.
+    pub fn from_snbt(input: &str) -> Result<Self, FunctionArgumentsParseError> {
+        nbt::parse_compound_fully(input)
+            .map(Self)
+            .map_err(|reason| FunctionArgumentsParseError { reason })
+    }
+
+    pub(crate) fn compound(&self) -> &CompoundTag {
+        &self.0
+    }
+}
+
+/// An error produced while parsing function arguments from SNBT.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionArgumentsParseError {
+    reason: String,
+}
+
+impl fmt::Display for FunctionArgumentsParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid function arguments: {}", self.reason)
+    }
+}
+
+impl Error for FunctionArgumentsParseError {}
 
 /// A loaded worldless data-pack program.
 #[derive(Debug)]
@@ -59,31 +92,54 @@ impl Vm {
         loader::load_packs(packs).map(|program| Self::new(program, world_seed))
     }
 
-    /// Executes a function without a physical Minecraft world.
+    /// Executes Minecraft's `function` command without a physical world.
     ///
-    /// Function identifiers without a namespace use `minecraft`. The command
-    /// source starts with the supplied position and rotation. An `execute`
-    /// context transformation applies only to its command chain; called
-    /// functions inherit the transformed context, while the caller's next
-    /// function line starts from the caller's context.
+    /// A reference beginning with `#` selects a function tag; other references
+    /// select one function. Identifiers without a namespace use `minecraft`.
+    /// The same argument compound is supplied to every selected function.
+    /// The command source starts with the supplied position and rotation. An
+    /// `execute` context transformation applies only to its command chain;
+    /// called functions inherit the transformed context, while the caller's
+    /// next function line starts from the caller's context.
     ///
     /// The command limit follows Minecraft's queue limit: reaching the limit stops
     /// execution, so a completed invocation always consumes less than
-    /// `command_limit`. A macro function cannot be invoked directly because
-    /// this entry point supplies no argument compound; invoke it from another
-    /// function with `function <id> <compound>` or `with storage`.
+    /// `command_limit`.
     pub fn execute_function(
         &mut self,
-        id: &str,
+        reference: &str,
+        arguments: Option<&FunctionArguments>,
         context: ExecutionContext,
         command_limit: usize,
-    ) -> Result<FunctionOutcome, ExecutionError> {
-        runtime::execute(
+    ) -> Result<ExecutionOutcome, ExecutionError> {
+        runtime::execute_function(
             &self.program,
             &mut self.scoreboard,
             &mut self.command_storage,
             &mut self.random,
-            id,
+            reference,
+            arguments.map(FunctionArguments::compound),
+            context,
+            command_limit,
+        )
+    }
+
+    /// Executes one supported Minecraft command without a physical world.
+    ///
+    /// The input may omit its leading `/` or contain exactly one. Parsing and
+    /// support validation complete before the command can mutate VM state.
+    pub fn execute_command(
+        &mut self,
+        command: &str,
+        context: ExecutionContext,
+        command_limit: usize,
+    ) -> Result<ExecutionOutcome, ExecutionError> {
+        runtime::execute_command(
+            &self.program,
+            &mut self.scoreboard,
+            &mut self.command_storage,
+            &mut self.random,
+            command,
             context,
             command_limit,
         )

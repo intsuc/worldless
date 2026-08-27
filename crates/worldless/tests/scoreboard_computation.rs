@@ -2,13 +2,13 @@ mod common;
 
 use common::context;
 use worldless::{
-    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
 };
 
 const LIMIT: usize = 128;
 
-fn returned(success: bool, value: i32) -> FunctionOutcome {
-    FunctionOutcome::Returned { success, value }
+fn returned(success: bool, value: i32) -> ExecutionOutcome {
+    ExecutionOutcome::Result { success, value }
 }
 
 fn compile(functions: &[(&str, &str)]) -> Vm {
@@ -71,30 +71,30 @@ fn add_and_remove_create_scores_and_use_wrapping_i32_arithmetic() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:add_missing", context(), LIMIT)
+        vm.execute_function("example:add_missing", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:add_wrap", context(), LIMIT)
+        vm.execute_function("example:add_wrap", None, context(), LIMIT)
             .unwrap(),
         returned(true, i32::MIN)
     );
     assert_eq!(
-        vm.execute_function("example:remove_missing", context(), LIMIT)
+        vm.execute_function("example:remove_missing", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:remove_wrap", context(), LIMIT)
+        vm.execute_function("example:remove_wrap", None, context(), LIMIT)
             .unwrap(),
         returned(true, i32::MAX)
     );
     assert_eq!(
-        vm.execute_function("example:missing_objective", context(), LIMIT)
+        vm.execute_function("example:missing_objective", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
@@ -105,7 +105,8 @@ fn add_and_remove_create_scores_and_use_wrapping_i32_arithmetic() {
         ("example:read_remove_wrap", i32::MAX),
     ] {
         assert_eq!(
-            vm.execute_function(function, context(), LIMIT).unwrap(),
+            vm.execute_function(function, None, context(), LIMIT)
+                .unwrap(),
             returned(true, expected),
             "{function}"
         );
@@ -186,7 +187,7 @@ fn operations_match_java_integer_and_scoreboard_semantics() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     for (function, expected) in [
         ("example:assign", -3),
@@ -206,7 +207,8 @@ fn operations_match_java_integer_and_scoreboard_semantics() {
         ("example:alias_add", 12),
     ] {
         assert_eq!(
-            vm.execute_function(function, context(), LIMIT).unwrap(),
+            vm.execute_function(function, None, context(), LIMIT)
+                .unwrap(),
             returned(true, expected),
             "{function}"
         );
@@ -216,7 +218,7 @@ fn operations_match_java_integer_and_scoreboard_semantics() {
             "example:read_target"
         };
         assert_eq!(
-            vm.execute_function(reader, context(), LIMIT).unwrap(),
+            vm.execute_function(reader, None, context(), LIMIT).unwrap(),
             returned(true, expected),
             "state after {function}"
         );
@@ -241,20 +243,20 @@ fn swap_updates_both_scores_and_handles_an_aliased_score() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:swap", context(), LIMIT)
+        vm.execute_function("example:swap", None, context(), LIMIT)
             .unwrap(),
         returned(true, -3)
     );
     assert_eq!(
-        vm.execute_function("example:source", context(), LIMIT)
+        vm.execute_function("example:source", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7)
     );
     assert_eq!(
-        vm.execute_function("example:alias", context(), LIMIT)
+        vm.execute_function("example:alias", None, context(), LIMIT)
             .unwrap(),
         returned(true, 11)
     );
@@ -294,40 +296,40 @@ fn operation_failures_preserve_minecraft_partial_effects() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:divide_by_missing", context(), LIMIT)
+        vm.execute_function("example:divide_by_missing", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7)
     );
     assert_eq!(
-        vm.execute_function("example:read_missing", context(), LIMIT)
+        vm.execute_function("example:read_missing", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:divide_both_missing", context(), LIMIT)
+        vm.execute_function("example:divide_both_missing", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:read_zero_source", context(), LIMIT)
+        vm.execute_function("example:read_zero_source", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:missing_source_objective", context(), LIMIT)
+        vm.execute_function("example:missing_source_objective", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:both_missing", context(), LIMIT)
+        vm.execute_function("example:both_missing", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:read_right", context(), LIMIT)
+        vm.execute_function("example:read_right", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
@@ -398,7 +400,7 @@ fn score_comparisons_and_ranges_are_inclusive() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     for function in [
         "example:equal",
@@ -414,23 +416,24 @@ fn score_comparisons_and_ranges_are_inclusive() {
         "example:unless",
     ] {
         assert_eq!(
-            vm.execute_function(function, context(), LIMIT).unwrap(),
+            vm.execute_function(function, None, context(), LIMIT)
+                .unwrap(),
             returned(true, 1),
             "{function}"
         );
     }
     assert_eq!(
-        vm.execute_function("example:false", context(), LIMIT)
+        vm.execute_function("example:false", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:below_range", context(), LIMIT)
+        vm.execute_function("example:below_range", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:above_range", context(), LIMIT)
+        vm.execute_function("example:above_range", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
@@ -481,50 +484,65 @@ fn missing_scores_are_false_but_missing_objectives_abort_both_polarities() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:missing_score_if", context(), LIMIT)
+        vm.execute_function("example:missing_score_if", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:missing_score_unless", context(), LIMIT)
+        vm.execute_function("example:missing_score_unless", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:missing_objective_if", context(), LIMIT)
+        vm.execute_function("example:missing_objective_if", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:missing_objective_unless", context(), LIMIT)
+        vm.execute_function("example:missing_objective_unless", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:missing_score_compare_if", context(), LIMIT)
+        vm.execute_function("example:missing_score_compare_if", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:missing_score_compare_unless", context(), LIMIT)
-            .unwrap(),
+        vm.execute_function(
+            "example:missing_score_compare_unless",
+            None,
+            context(),
+            LIMIT
+        )
+        .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:missing_objective_compare_if", context(), LIMIT)
-            .unwrap(),
+        vm.execute_function(
+            "example:missing_objective_compare_if",
+            None,
+            context(),
+            LIMIT
+        )
+        .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:missing_objective_compare_unless", context(), LIMIT)
-            .unwrap(),
+        vm.execute_function(
+            "example:missing_objective_compare_unless",
+            None,
+            context(),
+            LIMIT
+        )
+        .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:read_missing", context(), LIMIT)
+        vm.execute_function("example:read_missing", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
@@ -567,40 +585,50 @@ fn score_conditions_filter_commands_and_preserve_modifier_order() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:passing", context(), LIMIT)
+        vm.execute_function("example:passing", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7)
     );
     assert_eq!(
-        vm.execute_function("example:condition_before_return", context(), LIMIT)
+        vm.execute_function("example:condition_before_return", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:return_before_condition", context(), LIMIT)
+        vm.execute_function("example:return_before_condition", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:store_before_false", context(), LIMIT)
+        vm.execute_function("example:store_before_false", None, context(), LIMIT)
             .unwrap(),
         returned(true, 4)
     );
     assert_eq!(
-        vm.execute_function("example:missing_objective_before_return", context(), LIMIT)
-            .unwrap(),
+        vm.execute_function(
+            "example:missing_objective_before_return",
+            None,
+            context(),
+            LIMIT
+        )
+        .unwrap(),
         returned(true, 13)
     );
     assert_eq!(
-        vm.execute_function("example:return_before_missing_objective", context(), LIMIT)
-            .unwrap(),
+        vm.execute_function(
+            "example:return_before_missing_objective",
+            None,
+            context(),
+            LIMIT
+        )
+        .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:forked_store_failure", context(), LIMIT)
+        vm.execute_function("example:forked_store_failure", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
@@ -619,14 +647,14 @@ fn inactive_condition_chains_still_charge_later_ordinary_modifiers() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:filtered", context(), 3),
+        vm.execute_function("example:filtered", None, context(), 3),
         Err(ExecutionError::CommandLimitExceeded { limit: 3 })
     );
     assert_eq!(
-        vm.execute_function("example:filtered", context(), 4)
+        vm.execute_function("example:filtered", None, context(), 4)
             .unwrap(),
         returned(true, 5)
     );
@@ -677,19 +705,19 @@ fn operation_cost_is_charged_even_when_execution_fails() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:divide_zero", context(), 2),
+        vm.execute_function("example:divide_zero", None, context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_eq!(
-        vm.execute_function("example:read_target", context(), LIMIT)
+        vm.execute_function("example:read_target", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7)
     );
     assert_eq!(
-        vm.execute_function("example:divide_zero", context(), 3)
+        vm.execute_function("example:divide_zero", None, context(), 3)
             .unwrap(),
         returned(false, 0)
     );
@@ -708,14 +736,14 @@ fn terminal_score_conditions_have_ordinary_command_cost() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:condition", context(), 2),
+        vm.execute_function("example:condition", None, context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_eq!(
-        vm.execute_function("example:condition", context(), 3)
+        vm.execute_function("example:condition", None, context(), 3)
             .unwrap(),
         returned(true, 1)
     );

@@ -2,13 +2,13 @@ mod common;
 
 use common::context;
 use worldless::{
-    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
 };
 
 const LIMIT: usize = 128;
 
-fn returned(value: i32) -> FunctionOutcome {
-    FunctionOutcome::Returned {
+fn returned(value: i32) -> ExecutionOutcome {
+    ExecutionOutcome::Result {
         success: true,
         value,
     }
@@ -28,8 +28,8 @@ fn load(
     Vm::from_packs([Pack::memory(functions.chain(providers))], world_seed)
 }
 
-fn execute(vm: &mut Vm, id: &str) -> Result<FunctionOutcome, ExecutionError> {
-    vm.execute_function(id, context(), LIMIT)
+fn execute(vm: &mut Vm, id: &str) -> Result<ExecutionOutcome, ExecutionError> {
+    vm.execute_function(id, None, context(), LIMIT)
 }
 
 #[test]
@@ -248,12 +248,12 @@ fn invalid_runtime_ranges_do_not_report_or_consume_a_result() {
 
     assert_eq!(
         execute(&mut vm, "example:setup").unwrap(),
-        FunctionOutcome::FellThrough
+        ExecutionOutcome::NoResult
     );
     assert_eq!(execute(&mut vm, "example:store").unwrap(), returned(9));
     assert_eq!(
         execute(&mut vm, "example:return_run").unwrap(),
-        FunctionOutcome::FellThrough
+        ExecutionOutcome::NoResult
     );
     assert_eq!(
         execute(&mut vm, "example:widest_accepted").unwrap(),

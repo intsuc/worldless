@@ -1,14 +1,12 @@
 mod common;
 
 use common::context;
-use worldless::{
-    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
-};
+use worldless::{ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm};
 
 const LIMIT: usize = 512;
 
-fn returned(success: bool, value: i32) -> FunctionOutcome {
-    FunctionOutcome::Returned { success, value }
+fn returned(success: bool, value: i32) -> ExecutionOutcome {
+    ExecutionOutcome::Result { success, value }
 }
 
 fn compile(functions: &[(&str, &str)]) -> Vm {
@@ -47,9 +45,10 @@ where
     Vm::from_packs([Pack::memory(functions.chain(tags))], None)
 }
 
-fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
+fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
     assert_eq!(
-        vm.execute_function(function, context(), LIMIT).unwrap(),
+        vm.execute_function(function, None, context(), LIMIT)
+            .unwrap(),
         expected,
         "{function}"
     );
@@ -88,7 +87,7 @@ fn direct_and_storage_arguments_instantiate_macro_functions() {
 
     assert_function(&mut vm, "example:direct", returned(true, 7));
     assert_function(&mut vm, "example:string", returned(true, 8));
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:root", returned(true, 9));
     assert_function(&mut vm, "example:path", returned(true, 10));
     assert_function(&mut vm, "example:plain_missing_storage", returned(true, 11));
@@ -150,7 +149,7 @@ return fail
         ),
     ]);
 
-    assert_function(&mut vm, "example:invoke", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:invoke", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:verify", returned(true, 1));
     assert_function(&mut vm, "example:invoke_raw", returned(true, 17));
 }
@@ -189,7 +188,7 @@ fn dynamic_score_holders_preserve_distinct_java_utf16_values() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:set_first", returned(true, 7));
     assert_function(&mut vm, "example:set_second", returned(true, 9));
     assert_function(&mut vm, "example:first", returned(true, 7));
@@ -236,15 +235,15 @@ fn numeric_arguments_follow_macro_stringification_rules() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:small_long", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:small_long", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:check_small_long", returned(true, 1));
-    assert_function(&mut vm, "example:float", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:float", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:check_float", returned(true, 1));
-    assert_function(&mut vm, "example:double", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:double", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:check_double", returned(true, 1));
-    assert_function(&mut vm, "example:nested", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:nested", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:check_nested", returned(true, 1));
-    assert_function(&mut vm, "example:large_long", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:large_long", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:check_failure", returned(true, 0));
 }
 
@@ -285,20 +284,16 @@ fn instantiation_is_atomic_and_failures_are_command_results() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:bad_parse", returned(true, 0));
     assert_function(&mut vm, "example:status", returned(true, 0));
     assert_function(&mut vm, "example:missing", returned(true, 0));
     assert_function(&mut vm, "example:status", returned(true, 0));
-    assert_function(&mut vm, "example:bad_path", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:bad_path", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:status", returned(true, 0));
-    assert_function(&mut vm, "example:scalar_path", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:scalar_path", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:status", returned(true, 0));
-    assert_function(
-        &mut vm,
-        "example:multiple_path",
-        FunctionOutcome::FellThrough,
-    );
+    assert_function(&mut vm, "example:multiple_path", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:status", returned(true, 0));
 }
 
@@ -338,7 +333,7 @@ fn nested_macros_require_explicit_arguments_and_tags_share_one_snapshot() {
     )
     .unwrap();
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:call_outer", returned(true, 12));
     assert_function(
         &mut vm,
@@ -408,7 +403,7 @@ fn tag_instantiation_keeps_a_successful_prefix_and_snapshots_storage() {
     )
     .unwrap();
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:failed_tag", returned(true, 0));
     assert_function(&mut vm, "example:read_prefix", returned(true, 1));
     assert_function(&mut vm, "example:read_late", returned(true, 0));
@@ -429,10 +424,11 @@ fn macro_conditions_have_no_arguments_and_top_level_failure_is_explicit() {
     ]);
 
     assert_function(&mut vm, "example:unless_macro", returned(true, 1));
-    assert!(matches!(
-        vm.execute_function("example:macro", context(), LIMIT),
-        Err(ExecutionError::FunctionInstantiationFailed { .. })
-    ));
+    assert_eq!(
+        vm.execute_function("example:macro", None, context(), LIMIT)
+            .unwrap(),
+        returned(false, 0)
+    );
 
     for command in [
         "function example:macro with entity @s",
@@ -463,8 +459,8 @@ fn macro_instantiation_does_not_consume_command_quota() {
 
     for limit in 1..=8 {
         assert_eq!(
-            vm.execute_function("example:plain_call", context(), limit),
-            vm.execute_function("example:macro_call", context(), limit),
+            vm.execute_function("example:plain_call", None, context(), limit),
+            vm.execute_function("example:macro_call", None, context(), limit),
             "limit {limit}"
         );
     }

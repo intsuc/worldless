@@ -5,9 +5,11 @@ use std::{
     process::ExitCode,
 };
 
-use worldless::{ExecutionContext, FunctionOutcome, Pack, Position, Rotation, Vm};
+use worldless::{
+    ExecutionContext, ExecutionOutcome, FunctionArguments, Pack, Position, Rotation, Vm,
+};
 
-const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] [--world-seed <I64>] [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] <FUNCTION_ID>";
+const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] [--world-seed <I64>] [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] function [--arguments <COMPOUND_SNBT>] <FUNCTION_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] [--world-seed <I64>] [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] tag [--arguments <COMPOUND_SNBT>] <TAG_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] [--world-seed <I64>] [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] command <COMMAND>";
 const DEFAULT_COMMAND_LIMIT: usize = 65_536;
 const DEFAULT_POSITION: Position = Position::new(0.0, 0.0, 0.0);
 const DEFAULT_ROTATION: Rotation = Rotation::new(0.0, 0.0);
@@ -25,8 +27,17 @@ enum CliCommand {
         world_seed: Option<i64>,
         command_limit: usize,
         context: ExecutionContext,
-        function_id: String,
+        invocation: CliInvocation,
     },
+}
+
+#[derive(Debug, PartialEq)]
+enum CliInvocation {
+    Function {
+        reference: String,
+        arguments: Option<String>,
+    },
+    Command(String),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -54,14 +65,36 @@ fn main() -> ExitCode {
             world_seed,
             command_limit,
             context,
-            function_id,
+            invocation,
         } => (
             packs,
             world_seed,
             Operation::Run {
                 command_limit,
                 context,
-                function_id,
+                invocation: match invocation {
+                    CliInvocation::Function {
+                        reference,
+                        arguments,
+                    } => {
+                        let arguments = match arguments
+                            .as_deref()
+                            .map(FunctionArguments::from_snbt)
+                            .transpose()
+                        {
+                            Ok(arguments) => arguments,
+                            Err(error) => {
+                                eprintln!("error: {error}");
+                                return ExitCode::from(EXIT_EXECUTION);
+                            }
+                        };
+                        Invocation::Function {
+                            reference,
+                            arguments,
+                        }
+                    }
+                    CliInvocation::Command(command) => Invocation::Command(command),
+                },
             },
         ),
     };
@@ -78,11 +111,17 @@ fn main() -> ExitCode {
         Operation::Run {
             command_limit,
             context,
-            function_id,
-        } => match vm.execute_function(&function_id, context, command_limit) {
-            Ok(FunctionOutcome::FellThrough) => println!("fell-through"),
-            Ok(FunctionOutcome::Returned { success, value }) => {
-                println!("returned success={success} value={value}")
+            invocation,
+        } => match match invocation {
+            Invocation::Function {
+                reference,
+                arguments,
+            } => vm.execute_function(&reference, arguments.as_ref(), context, command_limit),
+            Invocation::Command(command) => vm.execute_command(&command, context, command_limit),
+        } {
+            Ok(ExecutionOutcome::NoResult) => println!("no-result"),
+            Ok(ExecutionOutcome::Result { success, value }) => {
+                println!("result success={success} value={value}")
             }
             Err(error) => {
                 eprintln!("error: {error}");
@@ -99,8 +138,16 @@ enum Operation {
     Run {
         command_limit: usize,
         context: ExecutionContext,
-        function_id: String,
+        invocation: Invocation,
     },
+}
+
+enum Invocation {
+    Function {
+        reference: String,
+        arguments: Option<FunctionArguments>,
+    },
+    Command(String),
 }
 
 fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<CliCommand, UsageError> {
@@ -196,13 +243,30 @@ fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, Us
         return Err(usage_error("duplicate --world-seed"));
     }
 
-    let function_id = parse_function_id(arguments.next())?;
+    let target = arguments
+        .next()
+        .ok_or_else(|| usage_error("missing run target; expected function, tag, or command"))?;
+    let invocation = if target == "function" {
+        parse_function_invocation(&mut arguments, false)?
+    } else if target == "tag" {
+        parse_function_invocation(&mut arguments, true)?
+    } else if target == "command" {
+        CliInvocation::Command(parse_command(arguments.next())?)
+    } else if is_option(&target) {
+        return Err(unexpected_argument(target));
+    } else {
+        return Err(usage_error(format!("unknown run target {target:?}")));
+    };
+
     if let Some(argument) = arguments.next() {
         if world_seed.is_some() && argument == "--world-seed" {
             return Err(usage_error("duplicate --world-seed"));
         }
         if argument == "--command-limit" {
             return Err(usage_error("duplicate --command-limit"));
+        }
+        if argument == "--arguments" {
+            return Err(usage_error("duplicate --arguments"));
         }
         return Err(unexpected_argument(argument));
     }
@@ -212,8 +276,56 @@ fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, Us
         world_seed,
         command_limit,
         context: ExecutionContext::new(position, rotation),
-        function_id,
+        invocation,
     })
+}
+
+fn parse_function_invocation(
+    arguments: &mut impl Iterator<Item = OsString>,
+    tag: bool,
+) -> Result<CliInvocation, UsageError> {
+    let arguments_snbt = match arguments.next() {
+        Some(argument) if argument == "--arguments" => {
+            Some(parse_arguments_snbt(arguments.next())?)
+        }
+        Some(argument) => {
+            let id = parse_function_id(Some(argument), tag)?;
+            return Ok(CliInvocation::Function {
+                reference: function_reference(id, tag),
+                arguments: None,
+            });
+        }
+        None => return Err(missing_function_identifier(tag)),
+    };
+    let id = parse_function_id(arguments.next(), tag)?;
+    Ok(CliInvocation::Function {
+        reference: function_reference(id, tag),
+        arguments: arguments_snbt,
+    })
+}
+
+fn parse_arguments_snbt(argument: Option<OsString>) -> Result<String, UsageError> {
+    let argument = argument.ok_or_else(|| usage_error("missing value for --arguments"))?;
+    if is_known_option(&argument) {
+        return Err(usage_error("missing value for --arguments"));
+    }
+    if is_option(&argument) {
+        return Err(unexpected_argument(argument));
+    }
+    argument
+        .into_string()
+        .map_err(|_| usage_error("--arguments is not valid UTF-8"))
+}
+
+fn function_reference(id: String, tag: bool) -> String {
+    if tag { format!("#{id}") } else { id }
+}
+
+fn parse_command(argument: Option<OsString>) -> Result<String, UsageError> {
+    let argument = argument.ok_or_else(|| usage_error("missing command"))?;
+    argument
+        .into_string()
+        .map_err(|_| usage_error("command is not valid UTF-8"))
 }
 
 fn parse_pack_path(argument: Option<OsString>) -> Result<PathBuf, UsageError> {
@@ -319,17 +431,44 @@ fn invalid_number(value_name: &str, text: &str) -> UsageError {
     ))
 }
 
-fn parse_function_id(argument: Option<OsString>) -> Result<String, UsageError> {
-    let argument = argument.ok_or_else(|| usage_error("missing function identifier"))?;
+fn parse_function_id(argument: Option<OsString>, tag: bool) -> Result<String, UsageError> {
+    let argument = argument.ok_or_else(|| missing_function_identifier(tag))?;
     if is_option(&argument) {
+        if argument == "--arguments" {
+            return Err(usage_error("duplicate --arguments"));
+        }
         if argument == "--command-limit" {
             return Err(usage_error("duplicate --command-limit"));
         }
         return Err(unexpected_argument(argument));
     }
-    argument
+    let id = argument
         .into_string()
-        .map_err(|_| usage_error("function identifier is not valid UTF-8"))
+        .map_err(|_| usage_error(identifier_encoding_error(tag)))?;
+    if id.starts_with('#') {
+        return Err(usage_error(if tag {
+            "tag identifier must not start with '#'"
+        } else {
+            "function identifier must not start with '#'"
+        }));
+    }
+    Ok(id)
+}
+
+fn missing_function_identifier(tag: bool) -> UsageError {
+    usage_error(if tag {
+        "missing tag identifier"
+    } else {
+        "missing function identifier"
+    })
+}
+
+fn identifier_encoding_error(tag: bool) -> &'static str {
+    if tag {
+        "tag identifier is not valid UTF-8"
+    } else {
+        "function identifier is not valid UTF-8"
+    }
 }
 
 fn is_option(argument: &OsStr) -> bool {
@@ -344,6 +483,7 @@ fn is_known_option(argument: &OsStr) -> bool {
         || argument == "--command-limit"
         || argument == "--position"
         || argument == "--rotation"
+        || argument == "--arguments"
 }
 
 fn unexpected_argument(argument: OsString) -> UsageError {
@@ -364,6 +504,13 @@ mod tests {
 
     fn parse(arguments: &[&str]) -> Result<CliCommand, UsageError> {
         parse_args(arguments.iter().copied().map(OsString::from))
+    }
+
+    fn function(reference: &str) -> CliInvocation {
+        CliInvocation::Function {
+            reference: reference.to_owned(),
+            arguments: None,
+        }
     }
 
     #[test]
@@ -392,6 +539,7 @@ mod tests {
                 "--rotation",
                 "-90",
                 "45.5",
+                "function",
                 "example:main",
             ])
             .unwrap(),
@@ -403,21 +551,114 @@ mod tests {
                     Position::new(-1.5, 2.0, -3.25),
                     Rotation::new(-90.0, 45.5),
                 ),
-                function_id: "example:main".to_owned(),
+                invocation: function("example:main"),
             }
+        );
+    }
+
+    #[test]
+    fn parses_function_tags_arguments_and_single_commands() {
+        let defaults = |invocation| CliCommand::Run {
+            packs: vec![PathBuf::from("pack")],
+            world_seed: None,
+            command_limit: DEFAULT_COMMAND_LIMIT,
+            context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+            invocation,
+        };
+
+        assert_eq!(
+            parse(&[
+                "run",
+                "--pack",
+                "pack",
+                "function",
+                "--arguments",
+                r#"{name:"Ada",count:3}"#,
+                "example:macro",
+            ])
+            .unwrap(),
+            defaults(CliInvocation::Function {
+                reference: "example:macro".to_owned(),
+                arguments: Some(r#"{name:"Ada",count:3}"#.to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "run",
+                "--pack",
+                "pack",
+                "tag",
+                "--arguments",
+                "{phase:test}",
+                "example:entries",
+            ])
+            .unwrap(),
+            defaults(CliInvocation::Function {
+                reference: "#example:entries".to_owned(),
+                arguments: Some("{phase:test}".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "run",
+                "--pack",
+                "pack",
+                "command",
+                "scoreboard players get #value example",
+            ])
+            .unwrap(),
+            defaults(CliInvocation::Command(
+                "scoreboard players get #value example".to_owned()
+            ))
+        );
+        assert_eq!(
+            parse(&["run", "--pack", "pack", "command", "--not-a-command"]).unwrap(),
+            defaults(CliInvocation::Command("--not-a-command".to_owned()))
+        );
+    }
+
+    #[test]
+    fn requires_explicit_run_target_and_exact_target_grammar() {
+        for arguments in [
+            &["run", "--pack", "pack", "example:main"][..],
+            &["run", "--pack", "pack"],
+            &["run", "--pack", "pack", "function"],
+            &["run", "--pack", "pack", "tag"],
+            &["run", "--pack", "pack", "command"],
+            &["run", "--pack", "pack", "function", "example:main", "extra"],
+            &["run", "--pack", "pack", "command", "return 1", "extra"],
+            &["run", "--pack", "pack", "function", "#example:main"],
+            &["run", "--pack", "pack", "tag", "#example:entries"],
+        ] {
+            assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+        }
+
+        assert_eq!(
+            parse(&[
+                "run",
+                "--pack",
+                "pack",
+                "function",
+                "--arguments",
+                "{}",
+                "--arguments",
+                "{}",
+                "example:main",
+            ]),
+            Err(usage_error("duplicate --arguments"))
         );
     }
 
     #[test]
     fn run_options_have_independent_defaults() {
         assert_eq!(
-            parse(&["run", "--pack", "pack", "example:main"]).unwrap(),
+            parse(&["run", "--pack", "pack", "function", "example:main"]).unwrap(),
             CliCommand::Run {
                 packs: vec![PathBuf::from("pack")],
                 world_seed: None,
                 command_limit: DEFAULT_COMMAND_LIMIT,
                 context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
-                function_id: "example:main".to_owned(),
+                invocation: function("example:main"),
             }
         );
         assert_eq!(
@@ -427,6 +668,7 @@ mod tests {
                 "pack",
                 "--world-seed",
                 "123",
+                "function",
                 "example:main",
             ])
             .unwrap(),
@@ -435,7 +677,7 @@ mod tests {
                 world_seed: Some(123),
                 command_limit: DEFAULT_COMMAND_LIMIT,
                 context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
-                function_id: "example:main".to_owned(),
+                invocation: function("example:main"),
             }
         );
         assert_eq!(
@@ -445,6 +687,7 @@ mod tests {
                 "pack",
                 "--command-limit",
                 "12",
+                "function",
                 "example:main",
             ])
             .unwrap(),
@@ -453,7 +696,7 @@ mod tests {
                 world_seed: None,
                 command_limit: 12,
                 context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
-                function_id: "example:main".to_owned(),
+                invocation: function("example:main"),
             }
         );
         assert_eq!(
@@ -465,6 +708,7 @@ mod tests {
                 "1",
                 "2",
                 "3",
+                "function",
                 "example:main",
             ])
             .unwrap(),
@@ -473,7 +717,7 @@ mod tests {
                 world_seed: None,
                 command_limit: DEFAULT_COMMAND_LIMIT,
                 context: ExecutionContext::new(Position::new(1.0, 2.0, 3.0), DEFAULT_ROTATION),
-                function_id: "example:main".to_owned(),
+                invocation: function("example:main"),
             }
         );
         assert_eq!(
@@ -484,6 +728,7 @@ mod tests {
                 "--rotation",
                 "90",
                 "-45",
+                "function",
                 "example:main",
             ])
             .unwrap(),
@@ -492,7 +737,7 @@ mod tests {
                 world_seed: None,
                 command_limit: DEFAULT_COMMAND_LIMIT,
                 context: ExecutionContext::new(DEFAULT_POSITION, Rotation::new(90.0, -45.0)),
-                function_id: "example:main".to_owned(),
+                invocation: function("example:main"),
             }
         );
     }
@@ -512,8 +757,8 @@ mod tests {
             &["check", "--pack", "--pack", "pack"],
             &["check", "--pack", "--unknown"],
             &["check", "--pack", ""],
-            &["run", "--world-seed", "1", "example:main"],
-            &["run", "--command-limit", "1", "example:main"],
+            &["run", "--world-seed", "1", "function", "example:main"],
+            &["run", "--command-limit", "1", "function", "example:main"],
             &["run", "--pack", ""],
         ] {
             assert!(parse(arguments).is_err(), "accepted {arguments:?}");
@@ -530,6 +775,7 @@ mod tests {
                     OsString::from("pack"),
                     OsString::from("--world-seed"),
                     OsString::from(value.to_string()),
+                    OsString::from("function"),
                     OsString::from("example:main"),
                 ])
                 .unwrap(),
@@ -538,7 +784,7 @@ mod tests {
                     world_seed: Some(value),
                     command_limit: DEFAULT_COMMAND_LIMIT,
                     context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
-                    function_id: "example:main".to_owned(),
+                    invocation: function("example:main"),
                 }
             );
         }
@@ -552,6 +798,7 @@ mod tests {
                 "--world-seed",
                 "--command-limit",
                 "1",
+                "function",
                 "example:main",
             ],
             &[
@@ -560,6 +807,7 @@ mod tests {
                 "pack",
                 "--world-seed",
                 "+1",
+                "function",
                 "example:main",
             ],
             &[
@@ -568,6 +816,7 @@ mod tests {
                 "pack",
                 "--world-seed",
                 "1.0",
+                "function",
                 "example:main",
             ],
             &[
@@ -578,6 +827,7 @@ mod tests {
                 "1",
                 "--world-seed",
                 "2",
+                "function",
                 "example:main",
             ],
             &[
@@ -588,6 +838,7 @@ mod tests {
                 "1",
                 "--world-seed",
                 "2",
+                "function",
                 "example:main",
             ],
             &["check", "--pack", "pack", "--world-seed", "1"],
@@ -603,6 +854,7 @@ mod tests {
                     OsString::from("pack"),
                     OsString::from("--world-seed"),
                     OsString::from(overflow),
+                    OsString::from("function"),
                     OsString::from("example:main"),
                 ])
                 .is_err()
@@ -620,6 +872,7 @@ mod tests {
                 "pack",
                 "--world-seed",
                 "invalid",
+                "function",
                 "example:main",
             ]),
             Err(usage_error("invalid --world-seed \"invalid\""))
@@ -633,6 +886,7 @@ mod tests {
                 "1",
                 "--world-seed",
                 "2",
+                "function",
                 "example:main",
             ]),
             Err(usage_error("duplicate --world-seed"))
@@ -657,6 +911,7 @@ mod tests {
                 "pack",
                 "--command-limit",
                 "-1",
+                "function",
                 "example:main",
             ],
             &[
@@ -665,6 +920,7 @@ mod tests {
                 "pack",
                 "--command-limit",
                 "+1",
+                "function",
                 "example:main",
             ],
             &[
@@ -673,6 +929,7 @@ mod tests {
                 "pack",
                 "--command-limit",
                 "1.0",
+                "function",
                 "example:main",
             ],
             &[
@@ -683,6 +940,7 @@ mod tests {
                 "1",
                 "--command-limit",
                 "2",
+                "function",
                 "example:main",
             ],
         ] {
@@ -697,6 +955,7 @@ mod tests {
                 OsString::from("pack"),
                 OsString::from("--command-limit"),
                 OsString::from(overflow),
+                OsString::from("function"),
                 OsString::from("example:main"),
             ])
             .is_err()
@@ -718,6 +977,7 @@ mod tests {
                 "--rotation",
                 "0",
                 "0",
+                "function",
                 "example:main",
             ][..],
             &[
@@ -732,6 +992,7 @@ mod tests {
                 "0",
                 "--rotation",
                 "0",
+                "function",
                 "example:main",
             ],
             &[
@@ -747,6 +1008,7 @@ mod tests {
                 "--rotation",
                 "0",
                 "0",
+                "function",
                 "example:main",
             ],
             &[
@@ -762,6 +1024,7 @@ mod tests {
                 "--rotation",
                 "inf",
                 "0",
+                "function",
                 "example:main",
             ],
             &[
@@ -777,6 +1040,7 @@ mod tests {
                 "--rotation",
                 "0",
                 "0",
+                "function",
                 "example:main",
             ],
             &[
@@ -792,6 +1056,7 @@ mod tests {
                 "--rotation",
                 "1e39",
                 "0",
+                "function",
                 "example:main",
             ],
         ] {
@@ -820,6 +1085,7 @@ mod tests {
                 "--rotation",
                 "0",
                 "0",
+                "function",
                 "example:main",
                 "extra",
             ],

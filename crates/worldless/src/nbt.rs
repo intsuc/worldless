@@ -667,6 +667,17 @@ pub(crate) fn parse_compound(reader: &mut StringReader) -> Result<CompoundTag, S
     }
 }
 
+pub(crate) fn parse_compound_fully(input: &str) -> Result<CompoundTag, String> {
+    let mut reader = StringReader::new(input);
+    let compound = parse_compound(&mut reader)?;
+    reader.skip_whitespace();
+    if reader.can_read() {
+        Err(format!("trailing data at position {}", reader.cursor()))
+    } else {
+        Ok(compound)
+    }
+}
+
 struct SnbtParser<'a> {
     reader: &'a mut StringReader,
 }

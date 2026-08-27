@@ -8,7 +8,7 @@ use std::{
 };
 
 use worldless::{
-    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
 };
 
 const LIMIT: usize = 512;
@@ -56,8 +56,8 @@ impl Drop for TestPack {
     }
 }
 
-fn returned(success: bool, value: i32) -> FunctionOutcome {
-    FunctionOutcome::Returned { success, value }
+fn returned(success: bool, value: i32) -> ExecutionOutcome {
+    ExecutionOutcome::Result { success, value }
 }
 
 fn compile(functions: &[(&str, &str)], providers: &[(&str, &str)]) -> Vm {
@@ -85,9 +85,10 @@ fn load_memory(resources: impl IntoIterator<Item = MemoryResource>) -> Result<Vm
     Vm::from_packs([Pack::memory(resources)], None)
 }
 
-fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
+fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
     assert_eq!(
-        vm.execute_function(function, context(), LIMIT).unwrap(),
+        vm.execute_function(function, None, context(), LIMIT)
+            .unwrap(),
         expected,
         "{function}"
     );
@@ -234,7 +235,7 @@ fn fixed_score_and_storage_providers_use_their_java_numeric_conversions() {
         ],
     );
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:score_float", returned(true, 3));
     assert_function(&mut vm, "example:score_integer", returned(true, 4));
     assert_function(&mut vm, "example:storage_float", returned(true, -2));
@@ -314,7 +315,7 @@ fn json_lone_surrogates_are_preserved_in_fixed_score_targets_and_storage_paths()
         ],
     );
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:score", returned(true, 7));
     assert_function(&mut vm, "example:storage", returned(true, 9));
 }
@@ -573,7 +574,7 @@ fn data_compute_sources_cover_every_storage_modify_operation() {
         &[],
     );
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:set_float", returned(true, 1));
     assert_function(&mut vm, "example:verify_float", returned(true, 1));
     assert_function(&mut vm, "example:set_integer", returned(true, 1));
@@ -965,7 +966,7 @@ fn invalid_uniform_integer_range_aborts_the_execution_queue() {
     );
 
     assert!(matches!(
-        vm.execute_function("example:overflow", context(), LIMIT),
+        vm.execute_function("example:overflow", None, context(), LIMIT),
         Err(ExecutionError::NumberProviderEvaluationFailed { reason })
             if reason.contains("bound must be positive")
     ));
@@ -1002,5 +1003,5 @@ fn macro_instantiation_uses_the_same_provider_registry_and_inline_parser() {
 
     assert_function(&mut vm, "example:inline_call", returned(true, -1));
     assert_function(&mut vm, "example:named_call", returned(true, 6));
-    assert_function(&mut vm, "example:bad_call", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:bad_call", ExecutionOutcome::NoResult);
 }

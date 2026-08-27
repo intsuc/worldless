@@ -1,5 +1,5 @@
 use worldless::{
-    ExecutionContext, ExecutionError, FunctionOutcome, MemoryResource, Pack, Position,
+    ExecutionContext, ExecutionError, ExecutionOutcome, MemoryResource, Pack, Position,
     ResourceKind, Rotation, Vm,
 };
 
@@ -38,15 +38,15 @@ fn context(x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> ExecutionContext {
     ExecutionContext::new(Position::new(x, y, z), Rotation::new(yaw, pitch))
 }
 
-fn returned(value: i32) -> FunctionOutcome {
-    FunctionOutcome::Returned {
+fn returned(value: i32) -> ExecutionOutcome {
+    ExecutionOutcome::Result {
         success: true,
         value,
     }
 }
 
-fn execute(vm: &mut Vm, id: &str, initial: ExecutionContext) -> FunctionOutcome {
-    vm.execute_function(id, initial, LIMIT).unwrap()
+fn execute(vm: &mut Vm, id: &str, initial: ExecutionContext) -> ExecutionOutcome {
+    vm.execute_function(id, None, initial, LIMIT).unwrap()
 }
 
 #[test]
@@ -318,20 +318,20 @@ fn context_redirects_consume_quota_even_when_the_chain_is_inactive() {
     let initial = context(1.0, 2.0, 3.0, 4.0, 5.0);
 
     assert_eq!(
-        vm.execute_function("example:all_transforms", initial, 6),
+        vm.execute_function("example:all_transforms", None, initial, 6),
         Err(ExecutionError::CommandLimitExceeded { limit: 6 })
     );
     assert_eq!(
-        vm.execute_function("example:all_transforms", initial, 7),
+        vm.execute_function("example:all_transforms", None, initial, 7),
         Ok(returned(61))
     );
     assert_eq!(
-        vm.execute_function("example:inactive", initial, 4),
+        vm.execute_function("example:inactive", None, initial, 4),
         Err(ExecutionError::CommandLimitExceeded { limit: 4 })
     );
     assert_eq!(
-        vm.execute_function("example:inactive", initial, 5),
-        Ok(FunctionOutcome::Returned {
+        vm.execute_function("example:inactive", None, initial, 5),
+        Ok(ExecutionOutcome::Result {
             success: false,
             value: 0,
         })

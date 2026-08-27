@@ -8,8 +8,7 @@ use std::{
 };
 
 use worldless::{
-    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, ResourceOrigin,
-    Vm,
+    ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, ResourceOrigin, Vm,
 };
 
 const LIMIT: usize = 256;
@@ -85,16 +84,16 @@ fn predicate_tag(id: &str, source: &str) -> MemoryResource {
     resource(ResourceKind::PredicateTag, id, source)
 }
 
-fn returned(value: i32) -> FunctionOutcome {
-    FunctionOutcome::Returned {
+fn returned(value: i32) -> ExecutionOutcome {
+    ExecutionOutcome::Result {
         success: true,
         value,
     }
 }
 
-fn assert_function(vm: &mut Vm, id: &str, expected: FunctionOutcome) {
+fn assert_function(vm: &mut Vm, id: &str, expected: ExecutionOutcome) {
     assert_eq!(
-        vm.execute_function(id, context(), LIMIT).unwrap(),
+        vm.execute_function(id, None, context(), LIMIT).unwrap(),
         expected,
         "{id}"
     );
@@ -257,11 +256,11 @@ fn function_tags_append_replace_and_resolve_after_all_packs_are_composed() {
     ]);
 
     let mut vm = Vm::from_packs([low, high], None).unwrap();
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:run_append", returned(123));
-    assert_function(&mut vm, "example:reset", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:reset", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:run_replaced", returned(4));
-    assert_function(&mut vm, "example:reset", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:reset", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:run_old_cycle", returned(4));
 }
 
@@ -372,10 +371,12 @@ fn directory_and_memory_packs_share_the_same_priority_order() {
 fn an_empty_pack_stack_builds_an_empty_vm() {
     let mut vm = Vm::from_packs(std::iter::empty::<Pack>(), None).unwrap();
     assert_eq!(
-        vm.execute_function("example:missing", context(), LIMIT),
-        Err(ExecutionError::UnknownFunction {
-            id: "example:missing".to_owned(),
-        })
+        vm.execute_function("example:missing", None, context(), LIMIT)
+            .unwrap(),
+        ExecutionOutcome::Result {
+            success: false,
+            value: 0,
+        }
     );
 }
 

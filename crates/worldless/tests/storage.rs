@@ -2,13 +2,13 @@ mod common;
 
 use common::context;
 use worldless::{
-    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
 };
 
 const LIMIT: usize = 512;
 
-fn returned(success: bool, value: i32) -> FunctionOutcome {
-    FunctionOutcome::Returned { success, value }
+fn returned(success: bool, value: i32) -> ExecutionOutcome {
+    ExecutionOutcome::Result { success, value }
 }
 
 fn compile(functions: &[(&str, &str)]) -> Vm {
@@ -29,9 +29,10 @@ where
     )
 }
 
-fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
+fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
     assert_eq!(
-        vm.execute_function(function, context(), LIMIT).unwrap(),
+        vm.execute_function(function, None, context(), LIMIT)
+            .unwrap(),
         expected,
         "{function}"
     );
@@ -84,7 +85,7 @@ fn command_storage_is_persistent_namespaced_and_empty_when_missing() {
 
     assert_function(&mut vm, "example:get_missing_root", returned(true, 1));
     assert_function(&mut vm, "example:get_missing_path", returned(false, 0));
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:read_example", returned(true, 7));
     assert_function(&mut vm, "example:read_other", returned(true, 9));
     assert_function(&mut vm, "example:read_default", returned(true, 11));
@@ -213,7 +214,7 @@ fn target_snbt_literals_and_data_get_preserve_types_and_java_values() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     for (function, value) in [
         ("example:get_byte", 1),
         ("example:get_short", 2),
@@ -267,7 +268,7 @@ fn unicode_name_escapes_follow_java_se_25_character_names() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:exact_values", returned(true, 1));
     assert_function(&mut vm, "example:tangut_length", returned(true, 2));
 
@@ -366,7 +367,7 @@ fn data_get_and_nbt_paths_match_java_selection_rules() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:quoted_key", returned(true, 7));
     assert_function(&mut vm, "example:dotted_key", returned(false, 0));
     assert_function(&mut vm, "example:nested", returned(true, 8));
@@ -439,7 +440,7 @@ fn data_merge_and_remove_report_only_real_changes() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:merge", returned(true, 1));
     assert_function(&mut vm, "example:merge_again", returned(false, 0));
     assert_function(&mut vm, "example:merge_empty", returned(false, 0));
@@ -530,7 +531,7 @@ fn data_modify_set_and_from_create_paths_and_count_changed_targets() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:create_path", returned(true, 1));
     assert_function(&mut vm, "example:create_path_again", returned(false, 0));
     assert_function(&mut vm, "example:set_all", returned(true, 3));
@@ -663,7 +664,7 @@ fn data_modify_insert_prepend_and_append_preserve_order_and_collection_rules() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:append", returned(true, 1));
     assert_function(&mut vm, "example:prepend", returned(true, 1));
     assert_function(&mut vm, "example:insert", returned(true, 1));
@@ -813,7 +814,7 @@ data merge storage example:string_target {object:{base:0,nested:{z:3}},objects:[
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:merge_sources", returned(true, 1));
     assert_function(&mut vm, "example:merge_targets", returned(true, 2));
     assert_function(&mut vm, "example:merge_non_compound", returned(false, 0));
@@ -888,7 +889,7 @@ fn data_conditions_chain_and_publish_counts_to_result_consumers() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:passing_chain", returned(true, 9));
     assert_function(&mut vm, "example:failing_if", returned(false, 0));
     assert_function(&mut vm, "example:failing_unless", returned(false, 0));
@@ -979,7 +980,7 @@ fn execute_store_storage_uses_java_numeric_conversions_and_callback_order() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     for (function, outcome) in [
         ("example:store_byte", returned(true, 3)),
         ("example:store_short", returned(true, 7)),
@@ -1037,32 +1038,32 @@ fn storage_side_effects_before_the_command_limit_are_not_rolled_back() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_eq!(
-        vm.execute_function("example:modify_at_limit", context(), 2),
+        vm.execute_function("example:modify_at_limit", None, context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_function(&mut vm, "example:read_modified", returned(true, 7));
     assert_eq!(
-        vm.execute_function("example:store_at_limit", context(), 2),
+        vm.execute_function("example:store_at_limit", None, context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_function(&mut vm, "example:read_stored", returned(true, 6));
     assert_eq!(
-        vm.execute_function("example:condition_at_limit", context(), 2),
+        vm.execute_function("example:condition_at_limit", None, context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_eq!(
-        vm.execute_function("example:condition_at_limit", context(), 3)
+        vm.execute_function("example:condition_at_limit", None, context(), 3)
             .unwrap(),
         returned(true, 9)
     );
     assert_eq!(
-        vm.execute_function("example:terminal_condition_at_limit", context(), 2),
+        vm.execute_function("example:terminal_condition_at_limit", None, context(), 2),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_eq!(
-        vm.execute_function("example:terminal_condition_at_limit", context(), 3)
+        vm.execute_function("example:terminal_condition_at_limit", None, context(), 3)
             .unwrap(),
         returned(true, 1)
     );
@@ -1121,7 +1122,7 @@ fn failed_path_creation_observes_command_storage_aliasing() {
         ),
     ]);
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:fail_existing", returned(false, 0));
     assert_function(&mut vm, "example:read_existing_partial", returned(true, 0));
     assert_function(&mut vm, "example:fail_missing", returned(false, 0));

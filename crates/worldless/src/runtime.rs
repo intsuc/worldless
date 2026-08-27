@@ -4,7 +4,7 @@ use crate::{
     execution_context::ExecutionContext,
     loader::CommandCompiler,
     macro_function::Function,
-    nbt::{CommandStorage, JavaString, Tag},
+    nbt::{CommandStorage, CompoundTag, JavaString, Tag},
     program::{
         Command, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation, DataSource,
         FunctionArguments, Instruction, Modifier, ObjectiveId, PredicateCondition, Program,
@@ -15,21 +15,20 @@ use crate::{
     resource::{FunctionReference, Identifier},
 };
 
-/// The observable result of a function invocation.
+/// The observable result of a VM invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FunctionOutcome {
-    /// The function reached its end without executing `return`.
-    FellThrough,
-    /// The function explicitly returned a command result.
-    Returned { success: bool, value: i32 },
+pub enum ExecutionOutcome {
+    /// Execution completed without invoking the top-level result callback.
+    NoResult,
+    /// Execution invoked the top-level result callback.
+    Result { success: bool, value: i32 },
 }
 
-/// An error that prevents a function invocation from completing.
+/// An error that prevents a VM invocation from completing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionError {
-    InvalidFunctionIdentifier { input: String },
-    UnknownFunction { id: String },
-    FunctionInstantiationFailed { id: String, reason: String },
+    InvalidFunctionReference { input: String },
+    CommandCompilationFailed { reason: String },
     NumberProviderEvaluationFailed { reason: String },
     MissingWorldSeed { sequence: String },
     CommandLimitExceeded { limit: usize },
@@ -38,12 +37,11 @@ pub enum ExecutionError {
 impl fmt::Display for ExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidFunctionIdentifier { input } => {
-                write!(formatter, "invalid function identifier {input:?}")
+            Self::InvalidFunctionReference { input } => {
+                write!(formatter, "invalid function reference {input:?}")
             }
-            Self::UnknownFunction { id } => write!(formatter, "unknown function {id}"),
-            Self::FunctionInstantiationFailed { id, reason } => {
-                write!(formatter, "failed to instantiate function {id}: {reason}")
+            Self::CommandCompilationFailed { reason } => {
+                write!(formatter, "command compilation failed: {reason}")
             }
             Self::NumberProviderEvaluationFailed { reason } => {
                 write!(formatter, "number provider evaluation failed: {reason}")
@@ -104,53 +102,62 @@ enum StoreAction {
 
 #[derive(Clone)]
 enum ConsumerEnd {
-    Ignore,
     TopLevel,
     FunctionCondition(Rc<Cell<Option<i32>>>),
     FunctionTag(Rc<Cell<Option<i32>>>),
 }
 
 #[derive(Clone)]
+enum ConsumerAction {
+    Store(StoreAction),
+    End(ConsumerEnd),
+}
+
+#[derive(Clone, Default)]
 struct ResultConsumer {
-    stores: Vec<StoreAction>,
-    end: ConsumerEnd,
+    actions: Vec<ConsumerAction>,
 }
 
 impl ResultConsumer {
-    fn top_level() -> Self {
-        Self {
-            stores: Vec::new(),
-            end: ConsumerEnd::TopLevel,
-        }
+    fn empty() -> Self {
+        Self::default()
     }
 
-    fn ignoring(stores: Vec<StoreAction>) -> Self {
+    fn top_level() -> Self {
         Self {
-            stores,
-            end: ConsumerEnd::Ignore,
+            actions: vec![ConsumerAction::End(ConsumerEnd::TopLevel)],
         }
     }
 
     fn function_condition(result: Rc<Cell<Option<i32>>>) -> Self {
         Self {
-            stores: Vec::new(),
-            end: ConsumerEnd::FunctionCondition(result),
+            actions: vec![ConsumerAction::End(ConsumerEnd::FunctionCondition(result))],
         }
     }
 
     fn function_tag(result: Rc<Cell<Option<i32>>>) -> Self {
         Self {
-            stores: Vec::new(),
-            end: ConsumerEnd::FunctionTag(result),
+            actions: vec![ConsumerAction::End(ConsumerEnd::FunctionTag(result))],
         }
     }
 
     fn with_prefix(&self, mut prefix: Vec<StoreAction>) -> Self {
-        prefix.extend(self.stores.iter().cloned());
-        Self {
-            stores: prefix,
-            end: self.end.clone(),
-        }
+        let mut actions = prefix
+            .drain(..)
+            .map(ConsumerAction::Store)
+            .collect::<Vec<_>>();
+        actions.extend(self.actions.iter().cloned());
+        Self { actions }
+    }
+
+    fn chain(&self, other: &Self) -> Self {
+        let mut actions = self.actions.clone();
+        actions.extend(other.actions.iter().cloned());
+        Self { actions }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.actions.is_empty()
     }
 
     fn accept(
@@ -158,51 +165,47 @@ impl ResultConsumer {
         result: CommandResult,
         scoreboard: &mut Scoreboard,
         command_storage: &mut CommandStorage,
-        top_level_result: &mut Option<FunctionOutcome>,
+        top_level_result: &mut Option<ExecutionOutcome>,
     ) {
-        for store in &self.stores {
-            match store {
-                StoreAction::Score {
+        for action in &self.actions {
+            match action {
+                ConsumerAction::Store(StoreAction::Score {
                     kind,
                     holders,
                     objective,
-                } => {
+                }) => {
                     let value = stored_command_value(*kind, result);
                     for holder in holders {
                         scoreboard.set_score_by_id(holder, *objective, value);
                     }
                 }
-                StoreAction::Storage {
+                ConsumerAction::Store(StoreAction::Storage {
                     kind,
                     storage,
                     path,
                     number_type,
                     scale,
-                } => {
+                }) => {
                     let value = storage_number(
                         *number_type,
                         f64::from(stored_command_value(*kind, result)) * scale,
                     );
                     let _ = command_storage.edit(storage, |data| path.set(data, value));
                 }
-            }
-        }
-
-        match &self.end {
-            ConsumerEnd::Ignore => {}
-            ConsumerEnd::TopLevel => {
-                *top_level_result = Some(FunctionOutcome::Returned {
-                    success: result.success,
-                    value: result.value,
-                });
-            }
-            ConsumerEnd::FunctionCondition(condition_result) => {
-                condition_result.set(Some(result.value));
-            }
-            ConsumerEnd::FunctionTag(tag_result) => {
-                tag_result.set(Some(
-                    tag_result.get().unwrap_or(0).wrapping_add(result.value),
-                ));
+                ConsumerAction::End(ConsumerEnd::TopLevel) => {
+                    *top_level_result = Some(ExecutionOutcome::Result {
+                        success: result.success,
+                        value: result.value,
+                    });
+                }
+                ConsumerAction::End(ConsumerEnd::FunctionCondition(condition_result)) => {
+                    condition_result.set(Some(result.value));
+                }
+                ConsumerAction::End(ConsumerEnd::FunctionTag(tag_result)) => {
+                    tag_result.set(Some(
+                        tag_result.get().unwrap_or(0).wrapping_add(result.value),
+                    ));
+                }
             }
         }
     }
@@ -214,6 +217,7 @@ struct Frame {
     next_instruction: usize,
     depth: usize,
     discard_depth: usize,
+    source_consumer: ResultConsumer,
     result_consumer: ResultConsumer,
 }
 
@@ -252,7 +256,7 @@ enum QueueEntry {
         context: ExecutionContext,
         functions: Arc<[Arc<[Instruction]>]>,
         next_function: usize,
-        stores: Vec<StoreAction>,
+        consumer: ResultConsumer,
         result: Option<Rc<Cell<Option<i32>>>>,
     },
     Fallthrough {
@@ -295,7 +299,42 @@ impl CommandQuota {
     }
 }
 
-pub(crate) fn execute(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_function(
+    program: &Program,
+    scoreboard: &mut Scoreboard,
+    command_storage: &mut CommandStorage,
+    random: &mut RandomState,
+    input: &str,
+    arguments: Option<&CompoundTag>,
+    context: ExecutionContext,
+    command_limit: usize,
+) -> Result<ExecutionOutcome, ExecutionError> {
+    let reference = FunctionReference::parse(input).ok_or_else(|| {
+        ExecutionError::InvalidFunctionReference {
+            input: input.to_owned(),
+        }
+    })?;
+    let instruction = Instruction {
+        modifiers: Vec::new(),
+        command: Command::Function {
+            reference,
+            arguments: arguments.cloned().map(FunctionArguments::Compound),
+        },
+    };
+    execute_instruction(
+        program,
+        scoreboard,
+        command_storage,
+        random,
+        instruction,
+        None,
+        context,
+        command_limit,
+    )
+}
+
+pub(crate) fn execute_command(
     program: &Program,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
@@ -303,23 +342,43 @@ pub(crate) fn execute(
     input: &str,
     context: ExecutionContext,
     command_limit: usize,
-) -> Result<FunctionOutcome, ExecutionError> {
-    let id = Identifier::parse(input).ok_or_else(|| ExecutionError::InvalidFunctionIdentifier {
-        input: input.to_owned(),
-    })?;
-    let definition = find_function(program, &id)?;
-    let mut compiler = None;
-    let function = instantiate_function(definition, None, &mut compiler, program.loot_registry())
-        .map_err(|reason| ExecutionError::FunctionInstantiationFailed {
-        id: id.to_string(),
-        reason,
-    })?;
-    let mut queue = VecDeque::from([QueueEntry::Call(Frame {
+) -> Result<ExecutionOutcome, ExecutionError> {
+    let command = input.strip_prefix('/').unwrap_or(input);
+    let compiler = CommandCompiler::with_loot_registry(Arc::clone(program.loot_registry()));
+    let instruction = compiler
+        .compile(command)
+        .map_err(|reason| ExecutionError::CommandCompilationFailed { reason })?;
+    execute_instruction(
+        program,
+        scoreboard,
+        command_storage,
+        random,
+        instruction,
+        Some(compiler),
+        context,
+        command_limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_instruction(
+    program: &Program,
+    scoreboard: &mut Scoreboard,
+    command_storage: &mut CommandStorage,
+    random: &mut RandomState,
+    instruction: Instruction,
+    mut compiler: Option<CommandCompiler>,
+    context: ExecutionContext,
+    command_limit: usize,
+) -> Result<ExecutionOutcome, ExecutionError> {
+    let function = Arc::<[Instruction]>::from([instruction]);
+    let mut queue = VecDeque::from([QueueEntry::Step(Frame {
         function,
         context,
         next_instruction: 0,
         depth: 0,
         discard_depth: 0,
+        source_consumer: ResultConsumer::top_level(),
         result_consumer: ResultConsumer::top_level(),
     })]);
     let mut quota = CommandQuota::new(command_limit);
@@ -332,7 +391,7 @@ pub(crate) fn execute(
             });
         }
         let Some(entry) = queue.pop_front() else {
-            return Ok(top_level_result.unwrap_or(FunctionOutcome::FellThrough));
+            return Ok(top_level_result.unwrap_or(ExecutionOutcome::NoResult));
         };
 
         match entry {
@@ -539,6 +598,7 @@ pub(crate) fn execute(
                                     next_instruction: 0,
                                     depth: isolated_depth,
                                     discard_depth: isolated_depth,
+                                    source_consumer: ResultConsumer::empty(),
                                     result_consumer: result_consumer.clone(),
                                 }));
                             }
@@ -595,26 +655,35 @@ pub(crate) fn execute(
                     Command::Function {
                         reference,
                         arguments,
-                    } => execute_function_command(
-                        program,
-                        scoreboard,
-                        command_storage,
-                        &mut compiler,
-                        &mut queue,
-                        &mut top_level_result,
-                        frame,
-                        context,
-                        reference,
-                        arguments.as_ref(),
-                        stores,
-                        return_run,
-                    ),
+                    } => {
+                        let command_consumer = frame.source_consumer.with_prefix(stores);
+                        execute_function_command(
+                            program,
+                            scoreboard,
+                            command_storage,
+                            &mut compiler,
+                            &mut queue,
+                            &mut top_level_result,
+                            frame,
+                            context,
+                            reference,
+                            arguments.as_ref(),
+                            command_consumer,
+                            return_run,
+                        );
+                    }
                     Command::Return { success, value } => {
                         let result = CommandResult {
                             success: *success,
                             value: *value,
                         };
-                        frame.result_consumer.with_prefix(stores).accept(
+                        frame.source_consumer.with_prefix(stores).accept(
+                            result,
+                            scoreboard,
+                            command_storage,
+                            &mut top_level_result,
+                        );
+                        frame.result_consumer.accept(
                             result,
                             scoreboard,
                             command_storage,
@@ -697,7 +766,7 @@ pub(crate) fn execute(
                     }
                     continue;
                 };
-                ResultConsumer::ignoring(stores).accept(
+                frame.source_consumer.with_prefix(stores).accept(
                     result,
                     scoreboard,
                     command_storage,
@@ -743,12 +812,12 @@ pub(crate) fn execute(
                 context,
                 functions,
                 next_function,
-                stores,
+                consumer,
                 result,
             } => {
                 let Some(function) = functions.get(next_function).map(Arc::clone) else {
                     if let Some(value) = result.as_ref().and_then(|result| result.get()) {
-                        ResultConsumer::ignoring(stores).accept(
+                        consumer.accept(
                             CommandResult::success(value),
                             scoreboard,
                             command_storage,
@@ -759,16 +828,17 @@ pub(crate) fn execute(
                     continue;
                 };
                 let child_depth = frame.depth + 1;
-                let result_consumer = result.as_ref().map_or_else(
-                    || ResultConsumer::ignoring(Vec::new()),
-                    |result| ResultConsumer::function_tag(Rc::clone(result)),
-                );
+                let result_consumer = result
+                    .as_ref()
+                    .map_or_else(ResultConsumer::empty, |result| {
+                        ResultConsumer::function_tag(Rc::clone(result))
+                    });
                 queue.push_front(QueueEntry::ContinueFunctionTag {
                     frame,
                     context,
                     functions,
                     next_function: next_function + 1,
-                    stores,
+                    consumer,
                     result,
                 });
                 queue.push_front(QueueEntry::Call(Frame {
@@ -777,6 +847,7 @@ pub(crate) fn execute(
                     next_instruction: 0,
                     depth: child_depth,
                     discard_depth: child_depth,
+                    source_consumer: ResultConsumer::empty(),
                     result_consumer,
                 }));
             }
@@ -804,12 +875,12 @@ fn execute_function_command(
     command_storage: &mut CommandStorage,
     compiler: &mut Option<CommandCompiler>,
     queue: &mut VecDeque<QueueEntry>,
-    top_level_result: &mut Option<FunctionOutcome>,
+    top_level_result: &mut Option<ExecutionOutcome>,
     frame: Frame,
     context: ExecutionContext,
     reference: &FunctionReference,
     argument_source: Option<&FunctionArguments>,
-    stores: Vec<StoreAction>,
+    command_consumer: ResultConsumer,
     return_run: bool,
 ) {
     let functions = match program.resolve_functions(reference) {
@@ -819,7 +890,7 @@ fn execute_function_command(
                 frame,
                 context,
                 Vec::new(),
-                stores,
+                command_consumer,
                 return_run,
                 scoreboard,
                 command_storage,
@@ -838,7 +909,7 @@ fn execute_function_command(
                 frame,
                 context,
                 Vec::new(),
-                stores,
+                command_consumer,
                 return_run,
                 scoreboard,
                 command_storage,
@@ -857,7 +928,7 @@ fn execute_function_command(
             frame,
             context,
             instances,
-            stores,
+            command_consumer,
             return_run,
             scoreboard,
             command_storage,
@@ -873,11 +944,18 @@ fn execute_function_command(
                     .first()
                     .expect("a resolved single function produces one instance"),
             ),
-            stores,
+            command_consumer,
             return_run,
         );
     } else {
-        queue_function_tag(queue, frame, context, instances, stores, return_run);
+        queue_function_tag(
+            queue,
+            frame,
+            context,
+            instances,
+            command_consumer,
+            return_run,
+        );
     }
 }
 
@@ -944,14 +1022,14 @@ fn fail_function_command(
     frame: Frame,
     context: ExecutionContext,
     instances: Vec<Arc<[Instruction]>>,
-    stores: Vec<StoreAction>,
+    command_consumer: ResultConsumer,
     return_run: bool,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
-    top_level_result: &mut Option<FunctionOutcome>,
+    top_level_result: &mut Option<ExecutionOutcome>,
 ) {
     if return_run {
-        ResultConsumer::ignoring(stores.clone()).accept(
+        command_consumer.accept(
             CommandResult::FAILURE,
             scoreboard,
             command_storage,
@@ -959,7 +1037,7 @@ fn fail_function_command(
         );
         let child_depth = frame.depth + 1;
         let discard_depth = frame.discard_depth;
-        let child_consumer = frame.result_consumer.with_prefix(stores);
+        let child_consumer = command_consumer.chain(&frame.result_consumer);
         for function in instances.into_iter().rev() {
             queue.push_front(QueueEntry::Call(Frame {
                 function,
@@ -967,11 +1045,12 @@ fn fail_function_command(
                 next_instruction: 0,
                 depth: child_depth,
                 discard_depth,
+                source_consumer: ResultConsumer::empty(),
                 result_consumer: child_consumer.clone(),
             }));
         }
     } else {
-        ResultConsumer::ignoring(stores).accept(
+        command_consumer.accept(
             CommandResult::FAILURE,
             scoreboard,
             command_storage,
@@ -985,7 +1064,7 @@ fn fail_function_command(
                 context,
                 functions: Arc::from(instances),
                 next_function: 0,
-                stores: Vec::new(),
+                consumer: ResultConsumer::empty(),
                 result: None,
             });
         }
@@ -997,19 +1076,21 @@ fn queue_single_function(
     frame: Frame,
     context: ExecutionContext,
     function: Arc<[Instruction]>,
-    stores: Vec<StoreAction>,
+    command_consumer: ResultConsumer,
     return_run: bool,
 ) {
     let child_depth = frame.depth + 1;
     if return_run {
         let parent_consumer = frame.result_consumer;
+        let child_consumer = command_consumer.chain(&parent_consumer);
         let child = Frame {
             function,
             context,
             next_instruction: 0,
             depth: child_depth,
             discard_depth: frame.discard_depth,
-            result_consumer: parent_consumer.with_prefix(stores),
+            source_consumer: ResultConsumer::empty(),
+            result_consumer: child_consumer,
         };
         queue.push_front(QueueEntry::Fallthrough {
             depth: frame.depth,
@@ -1024,7 +1105,8 @@ fn queue_single_function(
             next_instruction: 0,
             depth: child_depth,
             discard_depth: child_depth,
-            result_consumer: ResultConsumer::ignoring(stores),
+            source_consumer: ResultConsumer::empty(),
+            result_consumer: command_consumer,
         };
         schedule_next_instruction(queue, frame);
         queue.push_front(QueueEntry::Call(child));
@@ -1036,7 +1118,7 @@ fn queue_function_tag(
     frame: Frame,
     context: ExecutionContext,
     functions: Vec<Arc<[Instruction]>>,
-    stores: Vec<StoreAction>,
+    command_consumer: ResultConsumer,
     return_run: bool,
 ) {
     if return_run {
@@ -1044,7 +1126,7 @@ fn queue_function_tag(
         let fallback_depth = frame.depth;
         let discard_depth = frame.discard_depth;
         let parent_consumer = frame.result_consumer;
-        let child_consumer = parent_consumer.with_prefix(stores);
+        let child_consumer = command_consumer.chain(&parent_consumer);
         queue.push_front(QueueEntry::Fallthrough {
             depth: fallback_depth,
             discard_depth,
@@ -1057,17 +1139,18 @@ fn queue_function_tag(
                 next_instruction: 0,
                 depth: child_depth,
                 discard_depth,
+                source_consumer: ResultConsumer::empty(),
                 result_consumer: child_consumer.clone(),
             }));
         }
     } else {
-        let result = (!stores.is_empty()).then(|| Rc::new(Cell::new(None)));
+        let result = (!command_consumer.is_empty()).then(|| Rc::new(Cell::new(None)));
         queue.push_front(QueueEntry::ContinueFunctionTag {
             frame,
             context,
             functions: Arc::from(functions),
             next_function: 0,
-            stores,
+            consumer: command_consumer,
             result,
         });
     }
@@ -1506,15 +1589,6 @@ fn schedule_next_instruction(queue: &mut VecDeque<QueueEntry>, frame: Frame) {
 
 fn discard_at_depth_or_higher(queue: &mut VecDeque<QueueEntry>, depth: usize) {
     queue.retain(|entry| entry.depth() < depth);
-}
-
-fn find_function<'a>(
-    program: &'a Program,
-    id: &Identifier,
-) -> Result<&'a Function, ExecutionError> {
-    program
-        .function(id)
-        .ok_or_else(|| ExecutionError::UnknownFunction { id: id.to_string() })
 }
 
 fn instantiate_function(

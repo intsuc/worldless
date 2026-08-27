@@ -1,12 +1,12 @@
 mod common;
 
 use common::context;
-use worldless::{FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm};
+use worldless::{ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm};
 
 const LIMIT: usize = 256;
 
-fn returned(success: bool, value: i32) -> FunctionOutcome {
-    FunctionOutcome::Returned { success, value }
+fn returned(success: bool, value: i32) -> ExecutionOutcome {
+    ExecutionOutcome::Result { success, value }
 }
 
 fn compile(functions: &[(&str, &str)]) -> Vm {
@@ -58,52 +58,52 @@ fn objective_lifecycle_reports_post_mutation_counts() {
     ]);
 
     assert_eq!(
-        vm.execute_function("example:list", context(), LIMIT)
+        vm.execute_function("example:list", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:add_first", context(), LIMIT)
+        vm.execute_function("example:add_first", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:add_second", context(), LIMIT)
+        vm.execute_function("example:add_second", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2)
     );
     assert_eq!(
-        vm.execute_function("example:add_duplicate", context(), LIMIT)
+        vm.execute_function("example:add_duplicate", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:list", context(), LIMIT)
+        vm.execute_function("example:list", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2)
     );
     assert_eq!(
-        vm.execute_function("example:remove_missing", context(), LIMIT)
+        vm.execute_function("example:remove_missing", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:list", context(), LIMIT)
+        vm.execute_function("example:list", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2)
     );
     assert_eq!(
-        vm.execute_function("example:remove_first", context(), LIMIT)
+        vm.execute_function("example:remove_first", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:remove_second", context(), LIMIT)
+        vm.execute_function("example:remove_second", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:list", context(), LIMIT)
+        vm.execute_function("example:list", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
@@ -151,86 +151,86 @@ fn reset_and_list_manage_score_and_holder_lifetimes() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:list_all", context(), LIMIT)
+        vm.execute_function("example:list_all", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2)
     );
     assert_eq!(
-        vm.execute_function("example:list_one", context(), LIMIT)
+        vm.execute_function("example:list_one", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2)
     );
     assert_eq!(
-        vm.execute_function("example:list_absent", context(), LIMIT)
+        vm.execute_function("example:list_absent", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:list_all", context(), LIMIT)
+        vm.execute_function("example:list_all", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2),
         "listing an absent holder must not start tracking it"
     );
 
     assert_eq!(
-        vm.execute_function("example:reset_one_first", context(), LIMIT)
+        vm.execute_function("example:reset_one_first", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:get_one_first", context(), LIMIT)
+        vm.execute_function("example:get_one_first", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0),
         "reset deletes a score instead of setting it to zero"
     );
     assert_eq!(
-        vm.execute_function("example:list_one", context(), LIMIT)
+        vm.execute_function("example:list_one", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:reset_one_first", context(), LIMIT)
+        vm.execute_function("example:reset_one_first", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1),
         "reset reports addressed holders even when no score was removed"
     );
     assert_eq!(
-        vm.execute_function("example:list_one", context(), LIMIT)
+        vm.execute_function("example:list_one", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
 
     assert_eq!(
-        vm.execute_function("example:reset_one_second", context(), LIMIT)
+        vm.execute_function("example:reset_one_second", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:list_all", context(), LIMIT)
+        vm.execute_function("example:list_all", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1),
         "removing a holder's last score stops tracking that holder"
     );
     assert_eq!(
-        vm.execute_function("example:reset_unknown_objective", context(), LIMIT)
+        vm.execute_function("example:reset_unknown_objective", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:reset_two", context(), LIMIT)
+        vm.execute_function("example:reset_two", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:reset_absent", context(), LIMIT)
+        vm.execute_function("example:reset_absent", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:list_all", context(), LIMIT)
+        vm.execute_function("example:list_all", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
@@ -274,61 +274,61 @@ fn removing_objectives_clears_scores_but_retains_tracked_holders() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:remove_first", context(), LIMIT)
+        vm.execute_function("example:remove_first", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:list_all", context(), LIMIT)
+        vm.execute_function("example:list_all", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2)
     );
     assert_eq!(
-        vm.execute_function("example:list_only", context(), LIMIT)
+        vm.execute_function("example:list_only", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:list_both", context(), LIMIT)
+        vm.execute_function("example:list_both", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:get_only_first", context(), LIMIT)
+        vm.execute_function("example:get_only_first", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:get_both_second", context(), LIMIT)
+        vm.execute_function("example:get_both_second", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2)
     );
 
     assert_eq!(
-        vm.execute_function("example:remove_second", context(), LIMIT)
+        vm.execute_function("example:remove_second", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:list_all", context(), LIMIT)
+        vm.execute_function("example:list_all", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2)
     );
     assert_eq!(
-        vm.execute_function("example:list_both", context(), LIMIT)
+        vm.execute_function("example:list_both", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:readd_first", context(), LIMIT)
+        vm.execute_function("example:readd_first", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:get_only_first", context(), LIMIT)
+        vm.execute_function("example:get_only_first", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0),
         "re-adding an objective must not revive scores from its old identity"
@@ -364,28 +364,29 @@ fn wildcard_score_changes_include_empty_tracked_holders_and_sum_final_values() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:set", context(), LIMIT)
+        vm.execute_function("example:set", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0),
         "the wildcard includes holders retained empty by objective removal"
     );
     assert_eq!(
-        vm.execute_function("example:add", context(), LIMIT)
+        vm.execute_function("example:add", None, context(), LIMIT)
             .unwrap(),
         returned(true, 4)
     );
     assert_eq!(
-        vm.execute_function("example:remove", context(), LIMIT)
+        vm.execute_function("example:remove", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0),
         "a zero result from nonempty wildcard targets is still successful"
     );
     for function in ["example:get_one", "example:get_two"] {
         assert_eq!(
-            vm.execute_function(function, context(), LIMIT).unwrap(),
+            vm.execute_function(function, None, context(), LIMIT)
+                .unwrap(),
             returned(true, 0),
             "{function}"
         );
@@ -446,15 +447,15 @@ fn wildcard_operations_use_the_current_tracked_holder_snapshot() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:sum_sources", context(), LIMIT)
+        vm.execute_function("example:sum_sources", None, context(), LIMIT)
             .unwrap(),
         returned(true, 15)
     );
     assert_eq!(
-        vm.execute_function("example:update_targets", context(), LIMIT)
+        vm.execute_function("example:update_targets", None, context(), LIMIT)
             .unwrap(),
         returned(true, 24)
     );
@@ -464,54 +465,56 @@ fn wildcard_operations_use_the_current_tracked_holder_snapshot() {
         ("example:get_two", 3),
     ] {
         assert_eq!(
-            vm.execute_function(function, context(), LIMIT).unwrap(),
+            vm.execute_function(function, None, context(), LIMIT)
+                .unwrap(),
             returned(true, value),
             "{function}"
         );
     }
 
     assert_eq!(
-        vm.execute_function("example:get_wildcard", context(), LIMIT)
+        vm.execute_function("example:get_wildcard", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0),
         "single-holder arguments do not resolve the wildcard"
     );
     assert_eq!(
-        vm.execute_function("example:list_wildcard", context(), LIMIT)
+        vm.execute_function("example:list_wildcard", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0),
         "player-list's target argument does not resolve the wildcard"
     );
     for function in ["example:if_wildcard", "example:unless_wildcard"] {
         assert_eq!(
-            vm.execute_function(function, context(), LIMIT).unwrap(),
+            vm.execute_function(function, None, context(), LIMIT)
+                .unwrap(),
             returned(false, 0),
             "a singular score condition cannot resolve the wildcard"
         );
     }
     assert_eq!(
-        vm.execute_function("example:reset_values", context(), LIMIT)
+        vm.execute_function("example:reset_values", None, context(), LIMIT)
             .unwrap(),
         returned(true, 3)
     );
     assert_eq!(
-        vm.execute_function("example:list_all", context(), LIMIT)
+        vm.execute_function("example:list_all", None, context(), LIMIT)
             .unwrap(),
         returned(true, 3),
         "the source operation created `terms` for every wildcard source"
     );
     assert_eq!(
-        vm.execute_function("example:reset_all", context(), LIMIT)
+        vm.execute_function("example:reset_all", None, context(), LIMIT)
             .unwrap(),
         returned(true, 3)
     );
     assert_eq!(
-        vm.execute_function("example:list_all", context(), LIMIT)
+        vm.execute_function("example:list_all", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:reset_all", context(), LIMIT)
+        vm.execute_function("example:reset_all", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0),
         "an empty wildcard is a command failure"
@@ -559,66 +562,66 @@ fn store_callbacks_keep_the_removed_objective_identity() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:remove_with_store", context(), LIMIT)
+        vm.execute_function("example:remove_with_store", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0),
         "removing the final objective succeeds with result zero"
     );
     assert_eq!(
-        vm.execute_function("example:list_objectives", context(), LIMIT)
+        vm.execute_function("example:list_objectives", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0),
         "the callback must not recreate the removed named objective"
     );
     assert_eq!(
-        vm.execute_function("example:list_holders", context(), LIMIT)
+        vm.execute_function("example:list_holders", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:list_sink", context(), LIMIT)
+        vm.execute_function("example:list_sink", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1),
         "Minecraft stores the result against the detached objective identity"
     );
     assert_eq!(
-        vm.execute_function("example:readd_and_get", context(), LIMIT)
+        vm.execute_function("example:readd_and_get", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0),
         "a new objective with the same name has a distinct identity"
     );
     assert_eq!(
-        vm.execute_function("example:set_current", context(), LIMIT)
+        vm.execute_function("example:set_current", None, context(), LIMIT)
             .unwrap(),
         returned(true, 4)
     );
     assert_eq!(
-        vm.execute_function("example:list_sink", context(), LIMIT)
+        vm.execute_function("example:list_sink", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2),
         "the detached and current objective scores coexist"
     );
     assert_eq!(
-        vm.execute_function("example:remove_current", context(), LIMIT)
+        vm.execute_function("example:remove_current", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:list_sink", context(), LIMIT)
+        vm.execute_function("example:list_sink", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1),
         "removing the current objective does not remove the detached score"
     );
     assert_eq!(
-        vm.execute_function("example:reset_sink", context(), LIMIT)
+        vm.execute_function("example:reset_sink", None, context(), LIMIT)
             .unwrap(),
         returned(true, 1)
     );
     assert_eq!(
-        vm.execute_function("example:list_holders", context(), LIMIT)
+        vm.execute_function("example:list_holders", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0),
         "reset all removes detached scores and the tracked holder"
@@ -660,54 +663,56 @@ fn wildcard_store_uses_a_pre_execution_holder_snapshot() {
         ),
     ]);
 
-    vm.execute_function("example:setup", context(), LIMIT)
+    vm.execute_function("example:setup", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:store_empty", context(), LIMIT)
+        vm.execute_function("example:store_empty", None, context(), LIMIT)
             .unwrap(),
-        FunctionOutcome::FellThrough,
+        ExecutionOutcome::NoResult,
         "an empty wildcard stops before executing the stored command"
     );
     assert_eq!(
-        vm.execute_function("example:list", context(), LIMIT)
+        vm.execute_function("example:list", None, context(), LIMIT)
             .unwrap(),
         returned(true, 0)
     );
     assert_eq!(
-        vm.execute_function("example:get_new", context(), LIMIT)
+        vm.execute_function("example:get_new", None, context(), LIMIT)
             .unwrap(),
         returned(false, 0)
     );
 
-    vm.execute_function("example:track", context(), LIMIT)
+    vm.execute_function("example:track", None, context(), LIMIT)
         .unwrap();
     assert_eq!(
-        vm.execute_function("example:store_across_reset", context(), LIMIT)
+        vm.execute_function("example:store_across_reset", None, context(), LIMIT)
             .unwrap(),
         returned(true, 2)
     );
     for function in ["example:get_one", "example:get_two"] {
         assert_eq!(
-            vm.execute_function(function, context(), LIMIT).unwrap(),
+            vm.execute_function(function, None, context(), LIMIT)
+                .unwrap(),
             returned(true, 2),
             "the callback recreates every holder captured before reset"
         );
     }
 
     assert_eq!(
-        vm.execute_function("example:store_before_new_holder", context(), LIMIT)
+        vm.execute_function("example:store_before_new_holder", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7)
     );
     for function in ["example:get_one", "example:get_two"] {
         assert_eq!(
-            vm.execute_function(function, context(), LIMIT).unwrap(),
+            vm.execute_function(function, None, context(), LIMIT)
+                .unwrap(),
             returned(true, 1),
             "store success updates the captured holders"
         );
     }
     assert_eq!(
-        vm.execute_function("example:get_new", context(), LIMIT)
+        vm.execute_function("example:get_new", None, context(), LIMIT)
             .unwrap(),
         returned(true, 7),
         "a holder created downstream is not part of the store snapshot"

@@ -8,7 +8,7 @@ use std::{
 };
 
 use worldless::{
-    FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, ResourceOrigin, Vm,
+    ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, ResourceOrigin, Vm,
 };
 
 const LIMIT: usize = 256;
@@ -94,13 +94,14 @@ fn compile(
     resources(functions, number_providers, predicates, predicate_tags).unwrap()
 }
 
-fn returned(success: bool, value: i32) -> FunctionOutcome {
-    FunctionOutcome::Returned { success, value }
+fn returned(success: bool, value: i32) -> ExecutionOutcome {
+    ExecutionOutcome::Result { success, value }
 }
 
-fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
+fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
     assert_eq!(
-        vm.execute_function(function, context(), LIMIT).unwrap(),
+        vm.execute_function(function, None, context(), LIMIT)
+            .unwrap(),
         expected,
         "{function}"
     );
@@ -395,10 +396,10 @@ fn uniform_after(predicate: &str, predicate_tags: &[(&str, &str)]) -> i32 {
         predicate_tags,
     );
     match vm
-        .execute_function("example:main", context(), LIMIT)
+        .execute_function("example:main", None, context(), LIMIT)
         .unwrap()
     {
-        FunctionOutcome::Returned {
+        ExecutionOutcome::Result {
             success: true,
             value,
         } => value,
@@ -539,7 +540,7 @@ fn predicate_conditions_publish_terminal_results_and_preserve_modifier_order() {
         &[],
     );
 
-    assert_function(&mut vm, "example:setup", FunctionOutcome::FellThrough);
+    assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:terminal_if", returned(true, 1));
     assert_function(&mut vm, "example:terminal_unless", returned(true, 1));
     assert_function(&mut vm, "example:terminal_failure", returned(false, 0));
