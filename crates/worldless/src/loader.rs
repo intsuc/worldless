@@ -1,6 +1,7 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet},
     error::Error,
     fmt, fs, io,
     path::{Path, PathBuf},
@@ -27,6 +28,7 @@ use crate::{
         LootRegistry, NumberProviderReference, RegistryResource, RegistryValidationError,
         parse_inline_tag as parse_inline_number_provider, parse_json as parse_number_provider_json,
     },
+    pack::{Pack, PackSource, ResourceKind},
     predicate::{
         PredicateReference, parse_inline_tag as parse_inline_predicate,
         parse_json as parse_predicate_json,
@@ -48,7 +50,25 @@ const TARGET_PACK_FORMAT: PackFormat = PackFormat {
 };
 const LAST_PRE_MINOR_DATA_PACK_FORMAT: i32 = 81;
 
-/// An error encountered while loading a directory data pack.
+/// The source of a selected resource in a composed pack stack.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResourceOrigin {
+    Directory(PathBuf),
+    Memory { pack: usize, id: String },
+}
+
+impl fmt::Display for ResourceOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Directory(path) => path.display().fmt(formatter),
+            Self::Memory { pack, id } => {
+                write!(formatter, "in-memory pack {pack} resource `{id}`")
+            }
+        }
+    }
+}
+
+/// An error encountered while composing and compiling data packs.
 #[derive(Debug)]
 pub enum LoadError {
     Io {
@@ -63,167 +83,42 @@ pub enum LoadError {
         path: PathBuf,
         feature: &'static str,
     },
+    InvalidMemoryResourceIdentifier {
+        pack: usize,
+        kind: ResourceKind,
+        input: String,
+    },
+    DuplicateMemoryResource {
+        pack: usize,
+        kind: ResourceKind,
+        id: String,
+    },
     InvalidFunction {
-        path: PathBuf,
+        origin: ResourceOrigin,
         line: usize,
         reason: String,
     },
     InvalidFunctionTag {
-        path: PathBuf,
+        origin: ResourceOrigin,
         reason: String,
     },
     InvalidNumberProvider {
-        path: PathBuf,
+        origin: ResourceOrigin,
         reason: String,
     },
     InvalidNumberProviderTag {
-        path: PathBuf,
+        origin: ResourceOrigin,
         reason: String,
     },
     InvalidPredicate {
-        path: PathBuf,
+        origin: ResourceOrigin,
         reason: String,
     },
     InvalidPredicateTag {
-        path: PathBuf,
+        origin: ResourceOrigin,
         reason: String,
     },
 }
-
-/// An error encountered while compiling in-memory data-pack resources.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CompileError {
-    InvalidFunctionIdentifier {
-        input: String,
-    },
-    DuplicateFunction {
-        id: String,
-    },
-    InvalidFunction {
-        id: String,
-        line: usize,
-        reason: String,
-    },
-    InvalidFunctionTagIdentifier {
-        input: String,
-    },
-    DuplicateFunctionTag {
-        id: String,
-    },
-    InvalidFunctionTag {
-        id: String,
-        reason: String,
-    },
-    InvalidNumberProviderIdentifier {
-        input: String,
-    },
-    DuplicateNumberProvider {
-        id: String,
-    },
-    InvalidNumberProvider {
-        id: String,
-        reason: String,
-    },
-    InvalidNumberProviderTagIdentifier {
-        input: String,
-    },
-    DuplicateNumberProviderTag {
-        id: String,
-    },
-    InvalidNumberProviderTag {
-        id: String,
-        reason: String,
-    },
-    InvalidPredicateIdentifier {
-        input: String,
-    },
-    DuplicatePredicate {
-        id: String,
-    },
-    InvalidPredicate {
-        id: String,
-        reason: String,
-    },
-    InvalidPredicateTagIdentifier {
-        input: String,
-    },
-    DuplicatePredicateTag {
-        id: String,
-    },
-    InvalidPredicateTag {
-        id: String,
-        reason: String,
-    },
-}
-
-impl fmt::Display for CompileError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidFunctionIdentifier { input } => {
-                write!(formatter, "invalid function identifier `{input}`")
-            }
-            Self::DuplicateFunction { id } => {
-                write!(formatter, "duplicate function `{id}`")
-            }
-            Self::InvalidFunction { id, line, reason } => {
-                write!(
-                    formatter,
-                    "invalid function `{id}` at line {line}: {reason}"
-                )
-            }
-            Self::InvalidFunctionTagIdentifier { input } => {
-                write!(formatter, "invalid function tag identifier `{input}`")
-            }
-            Self::DuplicateFunctionTag { id } => {
-                write!(formatter, "duplicate function tag `{id}`")
-            }
-            Self::InvalidFunctionTag { id, reason } => {
-                write!(formatter, "invalid function tag `{id}`: {reason}")
-            }
-            Self::InvalidNumberProviderIdentifier { input } => {
-                write!(formatter, "invalid number provider identifier `{input}`")
-            }
-            Self::DuplicateNumberProvider { id } => {
-                write!(formatter, "duplicate number provider `{id}`")
-            }
-            Self::InvalidNumberProvider { id, reason } => {
-                write!(formatter, "invalid number provider `{id}`: {reason}")
-            }
-            Self::InvalidNumberProviderTagIdentifier { input } => {
-                write!(
-                    formatter,
-                    "invalid number provider tag identifier `{input}`"
-                )
-            }
-            Self::DuplicateNumberProviderTag { id } => {
-                write!(formatter, "duplicate number provider tag `{id}`")
-            }
-            Self::InvalidNumberProviderTag { id, reason } => {
-                write!(formatter, "invalid number provider tag `{id}`: {reason}")
-            }
-            Self::InvalidPredicateIdentifier { input } => {
-                write!(formatter, "invalid predicate identifier `{input}`")
-            }
-            Self::DuplicatePredicate { id } => {
-                write!(formatter, "duplicate predicate `{id}`")
-            }
-            Self::InvalidPredicate { id, reason } => {
-                write!(formatter, "invalid predicate `{id}`: {reason}")
-            }
-            Self::InvalidPredicateTagIdentifier { input } => {
-                write!(formatter, "invalid predicate tag identifier `{input}`")
-            }
-            Self::DuplicatePredicateTag { id } => {
-                write!(formatter, "duplicate predicate tag `{id}`")
-            }
-            Self::InvalidPredicateTag { id, reason } => {
-                write!(formatter, "invalid predicate tag `{id}`: {reason}")
-            }
-        }
-    }
-}
-
-impl Error for CompileError {}
 
 impl fmt::Display for LoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -243,34 +138,39 @@ impl fmt::Display for LoadError {
                 "data pack at {} uses unsupported {feature}",
                 path.display()
             ),
-            Self::InvalidFunction { path, line, reason } => write!(
+            Self::InvalidMemoryResourceIdentifier { pack, kind, input } => write!(
                 formatter,
-                "invalid function {} at line {line}: {reason}",
-                path.display()
+                "invalid {} identifier `{input}` in in-memory pack {pack}",
+                resource_kind_name(*kind)
             ),
-            Self::InvalidFunctionTag { path, reason } => write!(
+            Self::DuplicateMemoryResource { pack, kind, id } => write!(
                 formatter,
-                "invalid function tag {}: {reason}",
-                path.display()
+                "duplicate {} `{id}` in in-memory pack {pack}",
+                resource_kind_name(*kind)
             ),
-            Self::InvalidNumberProvider { path, reason } => write!(
+            Self::InvalidFunction {
+                origin,
+                line,
+                reason,
+            } => write!(
                 formatter,
-                "invalid number provider {}: {reason}",
-                path.display()
+                "invalid function {origin} at line {line}: {reason}"
             ),
-            Self::InvalidNumberProviderTag { path, reason } => write!(
-                formatter,
-                "invalid number provider tag {}: {reason}",
-                path.display()
-            ),
-            Self::InvalidPredicate { path, reason } => {
-                write!(formatter, "invalid predicate {}: {reason}", path.display())
+            Self::InvalidFunctionTag { origin, reason } => {
+                write!(formatter, "invalid function tag {origin}: {reason}")
             }
-            Self::InvalidPredicateTag { path, reason } => write!(
-                formatter,
-                "invalid predicate tag {}: {reason}",
-                path.display()
-            ),
+            Self::InvalidNumberProvider { origin, reason } => {
+                write!(formatter, "invalid number provider {origin}: {reason}")
+            }
+            Self::InvalidNumberProviderTag { origin, reason } => {
+                write!(formatter, "invalid number provider tag {origin}: {reason}")
+            }
+            Self::InvalidPredicate { origin, reason } => {
+                write!(formatter, "invalid predicate {origin}: {reason}")
+            }
+            Self::InvalidPredicateTag { origin, reason } => {
+                write!(formatter, "invalid predicate tag {origin}: {reason}")
+            }
         }
     }
 }
@@ -284,25 +184,135 @@ impl Error for LoadError {
     }
 }
 
-pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
+const RESOURCE_KINDS: [ResourceKind; 6] = [
+    ResourceKind::Function,
+    ResourceKind::FunctionTag,
+    ResourceKind::NumberProvider,
+    ResourceKind::NumberProviderTag,
+    ResourceKind::Predicate,
+    ResourceKind::PredicateTag,
+];
+
+#[derive(Clone, Copy)]
+struct ResourceKindInfo {
+    name: &'static str,
+    directory: &'static str,
+    extension: &'static str,
+}
+
+fn resource_kind_info(kind: ResourceKind) -> ResourceKindInfo {
+    match kind {
+        ResourceKind::Function => ResourceKindInfo {
+            name: "function",
+            directory: "function",
+            extension: ".mcfunction",
+        },
+        ResourceKind::FunctionTag => ResourceKindInfo {
+            name: "function tag",
+            directory: "tags/function",
+            extension: ".json",
+        },
+        ResourceKind::NumberProvider => ResourceKindInfo {
+            name: "number provider",
+            directory: "number_provider",
+            extension: ".json",
+        },
+        ResourceKind::NumberProviderTag => ResourceKindInfo {
+            name: "number provider tag",
+            directory: "tags/number_provider",
+            extension: ".json",
+        },
+        ResourceKind::Predicate => ResourceKindInfo {
+            name: "predicate",
+            directory: "predicate",
+            extension: ".json",
+        },
+        ResourceKind::PredicateTag => ResourceKindInfo {
+            name: "predicate tag",
+            directory: "tags/predicate",
+            extension: ".json",
+        },
+    }
+}
+
+fn resource_kind_name(kind: ResourceKind) -> &'static str {
+    resource_kind_info(kind).name
+}
+
+#[derive(Debug, Default)]
+struct ResourceInventory {
+    stacks: HashMap<ResourceKind, HashMap<Identifier, Vec<SourcedResource>>>,
+}
+
+impl ResourceInventory {
+    fn insert(&mut self, kind: ResourceKind, id: Identifier, resource: SourcedResource) {
+        self.stacks
+            .entry(kind)
+            .or_default()
+            .entry(id)
+            .or_default()
+            .push(resource);
+    }
+
+    fn sorted_stacks(&self, kind: ResourceKind) -> Vec<(&Identifier, &Vec<SourcedResource>)> {
+        let mut stacks = self
+            .stacks
+            .get(&kind)
+            .into_iter()
+            .flat_map(HashMap::iter)
+            .collect::<Vec<_>>();
+        stacks.sort_by_key(|(id, _)| id.to_string());
+        stacks
+    }
+}
+
+#[derive(Debug)]
+struct SourcedResource {
+    origin: ResourceOrigin,
+    contents: ResourceContents,
+}
+
+impl SourcedResource {
+    fn contents(&self) -> Result<Cow<'_, str>, LoadError> {
+        match &self.contents {
+            ResourceContents::Directory(path) => read_to_string(path).map(Cow::Owned),
+            ResourceContents::Memory(source) => Ok(Cow::Borrowed(source)),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResourceContents {
+    Directory(PathBuf),
+    Memory(String),
+}
+
+pub(crate) fn load_packs(packs: impl IntoIterator<Item = Pack>) -> Result<Program, LoadError> {
+    let mut inventory = ResourceInventory::default();
+    for (pack_index, pack) in packs.into_iter().enumerate() {
+        match pack.into_source() {
+            PackSource::Directory(root) => inventory_directory_pack(&mut inventory, &root)?,
+            PackSource::Memory(resources) => {
+                inventory_memory_pack(&mut inventory, pack_index, resources)?
+            }
+        }
+    }
+    compile_inventory(&inventory)
+}
+
+fn inventory_directory_pack(
+    inventory: &mut ResourceInventory,
+    root: &Path,
+) -> Result<(), LoadError> {
     reject_symbolic_links(root)?;
-    let metadata = metadata(root)?;
-    if !metadata.is_dir() {
+    let root_metadata = metadata(root)?;
+    if !root_metadata.is_dir() {
         return Err(invalid_pack(root, "the pack path is not a directory"));
     }
     validate_pack_metadata(root)?;
 
-    let data = root.join("data");
-    let namespace_dirs = child_directories(&data)?;
-    let mut number_providers = HashMap::new();
-    let mut number_provider_paths = HashMap::new();
-    let mut unresolved_number_provider_tags = HashMap::new();
-    let mut number_provider_tag_paths = HashMap::new();
-    let mut predicates = HashMap::new();
-    let mut predicate_paths = HashMap::new();
-    let mut unresolved_predicate_tags = HashMap::new();
-    let mut predicate_tag_paths = HashMap::new();
-    for namespace_dir in &namespace_dirs {
+    let namespace_dirs = child_directories(&root.join("data"))?;
+    for namespace_dir in namespace_dirs {
         let Some(namespace) = namespace_dir.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
@@ -310,108 +320,110 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
             continue;
         }
 
-        let provider_root = namespace_dir.join("number_provider");
-        for path in regular_files_recursive(&provider_root)? {
-            let Some(relative) = resource_path(&provider_root, &path) else {
-                continue;
-            };
-            if !relative.ends_with(".json") {
-                continue;
-            }
-            let full_resource_path = format!("number_provider/{relative}");
-            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
-                continue;
-            }
-            let provider_path = &relative[..relative.len() - ".json".len()];
-            let id = Identifier::from_parts(namespace, provider_path)
-                .expect("removing a valid suffix preserves an identifier path");
-            let contents = read_to_string(&path)?;
-            let provider = parse_number_provider_json(&contents).map_err(|reason| {
-                LoadError::InvalidNumberProvider {
-                    path: path.clone(),
-                    reason,
+        for kind in RESOURCE_KINDS {
+            let info = resource_kind_info(kind);
+            let resource_root = namespace_dir.join(info.directory);
+            for path in regular_files_recursive(&resource_root)? {
+                let Some(relative) = resource_path(&resource_root, &path) else {
+                    continue;
+                };
+                let Some(id_path) = relative.strip_suffix(info.extension) else {
+                    continue;
+                };
+                let full_resource_path = format!("{}/{relative}", info.directory);
+                if Identifier::from_parts(namespace, &full_resource_path).is_none() {
+                    continue;
                 }
-            })?;
-            number_provider_paths.insert(id.clone(), path);
-            number_providers.insert(id, provider);
-        }
-
-        let tag_root = namespace_dir.join("tags/number_provider");
-        for path in regular_files_recursive(&tag_root)? {
-            let Some(relative) = resource_path(&tag_root, &path) else {
-                continue;
-            };
-            if !relative.ends_with(".json") {
-                continue;
+                let id = Identifier::from_parts(namespace, id_path)
+                    .expect("removing a valid resource suffix preserves its identifier");
+                inventory.insert(
+                    kind,
+                    id,
+                    SourcedResource {
+                        origin: ResourceOrigin::Directory(path.clone()),
+                        contents: ResourceContents::Directory(path),
+                    },
+                );
             }
-            let full_resource_path = format!("tags/number_provider/{relative}");
-            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
-                continue;
-            }
-            let tag_path = &relative[..relative.len() - ".json".len()];
-            let id = Identifier::from_parts(namespace, tag_path)
-                .expect("removing a valid suffix preserves an identifier path");
-            let contents = read_to_string(&path)?;
-            let tag = parse_resource_tag(&contents).map_err(|reason| {
-                LoadError::InvalidNumberProviderTag {
-                    path: path.clone(),
-                    reason,
-                }
-            })?;
-            number_provider_tag_paths.insert(id.clone(), path);
-            unresolved_number_provider_tags.insert(id, tag);
-        }
-
-        let predicate_root = namespace_dir.join("predicate");
-        for path in regular_files_recursive(&predicate_root)? {
-            let Some(relative) = resource_path(&predicate_root, &path) else {
-                continue;
-            };
-            if !relative.ends_with(".json") {
-                continue;
-            }
-            let full_resource_path = format!("predicate/{relative}");
-            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
-                continue;
-            }
-            let predicate_path = &relative[..relative.len() - ".json".len()];
-            let id = Identifier::from_parts(namespace, predicate_path)
-                .expect("removing a valid suffix preserves an identifier path");
-            let contents = read_to_string(&path)?;
-            let predicate =
-                parse_predicate_json(&contents).map_err(|reason| LoadError::InvalidPredicate {
-                    path: path.clone(),
-                    reason,
-                })?;
-            predicate_paths.insert(id.clone(), path);
-            predicates.insert(id, predicate);
-        }
-
-        let tag_root = namespace_dir.join("tags/predicate");
-        for path in regular_files_recursive(&tag_root)? {
-            let Some(relative) = resource_path(&tag_root, &path) else {
-                continue;
-            };
-            if !relative.ends_with(".json") {
-                continue;
-            }
-            let full_resource_path = format!("tags/predicate/{relative}");
-            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
-                continue;
-            }
-            let tag_path = &relative[..relative.len() - ".json".len()];
-            let id = Identifier::from_parts(namespace, tag_path)
-                .expect("removing a valid suffix preserves an identifier path");
-            let contents = read_to_string(&path)?;
-            let tag =
-                parse_resource_tag(&contents).map_err(|reason| LoadError::InvalidPredicateTag {
-                    path: path.clone(),
-                    reason,
-                })?;
-            predicate_tag_paths.insert(id.clone(), path);
-            unresolved_predicate_tags.insert(id, tag);
         }
     }
+    Ok(())
+}
+
+fn inventory_memory_pack(
+    inventory: &mut ResourceInventory,
+    pack: usize,
+    resources: Vec<crate::pack::MemoryResource>,
+) -> Result<(), LoadError> {
+    let mut seen = HashSet::new();
+    for resource in resources {
+        let (kind, raw_id, source) = resource.into_parts();
+        let id = Identifier::parse(&raw_id).ok_or_else(|| {
+            LoadError::InvalidMemoryResourceIdentifier {
+                pack,
+                kind,
+                input: raw_id.clone(),
+            }
+        })?;
+        if !seen.insert((kind, id.clone())) {
+            return Err(LoadError::DuplicateMemoryResource {
+                pack,
+                kind,
+                id: id.to_string(),
+            });
+        }
+        let normalized_id = id.to_string();
+        inventory.insert(
+            kind,
+            id,
+            SourcedResource {
+                origin: ResourceOrigin::Memory {
+                    pack,
+                    id: normalized_id,
+                },
+                contents: ResourceContents::Memory(source),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn compile_inventory(inventory: &ResourceInventory) -> Result<Program, LoadError> {
+    let mut number_providers = HashMap::new();
+    let mut number_provider_origins = HashMap::new();
+    for (id, stack) in inventory.sorted_stacks(ResourceKind::NumberProvider) {
+        let resource = stack
+            .last()
+            .expect("every inventoried resource stack is nonempty");
+        let source = resource.contents()?;
+        let provider = parse_number_provider_json(&source).map_err(|reason| {
+            LoadError::InvalidNumberProvider {
+                origin: resource.origin.clone(),
+                reason,
+            }
+        })?;
+        number_provider_origins.insert(id.clone(), resource.origin.clone());
+        number_providers.insert(id.clone(), provider);
+    }
+
+    let unresolved_number_provider_tags =
+        compose_resource_tags(inventory, ResourceKind::NumberProviderTag)?;
+    let mut predicates = HashMap::new();
+    let mut predicate_origins = HashMap::new();
+    for (id, stack) in inventory.sorted_stacks(ResourceKind::Predicate) {
+        let resource = stack
+            .last()
+            .expect("every inventoried resource stack is nonempty");
+        let source = resource.contents()?;
+        let predicate =
+            parse_predicate_json(&source).map_err(|reason| LoadError::InvalidPredicate {
+                origin: resource.origin.clone(),
+                reason,
+            })?;
+        predicate_origins.insert(id.clone(), resource.origin.clone());
+        predicates.insert(id.clone(), predicate);
+    }
+    let unresolved_predicate_tags = compose_resource_tags(inventory, ResourceKind::PredicateTag)?;
 
     let empty_loot_registry = LootRegistry::empty();
     let mut provider_ids = empty_loot_registry.number_provider_ids();
@@ -423,10 +435,7 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
         "number provider tag",
     )
     .map_err(|error| LoadError::InvalidNumberProviderTag {
-        path: number_provider_tag_paths
-            .get(&error.tag)
-            .expect("every unresolved directory tag has a source path")
-            .clone(),
+        origin: error.origin,
         reason: error.reason,
     })?;
     let mut predicate_ids = empty_loot_registry.predicate_ids();
@@ -438,10 +447,7 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
         "predicate tag",
     )
     .map_err(|error| LoadError::InvalidPredicateTag {
-        path: predicate_tag_paths
-            .get(&error.tag)
-            .expect("every unresolved directory tag has a source path")
-            .clone(),
+        origin: error.origin,
         reason: error.reason,
     })?;
     let loot_registry = Arc::new(
@@ -454,16 +460,16 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
         .map_err(
             |RegistryValidationError { resource, reason }| match resource {
                 RegistryResource::NumberProvider(id) => LoadError::InvalidNumberProvider {
-                    path: number_provider_paths
+                    origin: number_provider_origins
                         .get(&id)
-                        .expect("validation errors are attributed to supplied resources")
+                        .expect("validation errors are attributed to selected resources")
                         .clone(),
                     reason,
                 },
                 RegistryResource::Predicate(id) => LoadError::InvalidPredicate {
-                    path: predicate_paths
+                    origin: predicate_origins
                         .get(&id)
-                        .expect("validation errors are attributed to supplied resources")
+                        .expect("validation errors are attributed to selected resources")
                         .clone(),
                     reason,
                 },
@@ -473,68 +479,21 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
 
     let compiler = CommandCompiler::with_loot_registry(Arc::clone(&loot_registry));
     let mut functions = HashMap::new();
-    let mut unresolved_function_tags = HashMap::new();
-    let mut function_tag_paths = HashMap::new();
-    for namespace_dir in namespace_dirs {
-        let Some(namespace) = namespace_dir.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if Identifier::from_parts(namespace, "").is_none() {
-            continue;
-        }
-
-        let function_root = namespace_dir.join("function");
-        for path in regular_files_recursive(&function_root)? {
-            let Some(relative) = resource_path(&function_root, &path) else {
-                continue;
-            };
-            if !relative.ends_with(".mcfunction") {
-                continue;
-            }
-            let full_resource_path = format!("function/{relative}");
-            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
-                continue;
-            }
-            let function_path = &relative[..relative.len() - ".mcfunction".len()];
-            let id = Identifier::from_parts(namespace, function_path)
-                .expect("removing a valid suffix preserves an identifier path");
-            let contents = read_to_string(&path)?;
-            let function = parse_function(&contents, &compiler).map_err(|error| {
-                LoadError::InvalidFunction {
-                    path: path.clone(),
-                    line: error.line,
-                    reason: error.reason,
-                }
+    for (id, stack) in inventory.sorted_stacks(ResourceKind::Function) {
+        let resource = stack
+            .last()
+            .expect("every inventoried resource stack is nonempty");
+        let source = resource.contents()?;
+        let function =
+            parse_function(&source, &compiler).map_err(|error| LoadError::InvalidFunction {
+                origin: resource.origin.clone(),
+                line: error.line,
+                reason: error.reason,
             })?;
-            functions.insert(id, function);
-        }
-
-        let tag_root = namespace_dir.join("tags/function");
-        for path in regular_files_recursive(&tag_root)? {
-            let Some(relative) = resource_path(&tag_root, &path) else {
-                continue;
-            };
-            if !relative.ends_with(".json") {
-                continue;
-            }
-            let full_resource_path = format!("tags/function/{relative}");
-            if Identifier::from_parts(namespace, &full_resource_path).is_none() {
-                continue;
-            }
-            let tag_path = &relative[..relative.len() - ".json".len()];
-            let id = Identifier::from_parts(namespace, tag_path)
-                .expect("removing a valid suffix preserves an identifier path");
-            let contents = read_to_string(&path)?;
-            let tag =
-                parse_resource_tag(&contents).map_err(|reason| LoadError::InvalidFunctionTag {
-                    path: path.clone(),
-                    reason,
-                })?;
-            function_tag_paths.insert(id.clone(), path);
-            unresolved_function_tags.insert(id, tag);
-        }
+        functions.insert(id.clone(), function);
     }
 
+    let unresolved_function_tags = compose_resource_tags(inventory, ResourceKind::FunctionTag)?;
     let function_ids = functions.keys().cloned().collect();
     let function_tags = resolve_resource_tags(
         &function_ids,
@@ -543,295 +502,42 @@ pub(crate) fn load_directory(root: &Path) -> Result<Program, LoadError> {
         "function tag",
     )
     .map_err(|error| LoadError::InvalidFunctionTag {
-        path: function_tag_paths
-            .get(&error.tag)
-            .expect("every unresolved directory tag has a source path")
-            .clone(),
+        origin: error.origin,
         reason: error.reason,
     })?;
     Ok(Program::new(functions, function_tags, loot_registry))
 }
 
-pub(crate) fn compile_functions<I, N, S>(functions: I) -> Result<Program, CompileError>
-where
-    I: IntoIterator<Item = (N, S)>,
-    N: AsRef<str>,
-    S: AsRef<str>,
-{
-    compile_resources(
-        functions,
-        std::iter::empty::<(&'static str, &'static str)>(),
-        std::iter::empty::<(&'static str, &'static str)>(),
-        std::iter::empty::<(&'static str, &'static str)>(),
-        std::iter::empty::<(&'static str, &'static str)>(),
-        std::iter::empty::<(&'static str, &'static str)>(),
-    )
+fn compose_resource_tags(
+    inventory: &ResourceInventory,
+    kind: ResourceKind,
+) -> Result<HashMap<Identifier, UnresolvedResourceTag>, LoadError> {
+    let mut tags = HashMap::new();
+    for (id, stack) in inventory.sorted_stacks(kind) {
+        let mut entries = Vec::new();
+        for resource in stack {
+            let source = resource.contents()?;
+            let parsed = parse_resource_tag(&source, &resource.origin)
+                .map_err(|reason| invalid_tag_resource(kind, resource.origin.clone(), reason))?;
+            if parsed.replace {
+                entries.clear();
+            }
+            entries.extend(parsed.entries);
+        }
+        tags.insert(id.clone(), UnresolvedResourceTag { entries });
+    }
+    Ok(tags)
 }
 
-pub(crate) fn compile_functions_and_tags<FI, FN, FS, TI, TN, TS>(
-    functions: FI,
-    function_tags: TI,
-) -> Result<Program, CompileError>
-where
-    FI: IntoIterator<Item = (FN, FS)>,
-    FN: AsRef<str>,
-    FS: AsRef<str>,
-    TI: IntoIterator<Item = (TN, TS)>,
-    TN: AsRef<str>,
-    TS: AsRef<str>,
-{
-    compile_resources(
-        functions,
-        function_tags,
-        std::iter::empty::<(&'static str, &'static str)>(),
-        std::iter::empty::<(&'static str, &'static str)>(),
-        std::iter::empty::<(&'static str, &'static str)>(),
-        std::iter::empty::<(&'static str, &'static str)>(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compile_resources<
-    FI,
-    FN,
-    FS,
-    FTI,
-    FTN,
-    FTS,
-    NPI,
-    NPN,
-    NPS,
-    NPTI,
-    NPTN,
-    NPTS,
-    PI,
-    PN,
-    PS,
-    PTI,
-    PTN,
-    PTS,
->(
-    functions: FI,
-    function_tags: FTI,
-    number_providers: NPI,
-    number_provider_tags: NPTI,
-    predicates: PI,
-    predicate_tags: PTI,
-) -> Result<Program, CompileError>
-where
-    FI: IntoIterator<Item = (FN, FS)>,
-    FN: AsRef<str>,
-    FS: AsRef<str>,
-    FTI: IntoIterator<Item = (FTN, FTS)>,
-    FTN: AsRef<str>,
-    FTS: AsRef<str>,
-    NPI: IntoIterator<Item = (NPN, NPS)>,
-    NPN: AsRef<str>,
-    NPS: AsRef<str>,
-    NPTI: IntoIterator<Item = (NPTN, NPTS)>,
-    NPTN: AsRef<str>,
-    NPTS: AsRef<str>,
-    PI: IntoIterator<Item = (PN, PS)>,
-    PN: AsRef<str>,
-    PS: AsRef<str>,
-    PTI: IntoIterator<Item = (PTN, PTS)>,
-    PTN: AsRef<str>,
-    PTS: AsRef<str>,
-{
-    let mut providers = HashMap::new();
-    for (raw_id, source) in number_providers {
-        let raw_id = raw_id.as_ref();
-        let id = Identifier::parse(raw_id).ok_or_else(|| {
-            CompileError::InvalidNumberProviderIdentifier {
-                input: raw_id.to_owned(),
-            }
-        })?;
-        match providers.entry(id) {
-            Entry::Occupied(entry) => {
-                return Err(CompileError::DuplicateNumberProvider {
-                    id: entry.key().to_string(),
-                });
-            }
-            Entry::Vacant(entry) => {
-                let id = entry.key().to_string();
-                let provider = parse_number_provider_json(source.as_ref())
-                    .map_err(|reason| CompileError::InvalidNumberProvider { id, reason })?;
-                entry.insert(provider);
-            }
+fn invalid_tag_resource(kind: ResourceKind, origin: ResourceOrigin, reason: String) -> LoadError {
+    match kind {
+        ResourceKind::FunctionTag => LoadError::InvalidFunctionTag { origin, reason },
+        ResourceKind::NumberProviderTag => LoadError::InvalidNumberProviderTag { origin, reason },
+        ResourceKind::PredicateTag => LoadError::InvalidPredicateTag { origin, reason },
+        ResourceKind::Function | ResourceKind::NumberProvider | ResourceKind::Predicate => {
+            unreachable!("only tag resource kinds are composed as stacks")
         }
     }
-
-    let mut unresolved_provider_tags = HashMap::new();
-    for (raw_id, source) in number_provider_tags {
-        let raw_id = raw_id.as_ref();
-        let id = Identifier::parse(raw_id).ok_or_else(|| {
-            CompileError::InvalidNumberProviderTagIdentifier {
-                input: raw_id.to_owned(),
-            }
-        })?;
-        match unresolved_provider_tags.entry(id) {
-            Entry::Occupied(entry) => {
-                return Err(CompileError::DuplicateNumberProviderTag {
-                    id: entry.key().to_string(),
-                });
-            }
-            Entry::Vacant(entry) => {
-                let id = entry.key().to_string();
-                let tag = parse_resource_tag(source.as_ref())
-                    .map_err(|reason| CompileError::InvalidNumberProviderTag { id, reason })?;
-                entry.insert(tag);
-            }
-        }
-    }
-
-    let mut parsed_predicates = HashMap::new();
-    for (raw_id, source) in predicates {
-        let raw_id = raw_id.as_ref();
-        let id =
-            Identifier::parse(raw_id).ok_or_else(|| CompileError::InvalidPredicateIdentifier {
-                input: raw_id.to_owned(),
-            })?;
-        match parsed_predicates.entry(id) {
-            Entry::Occupied(entry) => {
-                return Err(CompileError::DuplicatePredicate {
-                    id: entry.key().to_string(),
-                });
-            }
-            Entry::Vacant(entry) => {
-                let id = entry.key().to_string();
-                let predicate = parse_predicate_json(source.as_ref())
-                    .map_err(|reason| CompileError::InvalidPredicate { id, reason })?;
-                entry.insert(predicate);
-            }
-        }
-    }
-
-    let mut unresolved_predicate_tags = HashMap::new();
-    for (raw_id, source) in predicate_tags {
-        let raw_id = raw_id.as_ref();
-        let id = Identifier::parse(raw_id).ok_or_else(|| {
-            CompileError::InvalidPredicateTagIdentifier {
-                input: raw_id.to_owned(),
-            }
-        })?;
-        match unresolved_predicate_tags.entry(id) {
-            Entry::Occupied(entry) => {
-                return Err(CompileError::DuplicatePredicateTag {
-                    id: entry.key().to_string(),
-                });
-            }
-            Entry::Vacant(entry) => {
-                let id = entry.key().to_string();
-                let tag = parse_resource_tag(source.as_ref())
-                    .map_err(|reason| CompileError::InvalidPredicateTag { id, reason })?;
-                entry.insert(tag);
-            }
-        }
-    }
-
-    let empty_loot_registry = LootRegistry::empty();
-    let mut provider_ids = empty_loot_registry.number_provider_ids();
-    provider_ids.extend(providers.keys().cloned());
-    let provider_tags = resolve_resource_tags(
-        &provider_ids,
-        &unresolved_provider_tags,
-        "number provider",
-        "number provider tag",
-    )
-    .map_err(|error| CompileError::InvalidNumberProviderTag {
-        id: error.tag.to_string(),
-        reason: error.reason,
-    })?;
-    let mut predicate_ids = empty_loot_registry.predicate_ids();
-    predicate_ids.extend(parsed_predicates.keys().cloned());
-    let resolved_predicate_tags = resolve_resource_tags(
-        &predicate_ids,
-        &unresolved_predicate_tags,
-        "predicate",
-        "predicate tag",
-    )
-    .map_err(|error| CompileError::InvalidPredicateTag {
-        id: error.tag.to_string(),
-        reason: error.reason,
-    })?;
-    let loot_registry = Arc::new(
-        LootRegistry::new(
-            providers,
-            provider_tags,
-            parsed_predicates,
-            resolved_predicate_tags,
-        )
-        .map_err(
-            |RegistryValidationError { resource, reason }| match resource {
-                RegistryResource::NumberProvider(id) => CompileError::InvalidNumberProvider {
-                    id: id.to_string(),
-                    reason,
-                },
-                RegistryResource::Predicate(id) => CompileError::InvalidPredicate {
-                    id: id.to_string(),
-                    reason,
-                },
-            },
-        )?,
-    );
-    let compiler = CommandCompiler::with_loot_registry(Arc::clone(&loot_registry));
-    let mut compiled = HashMap::new();
-    for (raw_id, source) in functions {
-        let raw_id = raw_id.as_ref();
-        let id =
-            Identifier::parse(raw_id).ok_or_else(|| CompileError::InvalidFunctionIdentifier {
-                input: raw_id.to_owned(),
-            })?;
-        match compiled.entry(id) {
-            Entry::Occupied(entry) => {
-                return Err(CompileError::DuplicateFunction {
-                    id: entry.key().to_string(),
-                });
-            }
-            Entry::Vacant(entry) => {
-                let id = entry.key().to_string();
-                let function = parse_function(source.as_ref(), &compiler).map_err(|error| {
-                    CompileError::InvalidFunction {
-                        id,
-                        line: error.line,
-                        reason: error.reason,
-                    }
-                })?;
-                entry.insert(function);
-            }
-        }
-    }
-
-    let mut unresolved_tags = HashMap::new();
-    for (raw_id, source) in function_tags {
-        let raw_id = raw_id.as_ref();
-        let id = Identifier::parse(raw_id).ok_or_else(|| {
-            CompileError::InvalidFunctionTagIdentifier {
-                input: raw_id.to_owned(),
-            }
-        })?;
-        match unresolved_tags.entry(id) {
-            Entry::Occupied(entry) => {
-                return Err(CompileError::DuplicateFunctionTag {
-                    id: entry.key().to_string(),
-                });
-            }
-            Entry::Vacant(entry) => {
-                let id = entry.key().to_string();
-                let tag = parse_resource_tag(source.as_ref())
-                    .map_err(|reason| CompileError::InvalidFunctionTag { id, reason })?;
-                entry.insert(tag);
-            }
-        }
-    }
-    let function_ids = compiled.keys().cloned().collect();
-    let function_tags =
-        resolve_resource_tags(&function_ids, &unresolved_tags, "function", "function tag")
-            .map_err(|error| CompileError::InvalidFunctionTag {
-                id: error.tag.to_string(),
-                reason: error.reason,
-            })?;
-    Ok(Program::new(compiled, function_tags, loot_registry))
 }
 
 #[derive(Debug)]
@@ -840,9 +546,16 @@ struct UnresolvedResourceTag {
 }
 
 #[derive(Debug)]
+struct ParsedResourceTag {
+    replace: bool,
+    entries: Vec<ResourceTagEntry>,
+}
+
+#[derive(Debug)]
 struct ResourceTagEntry {
     reference: ResourceTagReference,
     required: bool,
+    origin: ResourceOrigin,
 }
 
 #[derive(Debug)]
@@ -853,30 +566,39 @@ enum ResourceTagReference {
 
 #[derive(Debug)]
 struct ResourceTagResolutionError {
-    tag: Identifier,
+    origin: ResourceOrigin,
     reason: String,
 }
 
-fn parse_resource_tag(contents: &str) -> Result<UnresolvedResourceTag, String> {
+fn parse_resource_tag(
+    contents: &str,
+    origin: &ResourceOrigin,
+) -> Result<ParsedResourceTag, String> {
     let value = resource_json::parse(contents)?;
     let object = value
         .as_object()
         .ok_or_else(|| "the root value must be an object".to_owned())?;
-    if resource_json::field(object, "replace").is_some_and(|value| !value.is_boolean()) {
-        return Err("`replace` must be a boolean".to_owned());
-    }
+    let replace = match resource_json::field(object, "replace") {
+        Some(Value::Bool(replace)) => *replace,
+        Some(_) => return Err("`replace` must be a boolean".to_owned()),
+        None => false,
+    };
     let values = resource_json::field(object, "values")
         .and_then(Value::as_array)
         .ok_or_else(|| "missing array field `values`".to_owned())?;
     let entries = values
         .iter()
         .enumerate()
-        .map(|(index, value)| parse_resource_tag_entry(index, value))
+        .map(|(index, value)| parse_resource_tag_entry(index, value, origin))
         .collect::<Result<_, _>>()?;
-    Ok(UnresolvedResourceTag { entries })
+    Ok(ParsedResourceTag { replace, entries })
 }
 
-fn parse_resource_tag_entry(index: usize, value: &Value) -> Result<ResourceTagEntry, String> {
+fn parse_resource_tag_entry(
+    index: usize,
+    value: &Value,
+    origin: &ResourceOrigin,
+) -> Result<ResourceTagEntry, String> {
     let (raw_id, required) = match value {
         Value::String(id) => (resource_json::decode_string(id).to_string_lossy(), true),
         Value::Object(object) => {
@@ -906,6 +628,7 @@ fn parse_resource_tag_entry(index: usize, value: &Value) -> Result<ResourceTagEn
     Ok(ResourceTagEntry {
         reference,
         required,
+        origin: origin.clone(),
     })
 }
 
@@ -932,7 +655,7 @@ fn resolve_resource_tags(
                 ResourceTagReference::Element(element) if entry.required => {
                     if !elements.contains(element) {
                         return Err(invalid_resource_tag_reference(
-                            tag_id,
+                            &entry.origin,
                             format!("required {element_kind} `{element}` does not exist"),
                         ));
                     }
@@ -940,13 +663,13 @@ fn resolve_resource_tags(
                 ResourceTagReference::Tag(dependency) if entry.required => {
                     if !tags.contains_key(dependency) {
                         return Err(invalid_resource_tag_reference(
-                            tag_id,
+                            &entry.origin,
                             format!("required {tag_kind} `#{dependency}` does not exist"),
                         ));
                     }
                     if creates_tag_cycle(&dependencies, tag_id, dependency) {
                         return Err(invalid_resource_tag_reference(
-                            tag_id,
+                            &entry.origin,
                             format!("required {tag_kind} reference `#{dependency}` is cyclic"),
                         ));
                     }
@@ -969,6 +692,7 @@ fn resolve_resource_tags(
             let ResourceTagEntry {
                 reference: ResourceTagReference::Tag(dependency),
                 required: false,
+                ..
             } = entry
             else {
                 continue;
@@ -1103,11 +827,11 @@ fn flatten_resource_tag(
 }
 
 fn invalid_resource_tag_reference(
-    tag: &Identifier,
+    origin: &ResourceOrigin,
     reason: impl Into<String>,
 ) -> ResourceTagResolutionError {
     ResourceTagResolutionError {
-        tag: tag.clone(),
+        origin: origin.clone(),
         reason: reason.into(),
     }
 }

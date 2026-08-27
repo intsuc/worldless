@@ -1,4 +1,6 @@
-use worldless::{CompileError, ExecutionError, FunctionOutcome, Vm};
+use worldless::{
+    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+};
 
 const LIMIT: usize = 512;
 
@@ -7,7 +9,18 @@ fn returned(success: bool, value: i32) -> FunctionOutcome {
 }
 
 fn compile(functions: &[(&str, &str)]) -> Vm {
-    Vm::from_functions(functions.iter().copied()).unwrap()
+    load_functions(functions.iter().copied()).unwrap()
+}
+
+fn load_functions<I, N, S>(functions: I) -> Result<Vm, LoadError>
+where
+    I: IntoIterator<Item = (N, S)>,
+    N: AsRef<str>,
+    S: AsRef<str>,
+{
+    Vm::from_packs([Pack::memory(functions.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+    }))])
 }
 
 fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
@@ -263,8 +276,8 @@ fn unicode_name_escapes_follow_java_se_25_character_names() {
     ] {
         let source = format!(r#"data merge storage example:invalid {{value:"\N{{{name}}}"}}"#);
         assert!(matches!(
-            Vm::from_functions([("example:invalid", source)]),
-            Err(CompileError::InvalidFunction { .. })
+            load_functions([("example:invalid", source)]),
+            Err(LoadError::InvalidFunction { .. })
         ));
     }
 }
@@ -441,7 +454,7 @@ fn data_merge_and_remove_report_only_real_changes() {
         "return run data merge storage example:rejected {}\n",
         nested_compound(512)
     );
-    let mut depth_vm = Vm::from_functions([
+    let mut depth_vm = load_functions([
         ("example:allowed", allowed_source.as_str()),
         ("example:rejected", rejected_source.as_str()),
     ])
@@ -1146,11 +1159,11 @@ fn rejects_invalid_and_out_of_slice_storage_command_forms() {
     ] {
         assert!(
             matches!(
-                Vm::from_functions([
+                load_functions([
                     ("example:target", "# target\n"),
                     ("example:invalid", command),
                 ]),
-                Err(CompileError::InvalidFunction { .. })
+                Err(LoadError::InvalidFunction { .. })
             ),
             "{command:?}"
         );

@@ -1,4 +1,6 @@
-use worldless::{CompileError, ExecutionError, FunctionOutcome, Vm};
+use worldless::{
+    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+};
 
 const LIMIT: usize = 128;
 
@@ -7,7 +9,36 @@ fn returned(success: bool, value: i32) -> FunctionOutcome {
 }
 
 fn compile(functions: &[(&str, &str)]) -> Vm {
-    Vm::from_functions(functions.iter().copied()).unwrap()
+    load_functions(functions.iter().copied()).unwrap()
+}
+
+fn load_functions<I, N, S>(functions: I) -> Result<Vm, LoadError>
+where
+    I: IntoIterator<Item = (N, S)>,
+    N: AsRef<str>,
+    S: AsRef<str>,
+{
+    Vm::from_packs([Pack::memory(functions.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+    }))])
+}
+
+fn load_functions_and_tags<FI, FN, FS, TI, TN, TS>(functions: FI, tags: TI) -> Result<Vm, LoadError>
+where
+    FI: IntoIterator<Item = (FN, FS)>,
+    FN: AsRef<str>,
+    FS: AsRef<str>,
+    TI: IntoIterator<Item = (TN, TS)>,
+    TN: AsRef<str>,
+    TS: AsRef<str>,
+{
+    let functions = functions.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+    });
+    let tags = tags.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::FunctionTag, id.as_ref(), source.as_ref())
+    });
+    Vm::from_packs([Pack::memory(functions.chain(tags))])
 }
 
 #[test]
@@ -401,15 +432,15 @@ fn function_conditions_reject_terminal_and_invalid_reference_forms() {
     ] {
         assert!(
             matches!(
-                Vm::from_functions([("example:invalid", command)]),
-                Err(CompileError::InvalidFunction { .. })
+                load_functions([("example:invalid", command)]),
+                Err(LoadError::InvalidFunction { .. })
             ),
             "{command:?}"
         );
     }
 
     assert!(
-        Vm::from_functions_and_tags(
+        load_functions_and_tags(
             [
                 (
                     "example:valid",

@@ -1,4 +1,6 @@
-use worldless::{CompileError, ExecutionError, FunctionOutcome, Vm};
+use worldless::{
+    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+};
 
 const LIMIT: usize = 512;
 
@@ -7,7 +9,36 @@ fn returned(success: bool, value: i32) -> FunctionOutcome {
 }
 
 fn compile(functions: &[(&str, &str)]) -> Vm {
-    Vm::from_functions(functions.iter().copied()).unwrap()
+    load_functions(functions.iter().copied()).unwrap()
+}
+
+fn load_functions<I, N, S>(functions: I) -> Result<Vm, LoadError>
+where
+    I: IntoIterator<Item = (N, S)>,
+    N: AsRef<str>,
+    S: AsRef<str>,
+{
+    Vm::from_packs([Pack::memory(functions.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+    }))])
+}
+
+fn load_functions_and_tags<FI, FN, FS, TI, TN, TS>(functions: FI, tags: TI) -> Result<Vm, LoadError>
+where
+    FI: IntoIterator<Item = (FN, FS)>,
+    FN: AsRef<str>,
+    FS: AsRef<str>,
+    TI: IntoIterator<Item = (TN, TS)>,
+    TN: AsRef<str>,
+    TS: AsRef<str>,
+{
+    let functions = functions.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+    });
+    let tags = tags.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::FunctionTag, id.as_ref(), source.as_ref())
+    });
+    Vm::from_packs([Pack::memory(functions.chain(tags))])
 }
 
 fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
@@ -67,8 +98,8 @@ fn template_validation_matches_java_utf16_rules() {
         ("$return $(\u{10400})\n", 1),
     ] {
         assert!(matches!(
-            Vm::from_functions([("example:invalid", source)]),
-            Err(CompileError::InvalidFunction {
+            load_functions([("example:invalid", source)]),
+            Err(LoadError::InvalidFunction {
                 line: actual_line,
                 ..
             }) if actual_line == line
@@ -267,7 +298,7 @@ fn instantiation_is_atomic_and_failures_are_command_results() {
 
 #[test]
 fn nested_macros_require_explicit_arguments_and_tags_share_one_snapshot() {
-    let mut vm = Vm::from_functions_and_tags(
+    let mut vm = load_functions_and_tags(
         [
             ("example:inner", "$return $(value)\n"),
             (
@@ -313,7 +344,7 @@ fn nested_macros_require_explicit_arguments_and_tags_share_one_snapshot() {
 
 #[test]
 fn tag_instantiation_keeps_a_successful_prefix_and_snapshots_storage() {
-    let mut vm = Vm::from_functions_and_tags(
+    let mut vm = load_functions_and_tags(
         [
             (
                 "example:plain_prefix",
@@ -403,8 +434,8 @@ fn macro_conditions_have_no_arguments_and_top_level_failure_is_explicit() {
         "execute if function example:macro with storage example:args run return 1",
     ] {
         assert!(matches!(
-            Vm::from_functions([("example:invalid", command)]),
-            Err(CompileError::InvalidFunction { .. })
+            load_functions([("example:invalid", command)]),
+            Err(LoadError::InvalidFunction { .. })
         ));
     }
 }

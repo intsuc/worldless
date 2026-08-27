@@ -4,7 +4,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use worldless::{CompileError, FunctionOutcome, LoadError, Vm};
+use worldless::{
+    FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, ResourceOrigin, Vm,
+};
 
 const LIMIT: usize = 256;
 static NEXT_PACK: AtomicU64 = AtomicU64::new(0);
@@ -56,15 +58,25 @@ fn resources(
     number_providers: &[(&str, &str)],
     predicates: &[(&str, &str)],
     predicate_tags: &[(&str, &str)],
-) -> Result<Vm, CompileError> {
-    Vm::from_resources(
-        functions.iter().copied(),
-        std::iter::empty::<(&str, &str)>(),
-        number_providers.iter().copied(),
-        std::iter::empty::<(&str, &str)>(),
-        predicates.iter().copied(),
-        predicate_tags.iter().copied(),
-    )
+) -> Result<Vm, LoadError> {
+    let functions = functions
+        .iter()
+        .map(|(id, source)| MemoryResource::new(ResourceKind::Function, *id, *source));
+    let number_providers = number_providers
+        .iter()
+        .map(|(id, source)| MemoryResource::new(ResourceKind::NumberProvider, *id, *source));
+    let predicates = predicates
+        .iter()
+        .map(|(id, source)| MemoryResource::new(ResourceKind::Predicate, *id, *source));
+    let predicate_tags = predicate_tags
+        .iter()
+        .map(|(id, source)| MemoryResource::new(ResourceKind::PredicateTag, *id, *source));
+    Vm::from_packs([Pack::memory(
+        functions
+            .chain(number_providers)
+            .chain(predicates)
+            .chain(predicate_tags),
+    )])
 }
 
 fn compile(
@@ -283,7 +295,7 @@ fn directory_loader_reads_predicate_resources_and_tags() {
         r#"{"values":["example:falsehood","example:truth"]}"#,
     );
 
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    let mut vm = Vm::from_packs([Pack::directory(pack.root())]).unwrap();
     assert_function(&mut vm, "example:main", returned(true, 7));
 }
 
@@ -294,9 +306,9 @@ fn directory_loader_reports_the_invalid_predicate_path_and_reason() {
     pack.write(relative_path, r#"{"type":"all_of"}"#);
     let expected_path = pack.root().join(relative_path);
 
-    match Vm::load_directory(pack.root()).unwrap_err() {
-        LoadError::InvalidPredicate { path, reason } => {
-            assert_eq!(path, expected_path);
+    match Vm::from_packs([Pack::directory(pack.root())]).unwrap_err() {
+        LoadError::InvalidPredicate { origin, reason } => {
+            assert_eq!(origin, ResourceOrigin::Directory(expected_path));
             assert_eq!(reason, "`root` is missing field `terms`");
         }
         error => panic!("expected an invalid predicate error, got {error}"),
@@ -814,6 +826,6 @@ fn invalid_predicates_references_and_cross_registry_cycles_are_rejected() {
             &[("example:predicates", r#"{"values":["example:truth"]}"#)],
         )
         .unwrap_err();
-        assert!(matches!(error, CompileError::InvalidFunction { .. }));
+        assert!(matches!(error, LoadError::InvalidFunction { .. }));
     }
 }

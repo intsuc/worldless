@@ -4,7 +4,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use worldless::{CompileError, ExecutionError, FunctionOutcome, Vm};
+use worldless::{
+    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+};
 
 const LIMIT: usize = 512;
 static NEXT_PACK: AtomicU64 = AtomicU64::new(0);
@@ -64,15 +66,20 @@ fn compile_with_tags(
     providers: &[(&str, &str)],
     provider_tags: &[(&str, &str)],
 ) -> Vm {
-    Vm::from_resources(
-        functions.iter().copied(),
-        std::iter::empty::<(&str, &str)>(),
-        providers.iter().copied(),
-        provider_tags.iter().copied(),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-    )
-    .unwrap()
+    let functions = functions
+        .iter()
+        .map(|(id, source)| MemoryResource::new(ResourceKind::Function, *id, *source));
+    let providers = providers
+        .iter()
+        .map(|(id, source)| MemoryResource::new(ResourceKind::NumberProvider, *id, *source));
+    let provider_tags = provider_tags
+        .iter()
+        .map(|(id, source)| MemoryResource::new(ResourceKind::NumberProviderTag, *id, *source));
+    load_memory(functions.chain(providers).chain(provider_tags)).unwrap()
+}
+
+fn load_memory(resources: impl IntoIterator<Item = MemoryResource>) -> Result<Vm, LoadError> {
+    Vm::from_packs([Pack::memory(resources)])
 }
 
 fn assert_function(vm: &mut Vm, function: &str, expected: FunctionOutcome) {
@@ -126,18 +133,15 @@ fn resource_or_inline_parsing_is_identifier_first_and_modes_match_minecraft() {
     assert_function(&mut vm, "example:scaled", returned(true, 3));
     assert_function(&mut vm, "example:signed_literal", returned(true, 1));
 
-    let error = Vm::from_resources(
-        [("example:missing", "return run compute default 1\n")],
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-    )
+    let error = load_memory([MemoryResource::new(
+        ResourceKind::Function,
+        "example:missing",
+        "return run compute default 1\n",
+    )])
     .unwrap_err();
     assert!(matches!(
         error,
-        CompileError::InvalidFunction { reason, .. }
+        LoadError::InvalidFunction { reason, .. }
             if reason.contains("number provider `minecraft:1` does not exist")
     ));
 }
@@ -665,7 +669,7 @@ fn directory_loader_reads_number_provider_resources_and_tags() {
         r#"{"values":["example:one","example:two"]}"#,
     );
 
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    let mut vm = Vm::from_packs([Pack::directory(pack.root())]).unwrap();
     assert_function(&mut vm, "example:main", returned(true, 3));
 }
 
@@ -685,7 +689,7 @@ fn directory_loader_applies_a_worldless_override_of_the_fast_cooking_predicate()
         "return run compute default minecraft:cooking/speed_default integer\n",
     );
 
-    let mut vm = Vm::load_directory(pack.root()).unwrap();
+    let mut vm = Vm::from_packs([Pack::directory(pack.root())]).unwrap();
     assert_function(&mut vm, "example:burn_time", returned(true, 25));
     assert_function(&mut vm, "example:speed", returned(true, 2));
 }
@@ -769,15 +773,10 @@ fn vanilla_number_providers_have_their_default_context_projection() {
             )
         })
         .collect::<Vec<_>>();
-    let mut vm = Vm::from_resources(
+    let mut vm = load_memory(
         functions
             .iter()
-            .map(|(id, source)| (id.as_str(), source.as_str())),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
+            .map(|(id, source)| MemoryResource::new(ResourceKind::Function, id, source)),
     )
     .unwrap();
 
@@ -824,74 +823,57 @@ fn invalid_references_shapes_and_out_of_scope_contexts_are_rejected() {
             "outside Worldless scope",
         ),
     ] {
-        let error = Vm::from_resources(
-            std::iter::empty::<(&str, &str)>(),
-            std::iter::empty::<(&str, &str)>(),
-            [(id, provider)],
-            std::iter::empty::<(&str, &str)>(),
-            std::iter::empty::<(&str, &str)>(),
-            std::iter::empty::<(&str, &str)>(),
-        )
+        let error = load_memory([MemoryResource::new(
+            ResourceKind::NumberProvider,
+            id,
+            provider,
+        )])
         .unwrap_err();
         assert!(matches!(
             error,
-            CompileError::InvalidNumberProvider { reason, .. }
+            LoadError::InvalidNumberProvider { reason, .. }
                 if reason.contains(expected)
         ));
     }
 
-    let cycle = Vm::from_resources(
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        [
-            (
-                "example:first",
-                r#"{"type":"sum","operands":"example:second"}"#,
-            ),
-            (
-                "example:second",
-                r#"{"type":"sum","operands":"example:first"}"#,
-            ),
-        ],
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-    )
+    let cycle = load_memory([
+        MemoryResource::new(
+            ResourceKind::NumberProvider,
+            "example:first",
+            r#"{"type":"sum","operands":"example:second"}"#,
+        ),
+        MemoryResource::new(
+            ResourceKind::NumberProvider,
+            "example:second",
+            r#"{"type":"sum","operands":"example:first"}"#,
+        ),
+    ])
     .unwrap_err();
     assert!(matches!(
         cycle,
-        CompileError::InvalidNumberProvider { reason, .. } if reason.contains("cyclic")
+        LoadError::InvalidNumberProvider { reason, .. } if reason.contains("cyclic")
     ));
 
-    let builtin_fast_branch_cycle = Vm::from_resources(
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        [(
-            "minecraft:cooking/fast_burn_time_multiplier",
-            r#"{"type":"sum","operands":"minecraft:cooking/time_bamboo"}"#,
-        )],
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-    )
+    let builtin_fast_branch_cycle = load_memory([MemoryResource::new(
+        ResourceKind::NumberProvider,
+        "minecraft:cooking/fast_burn_time_multiplier",
+        r#"{"type":"sum","operands":"minecraft:cooking/time_bamboo"}"#,
+    )])
     .unwrap_err();
     assert!(matches!(
         builtin_fast_branch_cycle,
-        CompileError::InvalidNumberProvider { reason, .. } if reason.contains("cyclic")
+        LoadError::InvalidNumberProvider { reason, .. } if reason.contains("cyclic")
     ));
 
-    let missing_tag_entry = Vm::from_resources(
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-        [("example:bad", r#"{"values":["example:missing"]}"#)],
-        std::iter::empty::<(&str, &str)>(),
-        std::iter::empty::<(&str, &str)>(),
-    )
+    let missing_tag_entry = load_memory([MemoryResource::new(
+        ResourceKind::NumberProviderTag,
+        "example:bad",
+        r#"{"values":["example:missing"]}"#,
+    )])
     .unwrap_err();
     assert!(matches!(
         missing_tag_entry,
-        CompileError::InvalidNumberProviderTag { reason, .. } if reason.contains("does not exist")
+        LoadError::InvalidNumberProviderTag { reason, .. } if reason.contains("does not exist")
     ));
 
     for source in [
@@ -900,16 +882,13 @@ fn invalid_references_shapes_and_out_of_scope_contexts_are_rejected() {
         "return run compute default {type:score,target:this,score:value}\n",
         "return run data modify block ~ ~ ~ value set compute default {type:constant,value:1}\n",
     ] {
-        let error = Vm::from_resources(
-            [("example:invalid", source)],
-            std::iter::empty::<(&str, &str)>(),
-            std::iter::empty::<(&str, &str)>(),
-            std::iter::empty::<(&str, &str)>(),
-            std::iter::empty::<(&str, &str)>(),
-            std::iter::empty::<(&str, &str)>(),
-        )
+        let error = load_memory([MemoryResource::new(
+            ResourceKind::Function,
+            "example:invalid",
+            source,
+        )])
         .unwrap_err();
-        assert!(matches!(error, CompileError::InvalidFunction { .. }));
+        assert!(matches!(error, LoadError::InvalidFunction { .. }));
     }
 }
 

@@ -1,4 +1,6 @@
-use worldless::{CompileError, ExecutionError, FunctionOutcome, Vm};
+use worldless::{
+    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+};
 
 const LIMIT: usize = 128;
 
@@ -7,7 +9,18 @@ fn returned(success: bool, value: i32) -> FunctionOutcome {
 }
 
 fn compile(functions: &[(&str, &str)]) -> Vm {
-    Vm::from_functions(functions.iter().copied()).unwrap()
+    load_functions(functions.iter().copied()).unwrap()
+}
+
+fn load_functions<I, N, S>(functions: I) -> Result<Vm, LoadError>
+where
+    I: IntoIterator<Item = (N, S)>,
+    N: AsRef<str>,
+    S: AsRef<str>,
+{
+    Vm::from_packs([Pack::memory(functions.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+    }))])
 }
 
 #[test]
@@ -610,8 +623,8 @@ fn scoreboard_arithmetic_and_conditions_reject_unsupported_syntax() {
     ] {
         assert!(
             matches!(
-                Vm::from_functions([("example:invalid", command)]),
-                Err(CompileError::InvalidFunction { .. })
+                load_functions([("example:invalid", command)]),
+                Err(LoadError::InvalidFunction { .. })
             ),
             "{command:?}"
         );

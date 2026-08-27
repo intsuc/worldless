@@ -1,4 +1,7 @@
-use worldless::{CompileError, ExecutionError, FunctionOutcome, Vm};
+use worldless::{
+    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, ResourceOrigin,
+    Vm,
+};
 
 const LIMIT: usize = 128;
 
@@ -7,7 +10,25 @@ fn returned(success: bool, value: i32) -> FunctionOutcome {
 }
 
 fn compile(functions: &[(&str, &str)], tags: &[(&str, &str)]) -> Vm {
-    Vm::from_functions_and_tags(functions.iter().copied(), tags.iter().copied()).unwrap()
+    load_functions_and_tags(functions.iter().copied(), tags.iter().copied()).unwrap()
+}
+
+fn load_functions_and_tags<FI, FN, FS, TI, TN, TS>(functions: FI, tags: TI) -> Result<Vm, LoadError>
+where
+    FI: IntoIterator<Item = (FN, FS)>,
+    FN: AsRef<str>,
+    FS: AsRef<str>,
+    TI: IntoIterator<Item = (TN, TS)>,
+    TN: AsRef<str>,
+    TS: AsRef<str>,
+{
+    let functions = functions.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+    });
+    let tags = tags.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::FunctionTag, id.as_ref(), source.as_ref())
+    });
+    Vm::from_packs([Pack::memory(functions.chain(tags))])
 }
 
 #[test]
@@ -114,7 +135,7 @@ fn deeply_nested_tags_are_resolved_without_rust_recursion() {
         })
         .collect::<Vec<_>>();
 
-    Vm::from_functions_and_tags(
+    load_functions_and_tags(
         std::iter::empty::<(&str, &str)>(),
         tags.iter()
             .map(|(id, source)| (id.as_str(), source.as_str())),
@@ -642,26 +663,30 @@ fn tag_member_calls_own_the_only_tag_execution_cost() {
 
 #[test]
 fn invalid_function_tag_resources_are_rejected_atomically() {
-    assert_eq!(
-        Vm::from_functions_and_tags(
+    assert!(matches!(
+        load_functions_and_tags(
             [("example:function", "return 1\n")],
             [("Upper:tag", r#"{"values":[]}"#)],
         )
         .unwrap_err(),
-        CompileError::InvalidFunctionTagIdentifier {
-            input: "Upper:tag".to_owned()
-        }
-    );
-    assert_eq!(
-        Vm::from_functions_and_tags(
+        LoadError::InvalidMemoryResourceIdentifier {
+            pack: 0,
+            kind: ResourceKind::FunctionTag,
+            input,
+        } if input == "Upper:tag"
+    ));
+    assert!(matches!(
+        load_functions_and_tags(
             [("example:function", "return 1\n")],
             [("tag", r#"{"values":[]}"#), (":tag", r#"{"values":[]}"#),],
         )
         .unwrap_err(),
-        CompileError::DuplicateFunctionTag {
-            id: "minecraft:tag".to_owned()
-        }
-    );
+        LoadError::DuplicateMemoryResource {
+            pack: 0,
+            kind: ResourceKind::FunctionTag,
+            id,
+        } if id == "minecraft:tag"
+    ));
 
     for (tag, source, expected_reason) in [
         ("example:invalid_json", "not json", "invalid JSON"),
@@ -686,18 +711,24 @@ fn invalid_function_tag_resources_are_rejected_atomically() {
             "`values[0].required` must be a boolean",
         ),
     ] {
-        match Vm::from_functions_and_tags([("example:function", "return 1\n")], [(tag, source)])
+        match load_functions_and_tags([("example:function", "return 1\n")], [(tag, source)])
             .unwrap_err()
         {
-            CompileError::InvalidFunctionTag { id, reason } => {
-                assert_eq!(id, tag);
+            LoadError::InvalidFunctionTag { origin, reason } => {
+                assert_eq!(
+                    origin,
+                    ResourceOrigin::Memory {
+                        pack: 0,
+                        id: tag.to_owned()
+                    }
+                );
                 assert!(reason.contains(expected_reason), "{reason:?}");
             }
             error => panic!("expected an invalid function tag, got {error}"),
         }
     }
 
-    match Vm::from_functions_and_tags(
+    match load_functions_and_tags(
         [("example:function", "return 1\n")],
         [
             ("example:a", r##"{"values":["#example:b"]}"##),
@@ -706,7 +737,7 @@ fn invalid_function_tag_resources_are_rejected_atomically() {
     )
     .unwrap_err()
     {
-        CompileError::InvalidFunctionTag { reason, .. } => {
+        LoadError::InvalidFunctionTag { reason, .. } => {
             assert!(reason.contains("cyclic"), "{reason:?}");
         }
         error => panic!("expected a cyclic function tag, got {error}"),

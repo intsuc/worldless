@@ -5,23 +5,24 @@
 //! scoreboard state and arithmetic, command storage and NBT data operations, number
 //! providers, worldless loot predicates and `compute`, function macros and
 //! tags, supported `execute` conditions, and result propagation. Supported
-//! resources can be compiled from an expanded directory data pack or in-memory
-//! source. Construction is atomic: an invalid supported resource rejects the
-//! whole program instead of leaving a partially populated VM.
+//! resources can be compiled from a statically composed, ordered mixture of
+//! expanded directory data packs and in-memory packs. Construction is atomic:
+//! an invalid selected resource rejects the whole program instead of leaving a
+//! partially populated VM.
 
 mod loader;
 mod macro_function;
 mod nbt;
 mod number_provider;
+mod pack;
 mod predicate;
 mod program;
 mod resource;
 mod resource_json;
 mod runtime;
 
-use std::path::Path;
-
-pub use loader::{CompileError, LoadError};
+pub use loader::{LoadError, ResourceOrigin};
+pub use pack::{MemoryResource, Pack, ResourceKind};
 pub use runtime::{ExecutionError, FunctionOutcome};
 
 use nbt::CommandStorage;
@@ -38,72 +39,14 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Compiles functions without reading a data pack from the file system.
+    /// Statically composes and compiles the supplied data packs.
     ///
-    /// Each item is a function identifier and its source. Identifiers without a
-    /// namespace use `minecraft`; duplicate identifiers after that normalization
-    /// are rejected. This entry point does not process pack metadata or resource
-    /// paths.
-    pub fn from_functions<I, N, S>(functions: I) -> Result<Self, CompileError>
-    where
-        I: IntoIterator<Item = (N, S)>,
-        N: AsRef<str>,
-        S: AsRef<str>,
-    {
-        loader::compile_functions(functions).map(Self::new)
-    }
-
-    /// Compiles functions and function-tag JSON without reading a data pack
-    /// from the file system.
-    ///
-    /// Function and tag identifiers without a namespace use `minecraft`.
-    /// Duplicate identifiers after that normalization are rejected within each
-    /// resource type. Tag sources use the same JSON representation as files in
-    /// `data/<namespace>/tags/function`.
-    pub fn from_functions_and_tags<FI, FN, FS, TI, TN, TS>(
-        functions: FI,
-        function_tags: TI,
-    ) -> Result<Self, CompileError>
-    where
-        FI: IntoIterator<Item = (FN, FS)>,
-        FN: AsRef<str>,
-        FS: AsRef<str>,
-        TI: IntoIterator<Item = (TN, TS)>,
-        TN: AsRef<str>,
-        TS: AsRef<str>,
-    {
-        loader::compile_functions_and_tags(functions, function_tags).map(Self::new)
-    }
-
-    /// Compiles all resource kinds currently consumed by Worldless without
-    /// reading a data pack from the file system.
-    ///
-    /// Number-provider and predicate sources use the JSON representations from
-    /// `data/<namespace>/number_provider` and `data/<namespace>/predicate`.
-    /// Their tag sources use the corresponding `data/<namespace>/tags/...`
-    /// representations.
-    pub fn from_resources(
-        functions: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
-        function_tags: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
-        number_providers: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
-        number_provider_tags: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
-        predicates: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
-        predicate_tags: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
-    ) -> Result<Self, CompileError> {
-        loader::compile_resources(
-            functions,
-            function_tags,
-            number_providers,
-            number_provider_tags,
-            predicates,
-            predicate_tags,
-        )
-        .map(Self::new)
-    }
-
-    /// Loads one expanded data pack from `path`.
-    pub fn load_directory(path: impl AsRef<Path>) -> Result<Self, LoadError> {
-        loader::load_directory(path.as_ref()).map(Self::new)
+    /// Inputs are ordered from lowest to highest priority. A higher ordinary
+    /// resource replaces a lower resource with the same identifier. Tag files
+    /// instead compose in pack order and may discard accumulated lower entries
+    /// with their `replace` field.
+    pub fn from_packs(packs: impl IntoIterator<Item = Pack>) -> Result<Self, LoadError> {
+        loader::load_packs(packs).map(Self::new)
     }
 
     /// Executes a function without a physical Minecraft world.

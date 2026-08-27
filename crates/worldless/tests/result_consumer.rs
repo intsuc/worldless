@@ -1,4 +1,6 @@
-use worldless::{CompileError, ExecutionError, FunctionOutcome, Vm};
+use worldless::{
+    ExecutionError, FunctionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+};
 
 const LIMIT: usize = 64;
 
@@ -6,9 +8,20 @@ fn returned(success: bool, value: i32) -> FunctionOutcome {
     FunctionOutcome::Returned { success, value }
 }
 
+fn load_functions<I, N, S>(functions: I) -> Result<Vm, LoadError>
+where
+    I: IntoIterator<Item = (N, S)>,
+    N: AsRef<str>,
+    S: AsRef<str>,
+{
+    Vm::from_packs([Pack::memory(functions.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+    }))])
+}
+
 #[test]
 fn scoreboard_commands_report_minecraft_results_and_persist_state() {
-    let mut vm = Vm::from_functions([
+    let mut vm = load_functions([
         (
             "example:create",
             "scoreboard objectives add first dummy\nreturn run scoreboard objectives add values dummy\n",
@@ -58,7 +71,7 @@ fn scoreboard_commands_report_minecraft_results_and_persist_state() {
 
 #[test]
 fn execute_store_distinguishes_result_from_success() {
-    let mut vm = Vm::from_functions([
+    let mut vm = load_functions([
         (
             "example:setup",
             "scoreboard objectives add input dummy\nscoreboard objectives add output dummy\n",
@@ -99,7 +112,7 @@ fn execute_store_distinguishes_result_from_success() {
 
 #[test]
 fn repeated_stores_run_in_command_order() {
-    let mut vm = Vm::from_functions([
+    let mut vm = load_functions([
         (
             "example:setup",
             "scoreboard objectives add input dummy\nscoreboard objectives add output dummy\n",
@@ -130,7 +143,7 @@ fn repeated_stores_run_in_command_order() {
 
 #[test]
 fn modifier_order_controls_whether_a_missing_store_target_discards_the_frame() {
-    let mut vm = Vm::from_functions([
+    let mut vm = load_functions([
         (
             "example:setup",
             "scoreboard objectives add values dummy\nscoreboard players set #value values 3\n",
@@ -161,7 +174,7 @@ fn modifier_order_controls_whether_a_missing_store_target_discards_the_frame() {
 
 #[test]
 fn function_results_reach_only_the_callbacks_minecraft_invokes() {
-    let mut vm = Vm::from_functions([
+    let mut vm = load_functions([
         (
             "example:setup",
             "scoreboard objectives add output dummy\n",
@@ -266,7 +279,7 @@ fn function_results_reach_only_the_callbacks_minecraft_invokes() {
 
 #[test]
 fn return_run_accepts_every_command_in_the_slice() {
-    let mut vm = Vm::from_functions([
+    let mut vm = load_functions([
         ("example:return", "return run return 4\n"),
         ("example:execute", "execute run return 5\n"),
         (
@@ -315,12 +328,12 @@ fn rejects_commands_outside_the_worldless_scoreboard_slice() {
         "execute store result bossbar example:value value run return 1",
     ] {
         assert!(matches!(
-            Vm::from_functions([("example:invalid", command)]),
-            Err(CompileError::InvalidFunction { .. })
+            load_functions([("example:invalid", command)]),
+            Err(LoadError::InvalidFunction { .. })
         ));
     }
 
-    assert!(Vm::from_functions([(
+    assert!(load_functions([(
         "example:valid",
         "scoreboard objectives add values dummy\nscoreboard players set # values 1\nreturn run scoreboard players get # values\n",
     )])
@@ -329,7 +342,7 @@ fn rejects_commands_outside_the_worldless_scoreboard_slice() {
 
 #[test]
 fn quota_stops_queued_work_but_does_not_roll_back_the_last_executable() {
-    let mut vm = Vm::from_functions([
+    let mut vm = load_functions([
         (
             "example:setup",
             "scoreboard objectives add values dummy\n",
