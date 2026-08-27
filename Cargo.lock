@@ -1599,6 +1599,13 @@ name = "worldless-brigadier"
 version = "0.1.0"
 
 [[package]]
+name = "worldless-cli"
+version = "0.1.0"
+dependencies = [
+ "worldless",
+]
+
+[[package]]
 name = "worldless-dev"
 version = "0.1.0"
 dependencies = [
