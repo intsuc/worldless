@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+flate2 = "1.1"
 libm = "0.2"
 md-5 = "0.10"
 serde = "1.0"

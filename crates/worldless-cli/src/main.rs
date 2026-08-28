@@ -11,7 +11,7 @@ use worldless::{
     Position, Rotation, Vm,
 };
 
-const USAGE: &str = "usage: worldless check [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] function [--arguments <COMPOUND_SNBT>] <FUNCTION_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] tag [--arguments <COMPOUND_SNBT>] <TAG_ID>\n       worldless run [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] command <COMMAND>\n       worldless repl [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>]";
+const USAGE: &str = "usage: worldless check [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] [--command-storage <NAMESPACE> <FILE> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] function [--arguments <COMPOUND_SNBT>] <FUNCTION_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] [--command-storage <NAMESPACE> <FILE> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] tag [--arguments <COMPOUND_SNBT>] <TAG_ID>\n       worldless run [--pack <DIR> ...] [--command-storage <NAMESPACE> <FILE> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] command <COMMAND>\n       worldless repl [--pack <DIR> ...] [--command-storage <NAMESPACE> <FILE> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>]";
 const DEFAULT_COMMAND_LIMIT: usize = 65_536;
 const DEFAULT_POSITION: Position = Position::new(0.0, 0.0, 0.0);
 const DEFAULT_ROTATION: Rotation = Rotation::new(0.0, 0.0);
@@ -36,6 +36,7 @@ enum CliCommand {
 #[derive(Debug, PartialEq)]
 struct RuntimeOptions {
     packs: Vec<PathBuf>,
+    command_storage_files: Vec<(String, PathBuf)>,
     world_seed: i64,
     command_limit: usize,
     context: ExecutionContext,
@@ -56,6 +57,21 @@ struct UsageError(String);
 impl fmt::Display for UsageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug)]
+enum LoadVmError {
+    Program(worldless::LoadError),
+    CommandStorage(worldless::CommandStorageLoadError),
+}
+
+impl fmt::Display for LoadVmError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Program(error) => fmt::Display::fmt(error, formatter),
+            Self::CommandStorage(error) => fmt::Display::fmt(error, formatter),
+        }
     }
 }
 
@@ -201,9 +217,18 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn load_vm(options: &RuntimeOptions) -> Result<Vm, worldless::LoadError> {
-    CompiledProgram::from_packs(options.packs.iter().map(Pack::directory))
-        .map(|program| program.create_vm(options.world_seed))
+fn load_vm(options: &RuntimeOptions) -> Result<Vm, LoadVmError> {
+    let program = CompiledProgram::from_packs(options.packs.iter().map(Pack::directory))
+        .map_err(LoadVmError::Program)?;
+    let mut vm = program.create_vm(options.world_seed);
+    vm.load_command_storage_files(
+        options
+            .command_storage_files
+            .iter()
+            .map(|(namespace, path)| (namespace.as_str(), path)),
+    )
+    .map_err(LoadVmError::CommandStorage)?;
+    Ok(vm)
 }
 
 fn repl(
@@ -441,6 +466,23 @@ where
         arguments.next();
         packs.push(parse_pack_path(arguments.next())?);
     }
+    let mut command_storage_files = Vec::new();
+    while arguments
+        .peek()
+        .is_some_and(|argument| argument == "--command-storage")
+    {
+        arguments.next();
+        command_storage_files.push(parse_command_storage_file(
+            arguments.next(),
+            arguments.next(),
+        )?);
+    }
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == "--pack")
+    {
+        return Err(usage_error("--pack must precede --command-storage"));
+    }
     if !arguments
         .peek()
         .is_some_and(|argument| argument == "--world-seed")
@@ -489,6 +531,7 @@ where
 
     Ok(RuntimeOptions {
         packs,
+        command_storage_files,
         world_seed,
         command_limit,
         context: ExecutionContext::new(position, rotation),
@@ -555,6 +598,35 @@ fn parse_pack_path(argument: Option<OsString>) -> Result<PathBuf, UsageError> {
         return Err(usage_error("--pack path must not be empty"));
     }
     Ok(PathBuf::from(argument))
+}
+
+fn parse_command_storage_file(
+    namespace: Option<OsString>,
+    path: Option<OsString>,
+) -> Result<(String, PathBuf), UsageError> {
+    let namespace =
+        namespace.ok_or_else(|| usage_error("missing namespace for --command-storage"))?;
+    if is_known_option(&namespace) {
+        return Err(usage_error("missing namespace for --command-storage"));
+    }
+    if is_option(&namespace) {
+        return Err(unexpected_argument(namespace));
+    }
+    let namespace = namespace
+        .into_string()
+        .map_err(|_| usage_error("--command-storage namespace is not valid UTF-8"))?;
+
+    let path = path.ok_or_else(|| usage_error("missing file for --command-storage"))?;
+    if is_known_option(&path) {
+        return Err(usage_error("missing file for --command-storage"));
+    }
+    if is_option(&path) {
+        return Err(unexpected_argument(path));
+    }
+    if path.is_empty() {
+        return Err(usage_error("--command-storage file path must not be empty"));
+    }
+    Ok((namespace, PathBuf::from(path)))
 }
 
 fn require_pack(packs: &[PathBuf]) -> Result<(), UsageError> {
@@ -694,6 +766,7 @@ fn is_option(argument: &OsStr) -> bool {
 
 fn is_known_option(argument: &OsStr) -> bool {
     argument == "--pack"
+        || argument == "--command-storage"
         || argument == "--world-seed"
         || argument == "--command-limit"
         || argument == "--position"
@@ -703,6 +776,7 @@ fn is_known_option(argument: &OsStr) -> bool {
 
 fn is_runtime_option(argument: &OsStr) -> bool {
     argument == "--pack"
+        || argument == "--command-storage"
         || argument == "--world-seed"
         || argument == "--command-limit"
         || argument == "--position"
@@ -714,6 +788,8 @@ fn misplaced_runtime_option(argument: OsString) -> UsageError {
         usage_error("duplicate --world-seed")
     } else if argument == "--pack" {
         usage_error("--pack must precede --world-seed")
+    } else if argument == "--command-storage" {
+        usage_error("--command-storage must precede --world-seed")
     } else {
         usage_error(format!(
             "{} is duplicated or out of order",
@@ -757,6 +833,26 @@ mod tests {
     ) -> RuntimeOptions {
         RuntimeOptions {
             packs: packs.iter().map(PathBuf::from).collect(),
+            command_storage_files: Vec::new(),
+            world_seed,
+            command_limit,
+            context,
+        }
+    }
+
+    fn options_with_command_storage(
+        packs: &[&str],
+        command_storage_files: &[(&str, &str)],
+        world_seed: i64,
+        command_limit: usize,
+        context: ExecutionContext,
+    ) -> RuntimeOptions {
+        RuntimeOptions {
+            packs: packs.iter().map(PathBuf::from).collect(),
+            command_storage_files: command_storage_files
+                .iter()
+                .map(|(namespace, path)| ((*namespace).to_owned(), PathBuf::from(path)))
+                .collect(),
             world_seed,
             command_limit,
             context,
@@ -894,6 +990,125 @@ mod tests {
         ] {
             assert!(parse(arguments).is_err(), "accepted {arguments:?}");
         }
+    }
+
+    #[test]
+    fn accepts_repeated_command_storage_files_between_packs_and_world_seed() {
+        assert_eq!(
+            parse(&[
+                "run",
+                "--pack",
+                "pack",
+                "--command-storage",
+                "probe",
+                "probe.dat",
+                "--command-storage",
+                "other",
+                "other.dat",
+                "--world-seed",
+                "7",
+                "command",
+                "seed",
+            ])
+            .unwrap(),
+            CliCommand::Run {
+                options: options_with_command_storage(
+                    &["pack"],
+                    &[("probe", "probe.dat"), ("other", "other.dat")],
+                    7,
+                    DEFAULT_COMMAND_LIMIT,
+                    ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                ),
+                invocation: CliInvocation::Command("seed".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "repl",
+                "--command-storage",
+                "probe",
+                "probe.dat",
+                "--world-seed",
+                "-7",
+            ])
+            .unwrap(),
+            CliCommand::Repl {
+                options: options_with_command_storage(
+                    &[],
+                    &[("probe", "probe.dat")],
+                    -7,
+                    DEFAULT_COMMAND_LIMIT,
+                    ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn validates_command_storage_values_and_option_order() {
+        assert_eq!(
+            parse(&["run", "--command-storage"]),
+            Err(usage_error("missing namespace for --command-storage"))
+        );
+        assert_eq!(
+            parse(&["run", "--command-storage", "probe"]),
+            Err(usage_error("missing file for --command-storage"))
+        );
+        assert_eq!(
+            parse(&[
+                "run",
+                "--command-storage",
+                "probe",
+                "--world-seed",
+                "0",
+                "command",
+                "seed",
+            ]),
+            Err(usage_error("missing file for --command-storage"))
+        );
+        assert_eq!(
+            parse(&[
+                "run",
+                "--command-storage",
+                "probe",
+                "",
+                "--world-seed",
+                "0",
+                "command",
+                "seed",
+            ]),
+            Err(usage_error("--command-storage file path must not be empty"))
+        );
+        assert_eq!(
+            parse(&[
+                "run",
+                "--command-storage",
+                "probe",
+                "probe.dat",
+                "--pack",
+                "pack",
+                "--world-seed",
+                "0",
+                "command",
+                "seed",
+            ]),
+            Err(usage_error("--pack must precede --command-storage"))
+        );
+        assert_eq!(
+            parse(&[
+                "run",
+                "--world-seed",
+                "0",
+                "--command-storage",
+                "probe",
+                "probe.dat",
+                "command",
+                "seed",
+            ]),
+            Err(usage_error("--command-storage must precede --world-seed"))
+        );
+        assert!(parse(&["check", "--command-storage", "probe", "probe.dat"]).is_err());
+        assert!(USAGE.contains("[--command-storage <NAMESPACE> <FILE> ...]"));
     }
 
     #[test]
@@ -1624,7 +1839,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn preserves_non_utf8_pack_paths() {
+    fn preserves_non_utf8_paths() {
         use std::os::unix::ffi::OsStringExt;
 
         let path = OsString::from_vec(b"pack-\xff".to_vec());
@@ -1639,11 +1854,51 @@ mod tests {
                 packs: vec![PathBuf::from(path)]
             }
         );
+
+        let path = OsString::from_vec(b"storage-\xff".to_vec());
+        let mut expected = options(
+            &[],
+            0,
+            DEFAULT_COMMAND_LIMIT,
+            ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+        );
+        expected
+            .command_storage_files
+            .push(("probe".to_owned(), PathBuf::from(path.clone())));
+        assert_eq!(
+            parse_args([
+                OsString::from("run"),
+                OsString::from("--command-storage"),
+                OsString::from("probe"),
+                path,
+                OsString::from("--world-seed"),
+                OsString::from("0"),
+                OsString::from("command"),
+                OsString::from("seed"),
+            ])
+            .unwrap(),
+            CliCommand::Run {
+                options: expected,
+                invocation: CliInvocation::Command("seed".to_owned()),
+            }
+        );
+
+        assert_eq!(
+            parse_args([
+                OsString::from("run"),
+                OsString::from("--command-storage"),
+                OsString::from_vec(b"namespace-\xff".to_vec()),
+                OsString::from("storage.dat"),
+            ]),
+            Err(usage_error(
+                "--command-storage namespace is not valid UTF-8"
+            ))
+        );
     }
 
     #[cfg(windows)]
     #[test]
-    fn preserves_non_utf8_pack_paths() {
+    fn preserves_non_utf8_paths() {
         use std::os::windows::ffi::OsStringExt;
 
         let path = OsString::from_wide(&[b'p' as u16, 0xd800]);
@@ -1657,6 +1912,46 @@ mod tests {
             CliCommand::Check {
                 packs: vec![PathBuf::from(path)]
             }
+        );
+
+        let path = OsString::from_wide(&[b's' as u16, 0xd800]);
+        let mut expected = options(
+            &[],
+            0,
+            DEFAULT_COMMAND_LIMIT,
+            ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+        );
+        expected
+            .command_storage_files
+            .push(("probe".to_owned(), PathBuf::from(path.clone())));
+        assert_eq!(
+            parse_args([
+                OsString::from("run"),
+                OsString::from("--command-storage"),
+                OsString::from("probe"),
+                path,
+                OsString::from("--world-seed"),
+                OsString::from("0"),
+                OsString::from("command"),
+                OsString::from("seed"),
+            ])
+            .unwrap(),
+            CliCommand::Run {
+                options: expected,
+                invocation: CliInvocation::Command("seed".to_owned()),
+            }
+        );
+
+        assert_eq!(
+            parse_args([
+                OsString::from("run"),
+                OsString::from("--command-storage"),
+                OsString::from_wide(&[b'n' as u16, 0xd800]),
+                OsString::from("storage.dat"),
+            ]),
+            Err(usage_error(
+                "--command-storage namespace is not valid UTF-8"
+            ))
         );
     }
 }

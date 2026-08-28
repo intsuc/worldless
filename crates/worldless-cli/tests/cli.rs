@@ -660,3 +660,81 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
     assert!(stderr.contains("limit of 0"), "{stderr}");
     assert!(!stderr.contains("usage: worldless"), "{stderr}");
 }
+
+#[test]
+fn command_storage_load_failures_use_the_load_exit_code_for_run_and_repl() {
+    let missing = std::env::temp_dir().join(format!(
+        "worldless-cli-missing-storage-{}-{}",
+        std::process::id(),
+        NEXT_PACK.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let output = worldless(&[
+        "run".as_ref(),
+        "--command-storage".as_ref(),
+        "probe".as_ref(),
+        missing.as_os_str(),
+        "--world-seed".as_ref(),
+        "0".as_ref(),
+        "command".as_ref(),
+        "seed".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(stderr.starts_with("error: "), "{stderr}");
+    assert!(!stderr.contains("usage: worldless"), "{stderr}");
+
+    let output = worldless_with_stdin(
+        &[
+            "repl".as_ref(),
+            "--command-storage".as_ref(),
+            "probe".as_ref(),
+            missing.as_os_str(),
+            "--world-seed".as_ref(),
+            "0".as_ref(),
+        ],
+        b"",
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(stderr.starts_with("error: "), "{stderr}");
+    assert!(!stderr.contains("usage: worldless"), "{stderr}");
+}
+
+#[test]
+fn run_loads_command_storage_before_executing_the_command() {
+    let directory = TestPack::new();
+    let storage = directory.root().join("probe.dat");
+    fs::write(
+        &storage,
+        [
+            0x0a, 0x00, 0x00, 0x03, 0x00, 0x0b, b'D', b'a', b't', b'a', b'V', b'e', b'r', b's',
+            b'i', b'o', b'n', 0x00, 0x00, 0x13, 0x97, 0x0a, 0x00, 0x04, b'd', b'a', b't', b'a',
+            0x0a, 0x00, 0x08, b'c', b'o', b'n', b't', b'e', b'n', b't', b's', 0x0a, 0x00, 0x05,
+            b's', b't', b'a', b't', b'e', 0x03, 0x00, 0x05, b'v', b'a', b'l', b'u', b'e', 0x00,
+            0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+        ],
+    )
+    .unwrap();
+
+    let output = worldless(&[
+        "run".as_ref(),
+        "--command-storage".as_ref(),
+        "probe".as_ref(),
+        storage.as_os_str(),
+        "--world-seed".as_ref(),
+        "0".as_ref(),
+        "command".as_ref(),
+        "data get storage probe:state value".as_ref(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        text(&output.stdout).ends_with("result success=true value=7\n"),
+        "{}",
+        text(&output.stdout)
+    );
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+}

@@ -12,6 +12,7 @@
 //! is atomic: an invalid selected resource rejects the whole program instead of
 //! leaving a partially populated VM.
 
+mod command_storage_file;
 mod execution_context;
 mod loader;
 mod macro_function;
@@ -26,6 +27,7 @@ mod resource_json;
 mod runtime;
 mod stopwatch;
 
+pub use command_storage_file::CommandStorageLoadError;
 pub use execution_context::{ExecutionContext, Position, Rotation};
 pub use loader::{LoadError, ResourceOrigin};
 pub use nbt::{CompoundTag, CompoundTagParseError};
@@ -34,7 +36,7 @@ pub use runtime::{
     CommandFeedback, ExecutionError, ExecutionOutcome, ExecutionReport, FeedbackText,
 };
 
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt, path::Path, sync::Arc};
 
 use macro_function::MacroCacheState;
 use nbt::CommandStorage;
@@ -164,6 +166,28 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Atomically replaces command-storage namespaces from Minecraft storage files.
+    ///
+    /// Each tuple supplies the namespace owned by one file and its path. All
+    /// namespaces and files are validated before any VM state changes. A loaded
+    /// namespace replaces every existing storage in that namespace; namespaces
+    /// not named by `files` are preserved.
+    pub fn load_command_storage_files<N, P>(
+        &mut self,
+        files: impl IntoIterator<Item = (N, P)>,
+    ) -> Result<(), CommandStorageLoadError>
+    where
+        N: AsRef<str>,
+        P: AsRef<Path>,
+    {
+        let loaded = command_storage_file::load(files)?;
+        for namespace in loaded {
+            self.command_storage
+                .replace_namespace(&namespace.namespace, namespace.values);
+        }
+        Ok(())
+    }
+
     /// Returns the exact compound stored under `id`, or `None` when it is absent.
     pub fn storage(&self, id: &str) -> Result<Option<&CompoundTag>, StorageIdParseError> {
         let id = parse_storage_id(id)?;

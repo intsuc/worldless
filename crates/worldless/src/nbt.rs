@@ -208,6 +208,350 @@ pub(crate) enum Tag {
     LongArray(Vec<i64>),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BinaryNbtParseError {
+    reason: String,
+}
+
+impl BinaryNbtParseError {
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+pub(crate) fn parse_binary_compound(input: &[u8]) -> Result<CompoundTag, BinaryNbtParseError> {
+    BinaryNbtReader::new(input).read_root_compound()
+}
+
+struct BinaryNbtReader<'a> {
+    input: &'a [u8],
+    position: usize,
+}
+
+impl<'a> BinaryNbtReader<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, position: 0 }
+    }
+
+    fn read_root_compound(mut self) -> Result<CompoundTag, BinaryNbtParseError> {
+        let tag_type = self.read_u8("root tag type")?;
+        if tag_type != 10 {
+            return self.fail(format!(
+                "root tag must be a compound, found {}",
+                tag_type_name(tag_type)
+            ));
+        }
+        let name_length = usize::from(self.read_u16("root name length")?);
+        self.take(name_length, "root name")?;
+        let Tag::Compound(root) = self.read_payload(tag_type, 0)? else {
+            unreachable!("tag type 10 always produces a compound")
+        };
+        Ok(root)
+    }
+
+    fn read_payload(
+        &mut self,
+        tag_type: u8,
+        container_depth: usize,
+    ) -> Result<Tag, BinaryNbtParseError> {
+        match tag_type {
+            1 => Ok(Tag::Byte(self.read_u8("byte tag")? as i8)),
+            2 => Ok(Tag::Short(self.read_i16("short tag")?)),
+            3 => Ok(Tag::Int(self.read_i32("int tag")?)),
+            4 => Ok(Tag::Long(self.read_i64("long tag")?)),
+            5 => Ok(Tag::float(f32::from_bits(self.read_u32("float tag")?))),
+            6 => Ok(Tag::double(f64::from_bits(self.read_u64("double tag")?))),
+            7 => self.read_byte_array().map(Tag::ByteArray),
+            8 => self.read_modified_utf().map(Tag::String),
+            9 => {
+                let depth = self.enter_container(container_depth)?;
+                self.read_list(depth).map(Tag::List)
+            }
+            10 => {
+                let depth = self.enter_container(container_depth)?;
+                self.read_compound(depth).map(Tag::Compound)
+            }
+            11 => self.read_int_array().map(Tag::IntArray),
+            12 => self.read_long_array().map(Tag::LongArray),
+            _ => self.fail(format!("invalid tag type {tag_type}")),
+        }
+    }
+
+    fn enter_container(&self, depth: usize) -> Result<usize, BinaryNbtParseError> {
+        let depth = depth
+            .checked_add(1)
+            .ok_or_else(|| self.error("NBT container depth overflow"))?;
+        if depth > MAX_DEPTH {
+            Err(self.error(format!("NBT exceeds the maximum depth of {MAX_DEPTH}")))
+        } else {
+            Ok(depth)
+        }
+    }
+
+    fn read_compound(
+        &mut self,
+        container_depth: usize,
+    ) -> Result<CompoundTag, BinaryNbtParseError> {
+        let mut result = CompoundTag::new();
+        loop {
+            let tag_type = self.read_u8("compound tag type")?;
+            if tag_type == 0 {
+                return Ok(result);
+            }
+            validate_tag_type(tag_type).map_err(|reason| self.error(reason))?;
+            let name = self.read_modified_utf()?;
+            let value = self.read_payload(tag_type, container_depth)?;
+            if result.insert(name, value).is_some() {
+                return self.fail("duplicate compound key");
+            }
+        }
+    }
+
+    fn read_list(&mut self, container_depth: usize) -> Result<Vec<Tag>, BinaryNbtParseError> {
+        let element_type = self.read_u8("list element type")?;
+        validate_tag_type_or_end(element_type).map_err(|reason| self.error(reason))?;
+        let length = self.read_length("list length")?;
+        if element_type == 0 && length != 0 {
+            return self.fail("non-empty list has end-tag element type");
+        }
+        if let Some(minimum_size) = minimum_payload_size(element_type) {
+            self.require_elements(length, minimum_size, "list elements")?;
+        }
+        let mut result = Vec::new();
+        reserve_exact(&mut result, length).map_err(|reason| self.error(reason))?;
+        for _ in 0..length {
+            let value = self.read_payload(element_type, container_depth)?;
+            result.push(if element_type == 10 {
+                unwrap_heterogeneous_list_element(value)
+            } else {
+                value
+            });
+        }
+        Ok(result)
+    }
+
+    fn read_byte_array(&mut self) -> Result<Vec<i8>, BinaryNbtParseError> {
+        let length = self.read_length("byte-array length")?;
+        self.require_elements(length, 1, "byte-array elements")?;
+        let bytes = self.take(length, "byte-array elements")?;
+        let mut result = Vec::new();
+        reserve_exact(&mut result, length).map_err(|reason| self.error(reason))?;
+        result.extend(bytes.iter().map(|&value| value as i8));
+        Ok(result)
+    }
+
+    fn read_int_array(&mut self) -> Result<Vec<i32>, BinaryNbtParseError> {
+        let length = self.read_length("int-array length")?;
+        self.require_elements(length, 4, "int-array elements")?;
+        let mut result = Vec::new();
+        reserve_exact(&mut result, length).map_err(|reason| self.error(reason))?;
+        for _ in 0..length {
+            result.push(self.read_i32("int-array element")?);
+        }
+        Ok(result)
+    }
+
+    fn read_long_array(&mut self) -> Result<Vec<i64>, BinaryNbtParseError> {
+        let length = self.read_length("long-array length")?;
+        self.require_elements(length, 8, "long-array elements")?;
+        let mut result = Vec::new();
+        reserve_exact(&mut result, length).map_err(|reason| self.error(reason))?;
+        for _ in 0..length {
+            result.push(self.read_i64("long-array element")?);
+        }
+        Ok(result)
+    }
+
+    fn read_modified_utf(&mut self) -> Result<JavaString, BinaryNbtParseError> {
+        let byte_length = usize::from(self.read_u16("modified UTF-8 length")?);
+        let bytes = self.take(byte_length, "modified UTF-8 bytes")?;
+        let mut units = Vec::new();
+        reserve_exact(&mut units, byte_length).map_err(|reason| self.error(reason))?;
+        let mut index = 0;
+        while index < bytes.len() {
+            let first = bytes[index];
+            match first >> 4 {
+                0..=7 => {
+                    units.push(u16::from(first));
+                    index += 1;
+                }
+                12 | 13 => {
+                    let Some(&second) = bytes.get(index + 1) else {
+                        return self.fail("truncated two-byte modified UTF-8 sequence");
+                    };
+                    if second & 0xc0 != 0x80 {
+                        return self.fail("invalid modified UTF-8 continuation byte");
+                    }
+                    units.push((u16::from(first & 0x1f) << 6) | u16::from(second & 0x3f));
+                    index += 2;
+                }
+                14 => {
+                    let (Some(&second), Some(&third)) =
+                        (bytes.get(index + 1), bytes.get(index + 2))
+                    else {
+                        return self.fail("truncated three-byte modified UTF-8 sequence");
+                    };
+                    if second & 0xc0 != 0x80 || third & 0xc0 != 0x80 {
+                        return self.fail("invalid modified UTF-8 continuation byte");
+                    }
+                    units.push(
+                        (u16::from(first & 0x0f) << 12)
+                            | (u16::from(second & 0x3f) << 6)
+                            | u16::from(third & 0x3f),
+                    );
+                    index += 3;
+                }
+                _ => return self.fail("invalid modified UTF-8 leading byte"),
+            }
+        }
+        Ok(JavaString::from_units(units))
+    }
+
+    fn read_length(&mut self, description: &str) -> Result<usize, BinaryNbtParseError> {
+        let length = self.read_i32(description)?;
+        usize::try_from(length).map_err(|_| self.error(format!("negative {description}")))
+    }
+
+    fn require_elements(
+        &self,
+        length: usize,
+        element_size: usize,
+        description: &str,
+    ) -> Result<(), BinaryNbtParseError> {
+        let byte_length = length
+            .checked_mul(element_size)
+            .ok_or_else(|| self.error(format!("{description} length overflow")))?;
+        if byte_length > self.input.len() - self.position {
+            Err(self.error(format!("truncated {description}")))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_u8(&mut self, description: &str) -> Result<u8, BinaryNbtParseError> {
+        Ok(self.take(1, description)?[0])
+    }
+
+    fn read_u16(&mut self, description: &str) -> Result<u16, BinaryNbtParseError> {
+        let bytes = self.take(2, description)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_i16(&mut self, description: &str) -> Result<i16, BinaryNbtParseError> {
+        let bytes = self.take(2, description)?;
+        Ok(i16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self, description: &str) -> Result<u32, BinaryNbtParseError> {
+        let bytes = self.take(4, description)?;
+        Ok(u32::from_be_bytes(bytes.try_into().expect("four bytes")))
+    }
+
+    fn read_i32(&mut self, description: &str) -> Result<i32, BinaryNbtParseError> {
+        let bytes = self.take(4, description)?;
+        Ok(i32::from_be_bytes(bytes.try_into().expect("four bytes")))
+    }
+
+    fn read_u64(&mut self, description: &str) -> Result<u64, BinaryNbtParseError> {
+        let bytes = self.take(8, description)?;
+        Ok(u64::from_be_bytes(bytes.try_into().expect("eight bytes")))
+    }
+
+    fn read_i64(&mut self, description: &str) -> Result<i64, BinaryNbtParseError> {
+        let bytes = self.take(8, description)?;
+        Ok(i64::from_be_bytes(bytes.try_into().expect("eight bytes")))
+    }
+
+    fn take(&mut self, length: usize, description: &str) -> Result<&'a [u8], BinaryNbtParseError> {
+        let Some(end) = self.position.checked_add(length) else {
+            return self.fail(format!("{description} length overflow"));
+        };
+        let Some(bytes) = self.input.get(self.position..end) else {
+            return self.fail(format!("truncated {description}"));
+        };
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn error(&self, reason: impl fmt::Display) -> BinaryNbtParseError {
+        BinaryNbtParseError {
+            reason: format!("{reason} at byte {}", self.position),
+        }
+    }
+
+    fn fail<T>(&self, reason: impl fmt::Display) -> Result<T, BinaryNbtParseError> {
+        Err(self.error(reason))
+    }
+}
+
+fn validate_tag_type(tag_type: u8) -> Result<(), String> {
+    if (1..=12).contains(&tag_type) {
+        Ok(())
+    } else {
+        Err(format!("invalid tag type {tag_type}"))
+    }
+}
+
+fn validate_tag_type_or_end(tag_type: u8) -> Result<(), String> {
+    if tag_type <= 12 {
+        Ok(())
+    } else {
+        Err(format!("invalid tag type {tag_type}"))
+    }
+}
+
+fn tag_type_name(tag_type: u8) -> String {
+    match tag_type {
+        0 => "end".to_owned(),
+        1 => "byte".to_owned(),
+        2 => "short".to_owned(),
+        3 => "int".to_owned(),
+        4 => "long".to_owned(),
+        5 => "float".to_owned(),
+        6 => "double".to_owned(),
+        7 => "byte array".to_owned(),
+        8 => "string".to_owned(),
+        9 => "list".to_owned(),
+        10 => "compound".to_owned(),
+        11 => "int array".to_owned(),
+        12 => "long array".to_owned(),
+        _ => format!("unknown type {tag_type}"),
+    }
+}
+
+fn minimum_payload_size(tag_type: u8) -> Option<usize> {
+    match tag_type {
+        0 => None,
+        1 => Some(1),
+        2 => Some(2),
+        3 | 5 => Some(4),
+        4 | 6 => Some(8),
+        7 | 11 | 12 => Some(4),
+        8 => Some(2),
+        9 => Some(5),
+        10 => Some(1),
+        _ => None,
+    }
+}
+
+fn reserve_exact<T>(values: &mut Vec<T>, length: usize) -> Result<(), String> {
+    values
+        .try_reserve_exact(length)
+        .map_err(|error| format!("cannot allocate space for {length} NBT values: {error}"))
+}
+
+fn unwrap_heterogeneous_list_element(value: Tag) -> Tag {
+    let Tag::Compound(mut compound) = value else {
+        return value;
+    };
+    if compound.len() == 1
+        && let Some(value) = compound.remove(&JavaString::default())
+    {
+        return value;
+    }
+    Tag::Compound(compound)
+}
+
 impl Tag {
     pub(crate) fn float(value: f32) -> Self {
         Self::Float(if value == 0.0 {
@@ -2510,6 +2854,17 @@ impl CommandStorage {
         }
     }
 
+    pub(crate) fn replace_namespace(
+        &mut self,
+        namespace: &str,
+        values: impl IntoIterator<Item = (Identifier, CompoundTag)>,
+    ) {
+        self.values.retain(|id, _| id.namespace() != namespace);
+        for (id, value) in values {
+            self.set(id, value);
+        }
+    }
+
     pub(crate) fn edit<R, E>(
         &mut self,
         id: &Identifier,
@@ -2538,6 +2893,276 @@ impl CommandStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn push_binary_string(output: &mut Vec<u8>, bytes: &[u8]) {
+        output.extend_from_slice(&u16::try_from(bytes.len()).unwrap().to_be_bytes());
+        output.extend_from_slice(bytes);
+    }
+
+    fn push_binary_header(output: &mut Vec<u8>, tag_type: u8, name: &[u8]) {
+        output.push(tag_type);
+        push_binary_string(output, name);
+    }
+
+    fn binary_root() -> Vec<u8> {
+        vec![10, 0, 0]
+    }
+
+    fn binary_tag<'a>(root: &'a CompoundTag, name: &str) -> &'a Tag {
+        root.get(&JavaString::from(name)).unwrap()
+    }
+
+    #[test]
+    fn binary_nbt_reads_every_payload_type_and_modified_utf() {
+        let mut input = binary_root();
+        push_binary_header(&mut input, 1, b"byte");
+        input.push(0xfe);
+        push_binary_header(&mut input, 2, b"short");
+        input.extend_from_slice(&(-1234_i16).to_be_bytes());
+        push_binary_header(&mut input, 3, b"int");
+        input.extend_from_slice(&(-123_456_i32).to_be_bytes());
+        push_binary_header(&mut input, 4, b"long");
+        input.extend_from_slice(&(-123_456_789_i64).to_be_bytes());
+        push_binary_header(&mut input, 5, b"float");
+        input.extend_from_slice(&(-0.0_f32).to_bits().to_be_bytes());
+        push_binary_header(&mut input, 6, b"double");
+        input.extend_from_slice(&(-0.0_f64).to_bits().to_be_bytes());
+        push_binary_header(&mut input, 5, b"nan");
+        input.extend_from_slice(&0x7fc0_1234_u32.to_be_bytes());
+        push_binary_header(&mut input, 7, b"bytes");
+        input.extend_from_slice(&3_i32.to_be_bytes());
+        input.extend_from_slice(&[0xff, 0, 1]);
+        push_binary_header(&mut input, 8, b"string");
+        push_binary_string(&mut input, &[0, 0xc0, 0x80, 0xc1, 0x81, 0xed, 0xa0, 0x80]);
+        push_binary_header(&mut input, 9, b"list");
+        input.push(3);
+        input.extend_from_slice(&2_i32.to_be_bytes());
+        input.extend_from_slice(&7_i32.to_be_bytes());
+        input.extend_from_slice(&8_i32.to_be_bytes());
+        push_binary_header(&mut input, 10, b"compound");
+        push_binary_header(&mut input, 1, b"value");
+        input.push(9);
+        input.push(0);
+        push_binary_header(&mut input, 11, b"ints");
+        input.extend_from_slice(&2_i32.to_be_bytes());
+        input.extend_from_slice(&(-1_i32).to_be_bytes());
+        input.extend_from_slice(&2_i32.to_be_bytes());
+        push_binary_header(&mut input, 12, b"longs");
+        input.extend_from_slice(&2_i32.to_be_bytes());
+        input.extend_from_slice(&(-3_i64).to_be_bytes());
+        input.extend_from_slice(&4_i64.to_be_bytes());
+        input.push(0);
+        input.extend_from_slice(b"ignored trailing bytes");
+
+        let root = parse_binary_compound(&input).unwrap();
+        assert_eq!(binary_tag(&root, "byte"), &Tag::Byte(-2));
+        assert_eq!(binary_tag(&root, "short"), &Tag::Short(-1234));
+        assert_eq!(binary_tag(&root, "int"), &Tag::Int(-123_456));
+        assert_eq!(binary_tag(&root, "long"), &Tag::Long(-123_456_789));
+        assert_eq!(binary_tag(&root, "float"), &Tag::Float(0.0_f32.to_bits()));
+        assert_eq!(binary_tag(&root, "double"), &Tag::Double(0.0_f64.to_bits()));
+        assert_eq!(binary_tag(&root, "nan"), &Tag::Float(0x7fc0_1234));
+        assert_eq!(binary_tag(&root, "bytes"), &Tag::ByteArray(vec![-1, 0, 1]));
+        assert_eq!(
+            binary_tag(&root, "string"),
+            &Tag::String(JavaString::from_units(vec![0, 0, 0x41, 0xd800]))
+        );
+        assert_eq!(
+            binary_tag(&root, "list"),
+            &Tag::List(vec![Tag::Int(7), Tag::Int(8)])
+        );
+        let mut compound = CompoundTag::new();
+        compound.insert(JavaString::from("value"), Tag::Byte(9));
+        assert_eq!(binary_tag(&root, "compound"), &Tag::Compound(compound));
+        assert_eq!(binary_tag(&root, "ints"), &Tag::IntArray(vec![-1, 2]));
+        assert_eq!(binary_tag(&root, "longs"), &Tag::LongArray(vec![-3, 4]));
+        assert_eq!(
+            binary_tag(&root, "float").compact_stringify(),
+            JavaString::from("0.0f")
+        );
+        assert_eq!(
+            binary_tag(&root, "double").compact_stringify(),
+            JavaString::from("0.0d")
+        );
+    }
+
+    #[test]
+    fn binary_nbt_unwraps_compound_list_elements_once() {
+        let mut input = binary_root();
+        push_binary_header(&mut input, 9, b"values");
+        input.push(10);
+        input.extend_from_slice(&3_i32.to_be_bytes());
+
+        push_binary_header(&mut input, 8, b"");
+        push_binary_string(&mut input, b"a");
+        input.push(0);
+
+        push_binary_header(&mut input, 3, b"b");
+        input.extend_from_slice(&3_i32.to_be_bytes());
+        input.push(0);
+
+        push_binary_header(&mut input, 10, b"");
+        push_binary_header(&mut input, 1, b"");
+        input.push(7);
+        input.push(0);
+        input.push(0);
+
+        input.push(0);
+
+        let root = parse_binary_compound(&input).unwrap();
+        let mut ordinary = CompoundTag::new();
+        ordinary.insert(JavaString::from("b"), Tag::Int(3));
+        let mut empty_key_compound = CompoundTag::new();
+        empty_key_compound.insert(JavaString::default(), Tag::Byte(7));
+        assert_eq!(
+            binary_tag(&root, "values"),
+            &Tag::List(vec![
+                Tag::String(JavaString::from("a")),
+                Tag::Compound(ordinary),
+                Tag::Compound(empty_key_compound),
+            ])
+        );
+    }
+
+    #[test]
+    fn binary_nbt_skips_the_root_name_without_decoding_it() {
+        let input = [10, 0, 4, 0xf0, 0x80, 0x80, 0x80, 0];
+        assert_eq!(parse_binary_compound(&input).unwrap(), CompoundTag::new());
+    }
+
+    #[test]
+    fn binary_nbt_rejects_invalid_modified_utf_and_decoded_duplicate_keys() {
+        let mut invalid_string = binary_root();
+        push_binary_header(&mut invalid_string, 8, b"value");
+        push_binary_string(&mut invalid_string, &[0xf0, 0x80, 0x80, 0x80]);
+        invalid_string.push(0);
+        assert!(
+            parse_binary_compound(&invalid_string)
+                .unwrap_err()
+                .reason()
+                .contains("leading byte")
+        );
+
+        let mut duplicate = binary_root();
+        push_binary_header(&mut duplicate, 1, b"A");
+        duplicate.push(1);
+        push_binary_header(&mut duplicate, 1, &[0xc1, 0x81]);
+        duplicate.push(2);
+        duplicate.push(0);
+        assert!(
+            parse_binary_compound(&duplicate)
+                .unwrap_err()
+                .reason()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn binary_nbt_validates_list_types_and_declared_lengths_before_allocation() {
+        let mut empty_end_list = binary_root();
+        push_binary_header(&mut empty_end_list, 9, b"empty");
+        empty_end_list.push(0);
+        empty_end_list.extend_from_slice(&0_i32.to_be_bytes());
+        empty_end_list.push(0);
+        assert!(parse_binary_compound(&empty_end_list).is_ok());
+
+        let mut nonempty_end_list = binary_root();
+        push_binary_header(&mut nonempty_end_list, 9, b"invalid");
+        nonempty_end_list.push(0);
+        nonempty_end_list.extend_from_slice(&1_i32.to_be_bytes());
+        nonempty_end_list.push(0);
+        assert!(parse_binary_compound(&nonempty_end_list).is_err());
+
+        let mut negative_array = binary_root();
+        push_binary_header(&mut negative_array, 7, b"invalid");
+        negative_array.extend_from_slice(&(-1_i32).to_be_bytes());
+        negative_array.push(0);
+        assert!(
+            parse_binary_compound(&negative_array)
+                .unwrap_err()
+                .reason()
+                .contains("negative")
+        );
+
+        let mut huge_array = binary_root();
+        push_binary_header(&mut huge_array, 12, b"invalid");
+        huge_array.extend_from_slice(&i32::MAX.to_be_bytes());
+        huge_array.push(0);
+        assert!(
+            parse_binary_compound(&huge_array)
+                .unwrap_err()
+                .reason()
+                .contains("truncated")
+        );
+    }
+
+    fn nested_binary_compounds(container_count: usize) -> Vec<u8> {
+        let mut input = binary_root();
+        for _ in 1..container_count {
+            push_binary_header(&mut input, 10, b"x");
+        }
+        input.extend(std::iter::repeat_n(0, container_count));
+        input
+    }
+
+    #[test]
+    fn binary_nbt_accepts_512_containers_and_rejects_the_513th() {
+        assert!(parse_binary_compound(&nested_binary_compounds(512)).is_ok());
+        assert!(
+            parse_binary_compound(&nested_binary_compounds(513))
+                .unwrap_err()
+                .reason()
+                .contains("maximum depth")
+        );
+    }
+
+    #[test]
+    fn replacing_a_storage_namespace_removes_empty_and_stale_entries_only_there() {
+        let mut storage = CommandStorage::default();
+        storage.set(
+            Identifier::from_parts("probe", "stale").unwrap(),
+            CompoundTag::from_snbt("{value:1}").unwrap(),
+        );
+        storage.set(
+            Identifier::from_parts("keep", "state").unwrap(),
+            CompoundTag::from_snbt("{value:2}").unwrap(),
+        );
+
+        storage.replace_namespace(
+            "probe",
+            [
+                (
+                    Identifier::from_parts("probe", "loaded").unwrap(),
+                    CompoundTag::from_snbt("{value:3}").unwrap(),
+                ),
+                (
+                    Identifier::from_parts("probe", "empty").unwrap(),
+                    CompoundTag::new(),
+                ),
+            ],
+        );
+
+        assert!(
+            storage
+                .get_ref(&Identifier::from_parts("probe", "stale").unwrap())
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_ref(&Identifier::from_parts("probe", "loaded").unwrap())
+                .is_some()
+        );
+        assert!(
+            storage
+                .get_ref(&Identifier::from_parts("probe", "empty").unwrap())
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_ref(&Identifier::from_parts("keep", "state").unwrap())
+                .is_some()
+        );
+    }
 
     fn assert_java_string(actual: JavaString, expected: &str) {
         assert_eq!(actual.units(), expected.encode_utf16().collect::<Vec<_>>());
