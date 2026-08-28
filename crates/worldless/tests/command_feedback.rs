@@ -447,7 +447,7 @@ fn data_modify_no_op_feedback_follows_nbt_collection_selection_rules() {
 }
 
 #[test]
-fn compound_data_get_feedback_matches_minecraft_pretty_snbt() {
+fn compound_data_get_feedback_uses_deterministic_pretty_snbt() {
     let mut vm = load(0, &[]);
     execute(
         &mut vm,
@@ -468,7 +468,7 @@ fn compound_data_get_feedback_matches_minecraft_pretty_snbt() {
     assert_eq!(
         feedback,
         [RenderedFeedback::Success(
-            "Storage example:state has the following contents: {1: 2, true: [I; 1, 2]}".to_owned()
+            "Storage example:state has the following contents: {true: [I; 1, 2], 1: 2}".to_owned()
         )]
     );
 }

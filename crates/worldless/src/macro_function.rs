@@ -13,7 +13,8 @@ use crate::{
 
 pub(crate) const MAX_COMMAND_LENGTH: usize = 2_000_000;
 const MAX_CACHE_ENTRIES: usize = 8;
-type MacroCache = VecDeque<(Vec<JavaString>, Arc<[Instruction]>)>;
+pub(crate) type Instructions = Arc<[Arc<Instruction>]>;
+type MacroCache = VecDeque<(Vec<JavaString>, Instructions)>;
 
 #[derive(Debug, Default)]
 pub(crate) struct MacroCacheState {
@@ -22,7 +23,7 @@ pub(crate) struct MacroCacheState {
 
 #[derive(Debug)]
 pub(crate) enum Function {
-    Plain(Arc<[Instruction]>),
+    Plain(Instructions),
     Macro(MacroFunction),
 }
 
@@ -34,7 +35,7 @@ pub(crate) struct MacroFunction {
 
 #[derive(Debug)]
 enum MacroEntry {
-    Plain(Box<Instruction>),
+    Plain(Arc<Instruction>),
     Template {
         template: StringTemplate,
         parameters: Vec<usize>,
@@ -69,7 +70,7 @@ impl FunctionBuilder {
     }
 
     pub(crate) fn add_command(&mut self, instruction: Instruction) {
-        self.entries.push(MacroEntry::Plain(Box::new(instruction)));
+        self.entries.push(MacroEntry::Plain(Arc::new(instruction)));
     }
 
     pub(crate) fn add_macro(&mut self, command: &str) -> Result<(), String> {
@@ -105,7 +106,7 @@ impl FunctionBuilder {
                 .entries
                 .into_iter()
                 .map(|entry| match entry {
-                    MacroEntry::Plain(instruction) => *instruction,
+                    MacroEntry::Plain(instruction) => instruction,
                     MacroEntry::Template { .. } => {
                         unreachable!("a template marks its function as a macro")
                     }
@@ -123,7 +124,7 @@ impl MacroFunction {
         caches: &mut MacroCacheState,
         arguments: Option<&CompoundTag>,
         mut compile: impl FnMut(Vec<u16>) -> Result<Instruction, String>,
-    ) -> Result<Arc<[Instruction]>, FunctionInstantiationError> {
+    ) -> Result<Instructions, FunctionInstantiationError> {
         let arguments = arguments.ok_or(FunctionInstantiationError::MissingArguments)?;
         let values = self
             .parameters
@@ -154,7 +155,7 @@ impl MacroFunction {
             .entries
             .iter()
             .map(|entry| match entry {
-                MacroEntry::Plain(instruction) => Ok(instruction.as_ref().clone()),
+                MacroEntry::Plain(instruction) => Ok(Arc::clone(instruction)),
                 MacroEntry::Template {
                     template,
                     parameters,
@@ -166,14 +167,16 @@ impl MacroFunction {
                     let command = template
                         .substitute(&substitutions)
                         .map_err(FunctionInstantiationError::Other)?;
-                    compile(command.clone()).map_err(|reason| FunctionInstantiationError::Parse {
-                        command: JavaString::from_units(command),
-                        reason,
+                    compile(command.clone()).map(Arc::new).map_err(|reason| {
+                        FunctionInstantiationError::Parse {
+                            command: JavaString::from_units(command),
+                            reason,
+                        }
                     })
                 }
             })
             .collect::<Result<Vec<_>, _>>()
-            .map(Arc::<[Instruction]>::from)?;
+            .map(Arc::<[Arc<Instruction>]>::from)?;
         let cache = caches.functions.entry(id.clone()).or_default();
         if cache.len() == MAX_CACHE_ENTRIES {
             cache.pop_front();

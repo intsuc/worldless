@@ -1273,25 +1273,39 @@ fn java_lines(contents: &str) -> Vec<&str> {
 #[derive(Clone)]
 struct LoweringSource {
     sink: Rc<RefCell<Option<Instruction>>>,
-    modifiers: Vec<Modifier>,
+    modifiers: Option<Rc<ModifierNode>>,
+}
+
+struct ModifierNode {
+    previous: Option<Rc<ModifierNode>>,
+    modifier: Modifier,
+    depth: usize,
 }
 
 impl LoweringSource {
     fn with_modifier(&self, modifier: Modifier) -> Self {
-        let mut modifiers = self.modifiers.clone();
-        modifiers.push(modifier);
+        let depth = self.modifiers.as_ref().map_or(1, |node| node.depth + 1);
         Self {
             sink: Rc::clone(&self.sink),
-            modifiers,
+            modifiers: Some(Rc::new(ModifierNode {
+                previous: self.modifiers.as_ref().map(Rc::clone),
+                modifier,
+                depth,
+            })),
         }
     }
 
     fn record(&self, command: CompiledCommand) -> Result<i32, CommandSyntaxException> {
         let mut sink = self.sink.borrow_mut();
-        let instruction = Instruction {
-            modifiers: self.modifiers.clone(),
-            command,
-        };
+        let mut modifiers =
+            Vec::with_capacity(self.modifiers.as_ref().map_or(0, |modifier| modifier.depth));
+        let mut current = self.modifiers.as_deref();
+        while let Some(modifier) = current {
+            modifiers.push(modifier.modifier.clone());
+            current = modifier.previous.as_deref();
+        }
+        modifiers.reverse();
+        let instruction = Instruction { modifiers, command };
         if sink.replace(instruction).is_some() {
             return Err(syntax_error("command produced more than one instruction"));
         }
@@ -1763,7 +1777,7 @@ impl CommandCompiler {
                 command,
                 LoweringSource {
                     sink: Rc::clone(&sink),
-                    modifiers: Vec::new(),
+                    modifiers: None,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -4522,15 +4536,16 @@ mod tests {
         let Function::Plain(instructions) = function else {
             panic!("a function without macro lines is plain")
         };
+        assert_eq!(instructions.len(), 1);
         assert!(matches!(
-            instructions.as_ref(),
-            [Instruction {
+            instructions[0].as_ref(),
+            Instruction {
                 modifiers,
                 command: CompiledCommand::Return {
                     success: true,
                     value: 2
                 }
-            }] if modifiers.is_empty()
+            } if modifiers.is_empty()
         ));
         assert!(parse_function("return 1\\", &compiler).is_err());
     }

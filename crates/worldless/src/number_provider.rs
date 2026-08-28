@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::{
     execution_context::ExecutionContext,
-    nbt::{CommandStorage, JavaString, NbtPath, Tag},
+    nbt::{CommandStorage, JavaString, NbtPath, NbtSelection, Tag},
     predicate::{
         LootPredicate, PredicateReference, PredicateSet, builtin_predicates,
         parse_reference as parse_predicate_reference,
@@ -593,6 +593,7 @@ impl NumberProvider {
                 .map(|value| value as f32),
             Self::Storage { storage, path } => Ok(storage_number(command_storage, storage, path)
                 .as_ref()
+                .and_then(NbtSelection::as_tag)
                 .and_then(tag_float_value)
                 .unwrap_or(0.0)),
             Self::Score {
@@ -794,6 +795,7 @@ impl NumberProvider {
             }
             Self::Storage { storage, path } => Ok(storage_number(command_storage, storage, path)
                 .as_ref()
+                .and_then(NbtSelection::as_tag)
                 .and_then(tag_boxed_int_value)
                 .unwrap_or(0)),
             Self::Sum(providers) => {
@@ -1537,13 +1539,13 @@ fn builtin_providers() -> HashMap<Identifier, NumberProvider> {
     providers
 }
 
-fn storage_number(
-    command_storage: &CommandStorage,
+fn storage_number<'a>(
+    command_storage: &'a CommandStorage,
     storage: &Identifier,
     path: &NbtPath,
-) -> Option<Tag> {
+) -> Option<NbtSelection<'a>> {
     let root = command_storage.get_ref(storage)?;
-    let mut values = path.get(root).ok()?;
+    let mut values = path.select(root).ok()?;
     if values.len() != 1 {
         return None;
     }

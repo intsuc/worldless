@@ -1,11 +1,51 @@
-use std::fmt;
+use std::{
+    collections::hash_map::DefaultHasher,
+    fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 const DEFAULT_NAMESPACE: &str = "minecraft";
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct Identifier {
-    namespace: String,
-    path: String,
+    namespace: IdentifierPart,
+    path: IdentifierPart,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IdentifierPart {
+    value: Arc<str>,
+    hash: u64,
+}
+
+impl IdentifierPart {
+    pub(crate) fn new(value: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        Self {
+            value: Arc::from(value),
+            hash: hasher.finish(),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
+impl PartialEq for IdentifierPart {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.value, &other.value) || self.value == other.value
+    }
+}
+
+impl Eq for IdentifierPart {}
+
+impl Hash for IdentifierPart {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
 }
 
 impl Identifier {
@@ -23,23 +63,52 @@ impl Identifier {
             .then_some(())
             .filter(|()| is_valid_path(path))
             .map(|()| Self {
-                namespace: namespace.to_owned(),
-                path: path.to_owned(),
+                namespace: IdentifierPart::new(namespace),
+                path: IdentifierPart::new(path),
             })
     }
 
     pub(crate) fn namespace(&self) -> &str {
-        &self.namespace
+        self.namespace.as_str()
     }
 
     pub(crate) fn path(&self) -> &str {
+        self.path.as_str()
+    }
+
+    pub(crate) fn namespace_key(&self) -> &IdentifierPart {
+        &self.namespace
+    }
+
+    pub(crate) fn path_key(&self) -> &IdentifierPart {
         &self.path
+    }
+
+    pub(crate) fn with_path(&self, path: &str) -> Option<Self> {
+        is_valid_path(path).then(|| Self {
+            namespace: self.namespace.clone(),
+            path: IdentifierPart::new(path),
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (IdentifierPart, IdentifierPart) {
+        (self.namespace, self.path)
+    }
+}
+
+impl fmt::Debug for Identifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Identifier")
+            .field("namespace", &self.namespace())
+            .field("path", &self.path())
+            .finish()
     }
 }
 
 impl fmt::Display for Identifier {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}:{}", self.namespace, self.path)
+        write!(formatter, "{}:{}", self.namespace(), self.path())
     }
 }
 

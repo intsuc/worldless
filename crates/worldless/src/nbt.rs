@@ -1,7 +1,11 @@
 use std::{
-    collections::{BTreeMap, HashMap, hash_map::Entry},
+    borrow::Cow,
+    cmp::Ordering,
+    collections::{HashMap, hash_map::DefaultHasher},
     error::Error,
     fmt,
+    hash::{BuildHasherDefault, Hash, Hasher},
+    sync::Arc,
 };
 
 use worldless_brigadier::{
@@ -9,24 +13,32 @@ use worldless_brigadier::{
     exceptions::{java_f32, java_f64},
 };
 
-use crate::resource::Identifier;
+use crate::resource::{Identifier, IdentifierPart};
 
 const MAX_DEPTH: usize = 512;
 
-#[derive(Clone, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct JavaString(Vec<u16>);
+#[derive(Clone)]
+pub(crate) struct JavaString {
+    units: Arc<[u16]>,
+    hash: u64,
+}
 
 impl JavaString {
     pub(crate) fn from_units(units: Vec<u16>) -> Self {
-        Self(units)
+        let mut hasher = DefaultHasher::new();
+        units.hash(&mut hasher);
+        Self {
+            units: units.into(),
+            hash: hasher.finish(),
+        }
     }
 
     pub(crate) fn units(&self) -> &[u16] {
-        &self.0
+        &self.units
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.units.len()
     }
 
     pub(crate) fn substring(&self, start: i32, end: Option<i32>) -> Result<Self, String> {
@@ -46,35 +58,69 @@ impl JavaString {
         if start < 0 || end > length || start > end {
             return Err(format!("invalid substring range {start}..{end}"));
         }
-        Ok(Self(self.0[start as usize..end as usize].to_vec()))
+        Ok(Self::from_units(
+            self.units[start as usize..end as usize].to_vec(),
+        ))
     }
 
     pub(crate) fn to_string_lossy(&self) -> String {
-        String::from_utf16_lossy(&self.0)
+        String::from_utf16_lossy(&self.units)
     }
 
     fn eq_ascii_ignore_case(&self, value: &[u8]) -> bool {
-        self.0.len() == value.len()
+        self.units.len() == value.len()
             && self
-                .0
+                .units
                 .iter()
                 .zip(value)
                 .all(|(&left, &right)| left <= 0x7f && (left as u8).eq_ignore_ascii_case(&right))
     }
 
     fn eq_ascii(&self, value: &[u8]) -> bool {
-        self.0.len() == value.len()
+        self.units.len() == value.len()
             && self
-                .0
+                .units
                 .iter()
                 .zip(value)
                 .all(|(&left, &right)| left == u16::from(right))
     }
 }
 
+impl Default for JavaString {
+    fn default() -> Self {
+        Self::from_units(Vec::new())
+    }
+}
+
+impl PartialEq for JavaString {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.units, &other.units) || self.units == other.units
+    }
+}
+
+impl Eq for JavaString {}
+
+impl Hash for JavaString {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl PartialOrd for JavaString {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for JavaString {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.units.cmp(&other.units)
+    }
+}
+
 impl From<&str> for JavaString {
     fn from(value: &str) -> Self {
-        Self(value.encode_utf16().collect())
+        Self::from_units(value.encode_utf16().collect())
     }
 }
 
@@ -96,8 +142,10 @@ impl fmt::Display for JavaString {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompoundTag(BTreeMap<JavaString, Tag>);
+type CompoundMap = HashMap<JavaString, Tag, BuildHasherDefault<DefaultHasher>>;
+
+#[derive(Debug)]
+pub struct CompoundTag(CompoundMap);
 
 /// An error produced while parsing a compound SNBT value.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,7 +183,7 @@ impl CompoundTag {
     }
 
     pub(crate) fn new() -> Self {
-        Self(BTreeMap::new())
+        Self(HashMap::default())
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -184,6 +232,16 @@ impl CompoundTag {
             }
         }
     }
+
+    pub(crate) fn is_too_deep(&self, depth: usize) -> bool {
+        depth >= MAX_DEPTH || self.values().any(|child| child.is_too_deep(depth + 1))
+    }
+
+    pub(crate) fn pretty_stringify(&self) -> JavaString {
+        let mut output = Vec::new();
+        write_pretty_compound(self, 0, &mut output);
+        JavaString::from_units(output)
+    }
 }
 
 impl Default for CompoundTag {
@@ -191,6 +249,29 @@ impl Default for CompoundTag {
         Self::new()
     }
 }
+
+impl Clone for CompoundTag {
+    fn clone(&self) -> Self {
+        let mut values = CompoundMap::with_capacity_and_hasher(
+            self.0.len(),
+            BuildHasherDefault::<DefaultHasher>::default(),
+        );
+        values.extend(
+            self.0
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        Self(values)
+    }
+}
+
+impl PartialEq for CompoundTag {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other) || self.0 == other.0
+    }
+}
+
+impl Eq for CompoundTag {}
 
 #[derive(Clone, Debug)]
 pub(crate) enum Tag {
@@ -649,22 +730,14 @@ impl Tag {
     }
 
     pub(crate) fn is_too_deep(&self, depth: usize) -> bool {
-        let mut stack = vec![(self, depth)];
-        while let Some((tag, depth)) = stack.pop() {
-            if depth >= MAX_DEPTH {
-                return true;
-            }
-            match tag {
-                Self::Compound(compound) => {
-                    stack.extend(compound.values().map(|child| (child, depth + 1)));
-                }
-                Self::List(list) => {
-                    stack.extend(list.iter().map(|child| (child, depth + 1)));
-                }
-                _ => {}
-            }
+        if depth >= MAX_DEPTH {
+            return true;
         }
-        false
+        match self {
+            Self::Compound(compound) => compound.is_too_deep(depth),
+            Self::List(list) => list.iter().any(|child| child.is_too_deep(depth + 1)),
+            _ => false,
+        }
     }
 
     pub(crate) fn macro_stringify(&self) -> JavaString {
@@ -706,12 +779,18 @@ impl Tag {
         compact_stringify(self)
     }
 
-    fn collection_element(&self, index: usize) -> Option<Tag> {
+    fn collection_element_equals(&self, index: usize, value: &Tag) -> Option<bool> {
         match self {
-            Self::ByteArray(values) => values.get(index).copied().map(Self::Byte),
-            Self::List(values) => values.get(index).cloned(),
-            Self::IntArray(values) => values.get(index).copied().map(Self::Int),
-            Self::LongArray(values) => values.get(index).copied().map(Self::Long),
+            Self::ByteArray(values) => values
+                .get(index)
+                .map(|current| value == &Self::Byte(*current)),
+            Self::List(values) => values.get(index).map(|current| current == value),
+            Self::IntArray(values) => values
+                .get(index)
+                .map(|current| value == &Self::Int(*current)),
+            Self::LongArray(values) => values
+                .get(index)
+                .map(|current| value == &Self::Long(*current)),
             _ => None,
         }
     }
@@ -738,14 +817,14 @@ impl Tag {
         }
     }
 
-    fn collection_set(&mut self, index: usize, value: Tag) -> bool {
+    fn collection_set(&mut self, index: usize, value: &Tag) -> bool {
         match self {
             Self::ByteArray(values) => value.byte_value().is_some_and(|value| {
                 values[index] = value;
                 true
             }),
             Self::List(values) => {
-                values[index] = value;
+                values[index] = value.clone();
                 true
             }
             Self::IntArray(values) => value.int_value().is_some_and(|value| {
@@ -760,7 +839,7 @@ impl Tag {
         }
     }
 
-    fn collection_insert(&mut self, index: i32, value: Tag) -> Result<bool, String> {
+    fn collection_insert(&mut self, index: i32, value: &Tag) -> Result<bool, String> {
         Ok(match self {
             Self::ByteArray(values) => {
                 let Some(value) = value.byte_value() else {
@@ -772,7 +851,7 @@ impl Tag {
             }
             Self::List(values) => {
                 let index = validated_insertion_index(index, values.len())?;
-                values.insert(index, value);
+                values.insert(index, value.clone());
                 true
             }
             Self::IntArray(values) => {
@@ -829,6 +908,9 @@ fn validated_insertion_index(index: i32, length: usize) -> Result<usize, String>
 
 impl PartialEq for Tag {
     fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
         match (self, other) {
             (Self::Byte(left), Self::Byte(right)) => left == right,
             (Self::Short(left), Self::Short(right)) => left == right,
@@ -857,6 +939,12 @@ fn compact_stringify(tag: &Tag) -> JavaString {
     let mut output = Vec::new();
     write_compact_tag(tag, &mut output);
     JavaString::from_units(output)
+}
+
+fn sorted_compound_entries(compound: &CompoundTag) -> Vec<(&JavaString, &Tag)> {
+    let mut entries = compound.0.iter().collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(name, _)| *name);
+    entries
 }
 
 fn write_pretty_tag(tag: &Tag, depth: usize, output: &mut Vec<u16>) {
@@ -904,24 +992,7 @@ fn write_pretty_tag(tag: &Tag, depth: usize, output: &mut Vec<u16>) {
             }
             output.push(u16::from(b']'));
         }
-        Tag::Compound(compound) if compound.is_empty() => push_ascii(output, "{}"),
-        Tag::Compound(_) if depth >= 64 => push_ascii(output, "{<...>}"),
-        Tag::Compound(compound) => {
-            output.push(u16::from(b'{'));
-            for (index, (name, value)) in compound.0.iter().enumerate() {
-                if index != 0 {
-                    push_ascii(output, ", ");
-                }
-                if is_pretty_unquoted_key(name) {
-                    output.extend_from_slice(name.units());
-                } else {
-                    write_quoted(name, output);
-                }
-                push_ascii(output, ": ");
-                write_pretty_tag(value, depth + 1, output);
-            }
-            output.push(u16::from(b'}'));
-        }
+        Tag::Compound(compound) => write_pretty_compound(compound, depth, output),
         Tag::IntArray(values) => write_pretty_array(
             b'I',
             values,
@@ -938,6 +1009,32 @@ fn write_pretty_tag(tag: &Tag, depth: usize, output: &mut Vec<u16>) {
             output,
         ),
     }
+}
+
+fn write_pretty_compound(compound: &CompoundTag, depth: usize, output: &mut Vec<u16>) {
+    if compound.is_empty() {
+        push_ascii(output, "{}");
+        return;
+    }
+    if depth >= 64 {
+        push_ascii(output, "{<...>}");
+        return;
+    }
+
+    output.push(u16::from(b'{'));
+    for (index, (name, value)) in compound.0.iter().enumerate() {
+        if index != 0 {
+            push_ascii(output, ", ");
+        }
+        if is_pretty_unquoted_key(name) {
+            output.extend_from_slice(name.units());
+        } else {
+            write_quoted(name, output);
+        }
+        push_ascii(output, ": ");
+        write_pretty_tag(value, depth + 1, output);
+    }
+    output.push(u16::from(b'}'));
 }
 
 fn is_pretty_unquoted_key(value: &JavaString) -> bool {
@@ -1016,7 +1113,8 @@ fn write_compact_tag(tag: &Tag, output: &mut Vec<u16>) {
         }
         Tag::Compound(compound) => {
             output.push(u16::from(b'{'));
-            for (index, (name, value)) in compound.0.iter().enumerate() {
+            for (index, (name, value)) in sorted_compound_entries(compound).into_iter().enumerate()
+            {
                 if index != 0 {
                     output.push(u16::from(b','));
                 }
@@ -1983,9 +2081,53 @@ fn parse_uuid(value: &JavaString) -> Result<Vec<i32>, String> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NbtPath {
-    nodes: Vec<PathNode>,
+    nodes: Arc<[PathNode]>,
     original: JavaString,
-    node_ends: Vec<usize>,
+    node_ends: Arc<[usize]>,
+}
+
+pub(crate) enum NbtSelection<'a> {
+    Root(&'a CompoundTag),
+    Tag(&'a Tag),
+    ArrayElement(Tag),
+}
+
+impl NbtSelection<'_> {
+    pub(crate) fn as_tag(&self) -> Option<&Tag> {
+        match self {
+            Self::Root(_) => None,
+            Self::Tag(tag) => Some(tag),
+            Self::ArrayElement(tag) => Some(tag),
+        }
+    }
+
+    pub(crate) fn is_compound(&self) -> bool {
+        matches!(self, Self::Root(_) | Self::Tag(Tag::Compound(_)))
+    }
+
+    pub(crate) fn is_too_deep(&self, depth: usize) -> bool {
+        match self {
+            Self::Root(root) => root.is_too_deep(depth),
+            Self::Tag(tag) => tag.is_too_deep(depth),
+            Self::ArrayElement(tag) => tag.is_too_deep(depth),
+        }
+    }
+
+    pub(crate) fn into_owned(self) -> Tag {
+        match self {
+            Self::Root(root) => Tag::Compound(root.clone()),
+            Self::Tag(tag) => tag.clone(),
+            Self::ArrayElement(tag) => tag,
+        }
+    }
+
+    pub(crate) fn pretty_stringify(&self) -> JavaString {
+        match self {
+            Self::Root(root) => root.pretty_stringify(),
+            Self::Tag(tag) => tag.pretty_stringify(),
+            Self::ArrayElement(tag) => tag.pretty_stringify(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2003,6 +2145,7 @@ impl NbtPath {
         let start = reader.cursor();
         let mut nodes = Vec::new();
         let mut node_ends = Vec::new();
+        let mut all_elements_end = None;
         let mut first = true;
         while reader.can_read() && reader.peek() != 0x20 {
             let node = match reader.peek() {
@@ -2042,11 +2185,7 @@ impl NbtPath {
             };
             let node_end = reader.cursor() - start;
             if matches!(node, PathNode::AllElements) {
-                for (previous, previous_end) in nodes.iter().zip(&mut node_ends) {
-                    if matches!(previous, PathNode::AllElements) {
-                        *previous_end = node_end;
-                    }
-                }
+                all_elements_end = Some(node_end);
             }
             nodes.push(node);
             node_ends.push(node_end);
@@ -2061,10 +2200,17 @@ impl NbtPath {
         if nodes.is_empty() {
             Err("expected an NBT path".to_owned())
         } else {
+            if let Some(all_elements_end) = all_elements_end {
+                for (node, node_end) in nodes.iter().zip(&mut node_ends) {
+                    if matches!(node, PathNode::AllElements) {
+                        *node_end = all_elements_end;
+                    }
+                }
+            }
             Ok(Self {
-                nodes,
+                nodes: nodes.into(),
                 original: JavaString::from_units(reader.substring_utf16(start, reader.cursor())),
-                node_ends,
+                node_ends: node_ends.into(),
             })
         }
     }
@@ -2072,9 +2218,9 @@ impl NbtPath {
     pub(crate) fn parse_codec(reader: &mut StringReader) -> Result<Self, String> {
         if !reader.can_read() || reader.peek() == 0x20 {
             Ok(Self {
-                nodes: Vec::new(),
+                nodes: Arc::from([]),
                 original: JavaString::default(),
-                node_ends: Vec::new(),
+                node_ends: Arc::from([]),
             })
         } else {
             Self::parse(reader)
@@ -2085,22 +2231,28 @@ impl NbtPath {
         &self.original
     }
 
-    pub(crate) fn get(&self, root: &CompoundTag) -> Result<Vec<Tag>, String> {
-        self.get_with_not_found(root)
-            .map_err(|_| "nothing found at NBT path".to_owned())
+    pub(crate) fn depth(&self) -> usize {
+        self.nodes.len()
     }
 
-    pub(crate) fn get_with_not_found(&self, root: &CompoundTag) -> Result<Vec<Tag>, JavaString> {
-        let mut current = vec![Tag::Compound(root.clone())];
+    pub(crate) fn select_with_not_found<'a>(
+        &self,
+        root: &'a CompoundTag,
+    ) -> Result<Vec<NbtSelection<'a>>, JavaString> {
+        self.select(root).map_err(|index| {
+            JavaString::from_units(self.original.units()[..self.node_ends[index]].to_vec())
+        })
+    }
+
+    pub(crate) fn select<'a>(&self, root: &'a CompoundTag) -> Result<Vec<NbtSelection<'a>>, usize> {
+        let mut current = vec![NbtSelection::Root(root)];
         for (index, node) in self.nodes.iter().enumerate() {
             let mut next = Vec::new();
             for tag in &current {
-                node.collect(tag, &mut next);
+                node.collect_selection(tag, &mut next);
             }
             if next.is_empty() {
-                return Err(JavaString::from_units(
-                    self.original.units()[..self.node_ends[index]].to_vec(),
-                ));
+                return Err(index);
             }
             current = next;
         }
@@ -2108,26 +2260,30 @@ impl NbtPath {
     }
 
     pub(crate) fn count_matching(&self, root: &CompoundTag) -> usize {
-        self.get(root).map_or(0, |tags| tags.len())
+        self.select(root).map_or(0, |tags| tags.len())
     }
 
-    pub(crate) fn set(&self, root: &mut CompoundTag, value: Tag) -> Result<i32, NbtEditError> {
+    pub(crate) fn set(&self, root: &mut CompoundTag, value: &Tag) -> Result<i32, NbtEditError> {
         if value.is_too_deep(self.nodes.len()) {
             return Err(NbtEditError::DataTooDeep);
         }
-        let (parents, last) = self.get_or_create_parents(root)?;
-        let mut changed = 0_i32;
         let mut root_tag = Tag::Compound(std::mem::take(root));
-        for location in parents {
-            if let Some(parent) = tag_at_mut(&mut root_tag, &location) {
-                changed = changed.wrapping_add(last.set(parent, value.clone()));
+        let result = (|| {
+            let last_index = self.nodes.len() - 1;
+            let parents =
+                self.resolve_for_edit(&mut root_tag, last_index, &Tag::List(Vec::new()))?;
+            let last = &self.nodes[last_index];
+            let mut changed = 0_i32;
+            for parent in parents {
+                changed = changed.wrapping_add(parent.apply(|parent| last.set(parent, value)));
             }
-        }
+            Ok(changed)
+        })();
         *root = match root_tag {
             Tag::Compound(root) => root,
             _ => unreachable!("an NBT path cannot replace its root compound"),
         };
-        Ok(changed)
+        result
     }
 
     pub(crate) fn insert(
@@ -2141,40 +2297,38 @@ impl NbtPath {
                 return Err(NbtEditError::DataTooDeep);
             }
         }
-        let (targets, _) = self.get_or_create_targets(root, Tag::List(Vec::new()))?;
         let mut modified = 0_i32;
         let mut root_tag = Tag::Compound(std::mem::take(root));
         let result = (|| {
-            for location in targets {
-                let Some(target) = tag_at_mut(&mut root_tag, &location) else {
-                    let Location::TypedArrayElement(value) = location else {
-                        unreachable!("resolved mutable NBT paths remain valid")
+            let targets =
+                self.resolve_for_edit(&mut root_tag, self.nodes.len(), &Tag::List(Vec::new()))?;
+            for target in targets {
+                target.apply(|target| {
+                    let Some(size) = target.collection_len() else {
+                        return Err(NbtEditError::ExpectedList(target.clone()));
                     };
-                    return Err(NbtEditError::ExpectedList(value));
-                };
-                let Some(size) = target.collection_len() else {
-                    return Err(NbtEditError::ExpectedList(target.clone()));
-                };
-                let size = i32::try_from(size)
-                    .map_err(|_| NbtEditError::Other("NBT list is too large".to_owned()))?;
-                let mut actual_index = if index < 0 {
-                    size.wrapping_add(index).wrapping_add(1)
-                } else {
-                    index
-                };
-                let mut changed = false;
-                for value in values {
-                    let inserted = target
-                        .collection_insert(actual_index, value.clone())
-                        .map_err(|_| NbtEditError::InvalidListIndex(actual_index))?;
-                    if inserted {
-                        actual_index = actual_index.wrapping_add(1);
-                        changed = true;
+                    let size = i32::try_from(size)
+                        .map_err(|_| NbtEditError::Other("NBT list is too large".to_owned()))?;
+                    let mut actual_index = if index < 0 {
+                        size.wrapping_add(index).wrapping_add(1)
+                    } else {
+                        index
+                    };
+                    let mut changed = false;
+                    for value in values {
+                        let inserted = target
+                            .collection_insert(actual_index, value)
+                            .map_err(|_| NbtEditError::InvalidListIndex(actual_index))?;
+                        if inserted {
+                            actual_index = actual_index.wrapping_add(1);
+                            changed = true;
+                        }
                     }
-                }
-                if changed {
-                    modified = modified.wrapping_add(1);
-                }
+                    if changed {
+                        modified = modified.wrapping_add(1);
+                    }
+                    Ok(())
+                })?;
             }
             Ok(modified)
         })();
@@ -2201,28 +2355,29 @@ impl NbtPath {
             combined.merge(source);
         }
 
-        let (targets, _) = self.get_or_create_targets(root, Tag::Compound(CompoundTag::new()))?;
         let mut root_tag = Tag::Compound(std::mem::take(root));
         let result = (|| {
+            let targets = self.resolve_for_edit(
+                &mut root_tag,
+                self.nodes.len(),
+                &Tag::Compound(CompoundTag::new()),
+            )?;
             let mut changed = 0_i32;
-            for location in targets {
-                let Some(target) = tag_at_mut(&mut root_tag, &location) else {
-                    let Location::TypedArrayElement(value) = location else {
-                        unreachable!("resolved mutable NBT paths remain valid")
+            for target in targets {
+                target.apply(|target| {
+                    if !matches!(target, Tag::Compound(_)) {
+                        return Err(NbtEditError::ExpectedObject(target.clone()));
                     };
-                    return Err(NbtEditError::ExpectedObject(value));
-                };
-                if !matches!(target, Tag::Compound(_)) {
-                    return Err(NbtEditError::ExpectedObject(target.clone()));
-                };
-                let Tag::Compound(target) = target else {
-                    unreachable!("the target tag type was checked")
-                };
-                let previous = target.clone();
-                target.merge(&combined);
-                if *target != previous {
-                    changed = changed.wrapping_add(1);
-                }
+                    let Tag::Compound(target) = target else {
+                        unreachable!("the target tag type was checked")
+                    };
+                    let previous = target.clone();
+                    target.merge(&combined);
+                    if *target != previous {
+                        changed = changed.wrapping_add(1);
+                    }
+                    Ok(())
+                })?;
             }
             Ok(changed)
         })();
@@ -2235,24 +2390,10 @@ impl NbtPath {
 
     pub(crate) fn remove(&self, root: &mut CompoundTag) -> i32 {
         let mut root_tag = Tag::Compound(std::mem::take(root));
-        let mut current = vec![Location::default()];
-        for node in &self.nodes[..self.nodes.len() - 1] {
-            let mut next = Vec::new();
-            for location in &current {
-                collect_locations(&root_tag, location, node, &mut next);
-            }
-            current = next;
-            if current.is_empty() {
-                break;
-            }
-        }
         let last = self.nodes.last().expect("NBT paths have at least one node");
         let mut removed = 0_i32;
-        for location in current {
-            let Some(parent) = tag_at_mut(&mut root_tag, &location) else {
-                continue;
-            };
-            removed = removed.wrapping_add(last.remove(parent));
+        for parent in self.resolve_mutable(&mut root_tag, self.nodes.len() - 1) {
+            removed = removed.wrapping_add(parent.apply(|parent| last.remove(parent)));
         }
         *root = match root_tag {
             Tag::Compound(root) => root,
@@ -2261,58 +2402,63 @@ impl NbtPath {
         removed
     }
 
-    fn get_or_create_parents(
+    fn resolve_for_edit<'a>(
         &self,
-        root: &mut CompoundTag,
-    ) -> Result<(Vec<Location>, &PathNode), NbtEditError> {
-        let last = self.nodes.last().expect("NBT paths have at least one node");
-        let mut root_tag = Tag::Compound(std::mem::take(root));
-        let result = (|| {
-            let mut current = vec![Location::default()];
-            for (index, node) in self.nodes[..self.nodes.len() - 1].iter().enumerate() {
-                let preferred = self.nodes[index + 1].preferred_parent();
-                let mut next = Vec::new();
-                for location in &current {
-                    collect_or_create_locations(
-                        &mut root_tag,
-                        location,
-                        node,
-                        &preferred,
-                        &mut next,
-                    );
+        root: &'a mut Tag,
+        end: usize,
+        final_preferred: &Tag,
+    ) -> Result<Vec<MutableSelection<'a>>, NbtEditError> {
+        let mut current = vec![MutableSelection::Tag(root)];
+        for index in 0..end {
+            let preferred = self
+                .nodes
+                .get(index + 1)
+                .map_or_else(|| final_preferred.clone(), PathNode::preferred_parent);
+            let mut next = Vec::new();
+            for selection in current {
+                if let MutableSelection::Tag(parent) = selection {
+                    self.nodes[index].collect_or_create_mut(parent, &preferred, &mut next);
                 }
-                if next.is_empty() {
-                    return Err(NbtEditError::NothingFound(JavaString::from_units(
-                        self.original.units()[..self.node_ends[index]].to_vec(),
-                    )));
-                }
-                current = next;
             }
-            Ok(current)
-        })();
-        *root = match root_tag {
-            Tag::Compound(root) => root,
-            _ => unreachable!("an NBT path cannot replace its root compound"),
-        };
-        result.map(|locations| (locations, last))
+            if next.is_empty() && index < self.nodes.len() - 1 {
+                return Err(NbtEditError::NothingFound(JavaString::from_units(
+                    self.original.units()[..self.node_ends[index]].to_vec(),
+                )));
+            }
+            current = next;
+        }
+        Ok(current)
     }
 
-    fn get_or_create_targets(
-        &self,
-        root: &mut CompoundTag,
-        default: Tag,
-    ) -> Result<(Vec<Location>, &PathNode), NbtEditError> {
-        let (parents, last) = self.get_or_create_parents(root)?;
-        let mut root_tag = Tag::Compound(std::mem::take(root));
-        let mut targets = Vec::new();
-        for parent in &parents {
-            collect_or_create_locations(&mut root_tag, parent, last, &default, &mut targets);
+    fn resolve_mutable<'a>(&self, root: &'a mut Tag, end: usize) -> Vec<MutableSelection<'a>> {
+        let mut current = vec![MutableSelection::Tag(root)];
+        for node in &self.nodes[..end] {
+            let mut next = Vec::new();
+            for selection in current {
+                if let MutableSelection::Tag(parent) = selection {
+                    node.collect_mut(parent, &mut next);
+                }
+            }
+            current = next;
+            if current.is_empty() {
+                break;
+            }
         }
-        *root = match root_tag {
-            Tag::Compound(root) => root,
-            _ => unreachable!("an NBT path cannot replace its root compound"),
-        };
-        Ok((targets, last))
+        current
+    }
+}
+
+enum MutableSelection<'a> {
+    Tag(&'a mut Tag),
+    ArrayElement(Tag),
+}
+
+impl MutableSelection<'_> {
+    fn apply<R>(self, operation: impl FnOnce(&mut Tag) -> R) -> R {
+        match self {
+            Self::Tag(tag) => operation(tag),
+            Self::ArrayElement(mut tag) => operation(&mut tag),
+        }
     }
 }
 
@@ -2340,23 +2486,213 @@ impl PathNode {
         }
     }
 
-    fn collect(&self, parent: &Tag, output: &mut Vec<Tag>) {
+    fn collect_or_create_mut<'a>(
+        &self,
+        parent: &'a mut Tag,
+        preferred: &Tag,
+        output: &mut Vec<MutableSelection<'a>>,
+    ) {
         match self {
             Self::AllElements => {
-                if let Some(length) = parent.collection_len() {
-                    output.extend((0..length).filter_map(|index| parent.collection_element(index)));
+                if let Tag::List(values) = parent
+                    && values.is_empty()
+                {
+                    values.push(preferred.clone());
                 }
             }
             Self::CompoundChild(name) => {
-                if let Some(tag) = parent.as_compound().and_then(|parent| parent.get(name)) {
-                    output.push(tag.clone());
+                if let Some(parent) = parent.as_compound_mut()
+                    && !parent.contains_key(name)
+                {
+                    parent.insert(name.clone(), preferred.clone());
+                }
+            }
+            Self::MatchElement(pattern) => {
+                if let Tag::List(values) = parent
+                    && !values
+                        .iter()
+                        .any(|value| partial_matches_compound(pattern, value))
+                {
+                    values.push(Tag::Compound(pattern.clone()));
+                }
+            }
+            Self::MatchObject(name, pattern) => {
+                if let Some(parent) = parent.as_compound_mut()
+                    && !parent.contains_key(name)
+                {
+                    parent.insert(name.clone(), Tag::Compound(pattern.clone()));
+                }
+            }
+            Self::Indexed(_) | Self::MatchRoot(_) => {}
+        }
+        self.collect_mut(parent, output);
+    }
+
+    fn collect_mut<'a>(&self, parent: &'a mut Tag, output: &mut Vec<MutableSelection<'a>>) {
+        match self {
+            Self::AllElements => match parent {
+                Tag::ByteArray(values) => output.extend(
+                    values
+                        .iter()
+                        .copied()
+                        .map(Tag::Byte)
+                        .map(MutableSelection::ArrayElement),
+                ),
+                Tag::List(values) => {
+                    output.extend(values.iter_mut().map(MutableSelection::Tag));
+                }
+                Tag::IntArray(values) => output.extend(
+                    values
+                        .iter()
+                        .copied()
+                        .map(Tag::Int)
+                        .map(MutableSelection::ArrayElement),
+                ),
+                Tag::LongArray(values) => output.extend(
+                    values
+                        .iter()
+                        .copied()
+                        .map(Tag::Long)
+                        .map(MutableSelection::ArrayElement),
+                ),
+                _ => {}
+            },
+            Self::CompoundChild(name) => {
+                if let Some(value) = parent
+                    .as_compound_mut()
+                    .and_then(|parent| parent.get_mut(name))
+                {
+                    output.push(MutableSelection::Tag(value));
                 }
             }
             Self::Indexed(index) => {
-                if let Some(index) = actual_index(*index, parent.collection_len())
-                    && let Some(tag) = parent.collection_element(index)
+                if let Some(index) = actual_index(*index, parent.collection_len()) {
+                    match parent {
+                        Tag::ByteArray(values) => {
+                            output.push(MutableSelection::ArrayElement(Tag::Byte(values[index])))
+                        }
+                        Tag::List(values) => {
+                            output.push(MutableSelection::Tag(&mut values[index]));
+                        }
+                        Tag::IntArray(values) => {
+                            output.push(MutableSelection::ArrayElement(Tag::Int(values[index])))
+                        }
+                        Tag::LongArray(values) => {
+                            output.push(MutableSelection::ArrayElement(Tag::Long(values[index])))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Self::MatchElement(pattern) => {
+                if let Tag::List(values) = parent {
+                    output.extend(
+                        values
+                            .iter_mut()
+                            .filter(|value| partial_matches_compound(pattern, value))
+                            .map(MutableSelection::Tag),
+                    );
+                }
+            }
+            Self::MatchObject(name, pattern) => {
+                if let Some(value) = parent
+                    .as_compound_mut()
+                    .and_then(|parent| parent.get_mut(name))
+                    && partial_matches_compound(pattern, value)
                 {
-                    output.push(tag);
+                    output.push(MutableSelection::Tag(value));
+                }
+            }
+            Self::MatchRoot(pattern) => {
+                if partial_matches_compound(pattern, parent) {
+                    output.push(MutableSelection::Tag(parent));
+                }
+            }
+        }
+    }
+
+    fn collect_selection<'a>(&self, parent: &NbtSelection<'a>, output: &mut Vec<NbtSelection<'a>>) {
+        match parent {
+            NbtSelection::Root(parent) => self.collect_root_selection(parent, output),
+            NbtSelection::Tag(parent) => self.collect_tag_selection(parent, output),
+            NbtSelection::ArrayElement(_) => {}
+        }
+    }
+
+    fn collect_root_selection<'a>(
+        &self,
+        parent: &'a CompoundTag,
+        output: &mut Vec<NbtSelection<'a>>,
+    ) {
+        match self {
+            Self::CompoundChild(name) => {
+                if let Some(tag) = parent.get(name) {
+                    output.push(NbtSelection::Tag(tag));
+                }
+            }
+            Self::MatchObject(name, pattern) => {
+                if let Some(value) = parent.get(name)
+                    && partial_matches_compound(pattern, value)
+                {
+                    output.push(NbtSelection::Tag(value));
+                }
+            }
+            Self::MatchRoot(pattern) if compound_partial_matches(pattern, parent) => {
+                output.push(NbtSelection::Root(parent));
+            }
+            Self::AllElements | Self::Indexed(_) | Self::MatchElement(_) | Self::MatchRoot(_) => {}
+        }
+    }
+
+    fn collect_tag_selection<'a>(&self, parent: &'a Tag, output: &mut Vec<NbtSelection<'a>>) {
+        match self {
+            Self::AllElements => match parent {
+                Tag::ByteArray(values) => output.extend(
+                    values
+                        .iter()
+                        .copied()
+                        .map(Tag::Byte)
+                        .map(NbtSelection::ArrayElement),
+                ),
+                Tag::List(values) => {
+                    output.extend(values.iter().map(NbtSelection::Tag));
+                }
+                Tag::IntArray(values) => output.extend(
+                    values
+                        .iter()
+                        .copied()
+                        .map(Tag::Int)
+                        .map(NbtSelection::ArrayElement),
+                ),
+                Tag::LongArray(values) => output.extend(
+                    values
+                        .iter()
+                        .copied()
+                        .map(Tag::Long)
+                        .map(NbtSelection::ArrayElement),
+                ),
+                _ => {}
+            },
+            Self::CompoundChild(name) => {
+                if let Some(tag) = parent.as_compound().and_then(|parent| parent.get(name)) {
+                    output.push(NbtSelection::Tag(tag));
+                }
+            }
+            Self::Indexed(index) => {
+                if let Some(index) = actual_index(*index, parent.collection_len()) {
+                    match parent {
+                        Tag::ByteArray(values) => {
+                            output.push(NbtSelection::ArrayElement(Tag::Byte(values[index])))
+                        }
+                        Tag::List(values) => output.push(NbtSelection::Tag(&values[index])),
+                        Tag::IntArray(values) => {
+                            output.push(NbtSelection::ArrayElement(Tag::Int(values[index])))
+                        }
+                        Tag::LongArray(values) => {
+                            output.push(NbtSelection::ArrayElement(Tag::Long(values[index])))
+                        }
+                        _ => {}
+                    }
                 }
             }
             Self::MatchElement(pattern) => {
@@ -2364,29 +2700,27 @@ impl PathNode {
                     output.extend(
                         values
                             .iter()
-                            .filter(|value| partial_matches(&Tag::Compound(pattern.clone()), value))
-                            .cloned(),
+                            .filter(|value| partial_matches_compound(pattern, value))
+                            .map(NbtSelection::Tag),
                     );
                 }
             }
             Self::MatchObject(name, pattern) => {
                 if let Some(value) = parent.as_compound().and_then(|parent| parent.get(name))
-                    && partial_matches(&Tag::Compound(pattern.clone()), value)
+                    && partial_matches_compound(pattern, value)
                 {
-                    output.push(value.clone());
+                    output.push(NbtSelection::Tag(value));
                 }
             }
             Self::MatchRoot(pattern) => {
-                if matches!(parent, Tag::Compound(_))
-                    && partial_matches(&Tag::Compound(pattern.clone()), parent)
-                {
-                    output.push(parent.clone());
+                if matches!(parent, Tag::Compound(_)) && partial_matches_compound(pattern, parent) {
+                    output.push(NbtSelection::Tag(parent));
                 }
             }
         }
     }
 
-    fn set(&self, parent: &mut Tag, value: Tag) -> i32 {
+    fn set(&self, parent: &mut Tag, value: &Tag) -> i32 {
         match self {
             Self::AllElements => {
                 let Some(size) = parent.collection_len() else {
@@ -2397,32 +2731,39 @@ impl PathNode {
                     return 1;
                 }
                 let changed = (0..size)
-                    .filter(|&index| parent.collection_element(index).as_ref() != Some(&value))
+                    .filter(|&index| {
+                        parent
+                            .collection_element_equals(index, value)
+                            .is_some_and(|equal| !equal)
+                    })
                     .count();
                 if changed == 0 {
                     return 0;
                 }
                 parent.collection_clear();
-                if !parent.collection_insert(0, value.clone()).unwrap_or(false) {
+                if !parent.collection_insert(0, value).unwrap_or(false) {
                     return 0;
                 }
                 let size = i32::try_from(size)
                     .expect("an NBT collection cannot exceed the Java int range");
                 for index in 1..size {
-                    let _ = parent.collection_insert(index, value.clone());
+                    let _ = parent.collection_insert(index, value);
                 }
                 i32::try_from(changed).unwrap_or(i32::MAX)
             }
             Self::CompoundChild(name) => parent.as_compound_mut().map_or(0, |parent| {
-                let changed = parent.get(name) != Some(&value);
-                parent.insert(name.clone(), value);
-                i32::from(changed)
+                if parent.get(name) == Some(value) {
+                    0
+                } else {
+                    parent.insert(name.clone(), value.clone());
+                    1
+                }
             }),
             Self::Indexed(index) => {
                 let Some(index) = actual_index(*index, parent.collection_len()) else {
                     return 0;
                 };
-                if parent.collection_element(index).as_ref() == Some(&value) {
+                if parent.collection_element_equals(index, value) == Some(true) {
                     0
                 } else {
                     i32::from(parent.collection_set(index, value))
@@ -2433,14 +2774,12 @@ impl PathNode {
                     return 0;
                 };
                 if values.is_empty() {
-                    values.push(value);
+                    values.push(value.clone());
                     return 1;
                 }
                 let mut changed = 0_i32;
                 for current in values {
-                    if partial_matches(&Tag::Compound(pattern.clone()), current)
-                        && *current != value
-                    {
+                    if partial_matches_compound(pattern, current) && current != value {
                         *current = value.clone();
                         changed = changed.wrapping_add(1);
                     }
@@ -2448,12 +2787,10 @@ impl PathNode {
                 changed
             }
             Self::MatchObject(name, pattern) => parent.as_compound_mut().map_or(0, |parent| {
-                let pattern = Tag::Compound(pattern.clone());
-                if parent
-                    .get(name)
-                    .is_some_and(|current| partial_matches(&pattern, current) && *current != value)
-                {
-                    parent.insert(name.clone(), value);
+                if parent.get(name).is_some_and(|current| {
+                    partial_matches_compound(pattern, current) && current != value
+                }) {
+                    parent.insert(name.clone(), value.clone());
                     1
                 } else {
                     0
@@ -2488,16 +2825,14 @@ impl PathNode {
                     return 0;
                 };
                 let old = values.len();
-                let pattern = Tag::Compound(pattern.clone());
-                values.retain(|value| !partial_matches(&pattern, value));
+                values.retain(|value| !partial_matches_compound(pattern, value));
                 i32::try_from(old - values.len()).unwrap_or(i32::MAX)
             }
             Self::MatchObject(name, pattern) => {
                 i32::from(parent.as_compound_mut().is_some_and(|parent| {
-                    let pattern = Tag::Compound(pattern.clone());
                     if parent
                         .get(name)
-                        .is_some_and(|current| partial_matches(&pattern, current))
+                        .is_some_and(|current| partial_matches_compound(pattern, current))
                     {
                         parent.remove(name);
                         true
@@ -2576,12 +2911,7 @@ fn expect_path_character(reader: &mut StringReader, expected: u16) -> Result<(),
 fn partial_matches(expected: &Tag, actual: &Tag) -> bool {
     match (expected, actual) {
         (Tag::Compound(expected), Tag::Compound(actual)) => {
-            actual.len() >= expected.len()
-                && expected.0.iter().all(|(name, expected)| {
-                    actual
-                        .get(name)
-                        .is_some_and(|actual| partial_matches(expected, actual))
-                })
+            compound_partial_matches(expected, actual)
         }
         (Tag::List(expected), Tag::List(actual)) => {
             if expected.is_empty() {
@@ -2599,227 +2929,20 @@ fn partial_matches(expected: &Tag, actual: &Tag) -> bool {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum Location {
-    Path(Vec<LocationStep>),
-    TypedArrayElement(Tag),
-}
-
-impl Default for Location {
-    fn default() -> Self {
-        Self::Path(Vec::new())
-    }
-}
-
-impl Location {
-    fn child(&self, step: LocationStep) -> Self {
-        let Self::Path(steps) = self else {
-            unreachable!("typed-array elements cannot have addressable child tags")
-        };
-        let mut result = steps.clone();
-        result.push(step);
-        Self::Path(result)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LocationStep {
-    Key(JavaString),
-    Index(usize),
-}
-
-fn tag_at<'a>(root: &'a Tag, location: &'a Location) -> Option<&'a Tag> {
-    let steps = match location {
-        Location::Path(steps) => steps,
-        Location::TypedArrayElement(tag) => return Some(tag),
+fn partial_matches_compound(expected: &CompoundTag, actual: &Tag) -> bool {
+    let Tag::Compound(actual) = actual else {
+        return false;
     };
-    let mut current = root;
-    for step in steps {
-        current = match step {
-            LocationStep::Key(key) => current.as_compound()?.get(key)?,
-            LocationStep::Index(index) => match current {
-                Tag::List(values) => values.get(*index)?,
-                _ => return None,
-            },
-        };
-    }
-    Some(current)
+    compound_partial_matches(expected, actual)
 }
 
-fn tag_at_mut<'a>(root: &'a mut Tag, location: &Location) -> Option<&'a mut Tag> {
-    let Location::Path(steps) = location else {
-        return None;
-    };
-    let mut current = root;
-    for step in steps {
-        current = match step {
-            LocationStep::Key(key) => current.as_compound_mut()?.get_mut(key)?,
-            LocationStep::Index(index) => match current {
-                Tag::List(values) => values.get_mut(*index)?,
-                _ => return None,
-            },
-        };
-    }
-    Some(current)
-}
-
-fn collect_locations(
-    root: &Tag,
-    parent_location: &Location,
-    node: &PathNode,
-    output: &mut Vec<Location>,
-) {
-    let Some(parent) = tag_at(root, parent_location) else {
-        return;
-    };
-    match node {
-        PathNode::AllElements => {
-            if let Some(length) = parent.collection_len() {
-                if matches!(parent, Tag::List(_)) {
-                    output.extend(
-                        (0..length).map(|index| parent_location.child(LocationStep::Index(index))),
-                    );
-                } else {
-                    output.extend(
-                        (0..length)
-                            .filter_map(|index| parent.collection_element(index))
-                            .map(Location::TypedArrayElement),
-                    );
-                }
-            }
-        }
-        PathNode::CompoundChild(name) => {
-            if parent
-                .as_compound()
-                .is_some_and(|parent| parent.contains_key(name))
-            {
-                output.push(parent_location.child(LocationStep::Key(name.clone())));
-            }
-        }
-        PathNode::Indexed(index) => {
-            if let Some(index) = actual_index(*index, parent.collection_len()) {
-                if matches!(parent, Tag::List(_)) {
-                    output.push(parent_location.child(LocationStep::Index(index)));
-                } else if let Some(value) = parent.collection_element(index) {
-                    output.push(Location::TypedArrayElement(value));
-                }
-            }
-        }
-        PathNode::MatchElement(pattern) => {
-            if let Tag::List(values) = parent {
-                let pattern = Tag::Compound(pattern.clone());
-                output.extend(
-                    values
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, value)| partial_matches(&pattern, value))
-                        .map(|(index, _)| parent_location.child(LocationStep::Index(index))),
-                );
-            }
-        }
-        PathNode::MatchObject(name, pattern) => {
-            if parent
-                .as_compound()
-                .and_then(|parent| parent.get(name))
-                .is_some_and(|value| partial_matches(&Tag::Compound(pattern.clone()), value))
-            {
-                output.push(parent_location.child(LocationStep::Key(name.clone())));
-            }
-        }
-        PathNode::MatchRoot(pattern) => {
-            if partial_matches(&Tag::Compound(pattern.clone()), parent) {
-                output.push(parent_location.clone());
-            }
-        }
-    }
-}
-
-fn collect_or_create_locations(
-    root: &mut Tag,
-    parent_location: &Location,
-    node: &PathNode,
-    preferred: &Tag,
-    output: &mut Vec<Location>,
-) {
-    let Some(parent) = tag_at_mut(root, parent_location) else {
-        return;
-    };
-    match node {
-        PathNode::AllElements => {
-            if let Tag::List(values) = parent {
-                if values.is_empty() {
-                    values.push(preferred.clone());
-                }
-                output.extend(
-                    (0..values.len())
-                        .map(|index| parent_location.child(LocationStep::Index(index))),
-                );
-            } else if let Some(length) = parent.collection_len() {
-                output.extend(
-                    (0..length)
-                        .filter_map(|index| parent.collection_element(index))
-                        .map(Location::TypedArrayElement),
-                );
-            }
-        }
-        PathNode::CompoundChild(name) => {
-            if let Some(parent) = parent.as_compound_mut() {
-                if !parent.contains_key(name) {
-                    parent.insert(name.clone(), preferred.clone());
-                }
-                output.push(parent_location.child(LocationStep::Key(name.clone())));
-            }
-        }
-        PathNode::Indexed(index) => {
-            if let Some(index) = actual_index(*index, parent.collection_len()) {
-                if matches!(parent, Tag::List(_)) {
-                    output.push(parent_location.child(LocationStep::Index(index)));
-                } else if let Some(value) = parent.collection_element(index) {
-                    output.push(Location::TypedArrayElement(value));
-                }
-            }
-        }
-        PathNode::MatchElement(pattern) => {
-            if let Tag::List(values) = parent {
-                let pattern_tag = Tag::Compound(pattern.clone());
-                let matches = values
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, value)| {
-                        partial_matches(&pattern_tag, value).then_some(index)
-                    })
-                    .collect::<Vec<_>>();
-                if matches.is_empty() {
-                    values.push(pattern_tag);
-                    output.push(parent_location.child(LocationStep::Index(values.len() - 1)));
-                } else {
-                    output.extend(
-                        matches
-                            .into_iter()
-                            .map(|index| parent_location.child(LocationStep::Index(index))),
-                    );
-                }
-            }
-        }
-        PathNode::MatchObject(name, pattern) => {
-            if let Some(parent) = parent.as_compound_mut() {
-                if !parent.contains_key(name) {
-                    parent.insert(name.clone(), Tag::Compound(pattern.clone()));
-                    output.push(parent_location.child(LocationStep::Key(name.clone())));
-                } else if parent
-                    .get(name)
-                    .is_some_and(|value| partial_matches(&Tag::Compound(pattern.clone()), value))
-                {
-                    output.push(parent_location.child(LocationStep::Key(name.clone())));
-                }
-            }
-        }
-        PathNode::MatchRoot(pattern) => {
-            if partial_matches(&Tag::Compound(pattern.clone()), parent) {
-                output.push(parent_location.clone());
-            }
-        }
-    }
+fn compound_partial_matches(expected: &CompoundTag, actual: &CompoundTag) -> bool {
+    actual.len() >= expected.len()
+        && expected.0.iter().all(|(name, expected)| {
+            actual
+                .get(name)
+                .is_some_and(|actual| partial_matches(expected, actual))
+        })
 }
 
 fn actual_index(index: i32, length: Option<usize>) -> Option<usize> {
@@ -2834,23 +2957,39 @@ fn actual_index(index: i32, length: Option<usize>) -> Option<usize> {
 
 #[derive(Debug, Default)]
 pub(crate) struct CommandStorage {
-    values: HashMap<Identifier, CompoundTag>,
+    values: StorageNamespaces,
 }
+
+type StorageNamespaces = HashMap<IdentifierPart, StorageValues, BuildHasherDefault<DefaultHasher>>;
+type StorageValues = HashMap<IdentifierPart, CompoundTag, BuildHasherDefault<DefaultHasher>>;
 
 impl CommandStorage {
     pub(crate) fn get_ref(&self, id: &Identifier) -> Option<&CompoundTag> {
-        self.values.get(id)
+        self.values
+            .get(id.namespace_key())
+            .and_then(|namespace| namespace.get(id.path_key()))
     }
 
-    pub(crate) fn get(&self, id: &Identifier) -> CompoundTag {
-        self.values.get(id).cloned().unwrap_or_default()
+    pub(crate) fn get(&self, id: &Identifier) -> Cow<'_, CompoundTag> {
+        self.get_ref(id)
+            .map_or_else(|| Cow::Owned(CompoundTag::new()), Cow::Borrowed)
     }
 
     pub(crate) fn set(&mut self, id: Identifier, value: CompoundTag) {
+        let (namespace, path) = id.into_parts();
         if value.is_empty() {
-            self.values.remove(&id);
+            let remove_namespace = self.values.get_mut(&namespace).is_some_and(|values| {
+                values.remove(&path);
+                values.is_empty()
+            });
+            if remove_namespace {
+                self.values.remove(&namespace);
+            }
         } else {
-            self.values.insert(id, value);
+            self.values
+                .entry(namespace)
+                .or_default()
+                .insert(path, value);
         }
     }
 
@@ -2859,9 +2998,31 @@ impl CommandStorage {
         namespace: &str,
         values: impl IntoIterator<Item = (Identifier, CompoundTag)>,
     ) {
-        self.values.retain(|id, _| id.namespace() != namespace);
+        let expected_namespace = IdentifierPart::new(namespace);
+        let mut storage_namespace = None;
+        let mut replacement = StorageValues::default();
         for (id, value) in values {
-            self.set(id, value);
+            let (id_namespace, path) = id.into_parts();
+            let namespace = storage_namespace.get_or_insert_with(|| {
+                assert_eq!(
+                    id_namespace, expected_namespace,
+                    "storage namespace replacement mismatch"
+                );
+                id_namespace.clone()
+            });
+            assert_eq!(
+                id_namespace, *namespace,
+                "storage namespace replacement mismatch"
+            );
+            if !value.is_empty() {
+                replacement.insert(path, value);
+            }
+        }
+        let namespace = storage_namespace.unwrap_or(expected_namespace);
+        if replacement.is_empty() {
+            self.values.remove(&namespace);
+        } else {
+            self.values.insert(namespace, replacement);
         }
     }
 
@@ -2870,22 +3031,39 @@ impl CommandStorage {
         id: &Identifier,
         operation: impl FnOnce(&mut CompoundTag) -> Result<R, E>,
     ) -> Result<R, E> {
-        match self.values.entry(id.clone()) {
-            Entry::Occupied(mut entry) => {
-                let result = operation(entry.get_mut());
-                if result.is_ok() && entry.get().is_empty() {
-                    entry.remove();
+        if let Some(values) = self.values.get_mut(id.namespace_key()) {
+            if values.contains_key(id.path_key()) {
+                let result = operation(
+                    values
+                        .get_mut(id.path_key())
+                        .expect("the storage path was found immediately before editing"),
+                );
+                if result.is_ok() && values.get(id.path_key()).is_some_and(CompoundTag::is_empty) {
+                    values.remove(id.path_key());
+                }
+                let remove_namespace = result.is_ok() && values.is_empty();
+                if remove_namespace {
+                    self.values.remove(id.namespace_key());
                 }
                 result
-            }
-            Entry::Vacant(entry) => {
+            } else {
                 let mut value = CompoundTag::new();
                 let result = operation(&mut value);
                 if result.is_ok() && !value.is_empty() {
-                    entry.insert(value);
+                    values.insert(id.path_key().clone(), value);
                 }
                 result
             }
+        } else {
+            let mut value = CompoundTag::new();
+            let result = operation(&mut value);
+            if result.is_ok() && !value.is_empty() {
+                self.values
+                    .entry(id.namespace_key().clone())
+                    .or_default()
+                    .insert(id.path_key().clone(), value);
+            }
+            result
         }
     }
 }

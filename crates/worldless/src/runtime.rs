@@ -1,12 +1,12 @@
-use std::{cell::Cell, collections::VecDeque, error::Error, fmt, rc::Rc, sync::Arc};
+use std::{borrow::Cow, cell::Cell, collections::VecDeque, error::Error, fmt, rc::Rc, sync::Arc};
 
 use worldless_brigadier::exceptions::{java_f32, java_f64};
 
 use crate::{
     execution_context::ExecutionContext,
     loader::CommandCompiler,
-    macro_function::{Function, FunctionInstantiationError, MacroCacheState},
-    nbt::{CommandStorage, CompoundTag, JavaString, NbtEditError, Tag},
+    macro_function::{Function, FunctionInstantiationError, Instructions, MacroCacheState},
+    nbt::{CommandStorage, CompoundTag, JavaString, NbtEditError, NbtSelection, Tag},
     program::{
         Command, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation, DataSource,
         FunctionArguments, Instruction, Modifier, ObjectiveId, PredicateCondition, Program,
@@ -232,7 +232,6 @@ impl OrdinaryExecution {
     }
 }
 
-#[derive(Clone)]
 enum StoreAction {
     Score {
         kind: StoreKind,
@@ -248,14 +247,12 @@ enum StoreAction {
     },
 }
 
-#[derive(Clone)]
 enum ConsumerEnd {
     TopLevel,
     FunctionCondition(Rc<Cell<Option<i32>>>),
     FunctionTag(Rc<Cell<Option<i32>>>),
 }
 
-#[derive(Clone)]
 enum ConsumerAction {
     Store(StoreAction),
     End(ConsumerEnd),
@@ -263,7 +260,15 @@ enum ConsumerAction {
 
 #[derive(Clone, Default)]
 struct ResultConsumer {
-    actions: Vec<ConsumerAction>,
+    node: Option<Rc<ResultConsumerNode>>,
+}
+
+enum ResultConsumerNode {
+    Actions(Box<[ConsumerAction]>),
+    Chain {
+        first: ResultConsumer,
+        second: ResultConsumer,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -306,40 +311,52 @@ impl ResultConsumer {
     }
 
     fn top_level() -> Self {
-        Self {
-            actions: vec![ConsumerAction::End(ConsumerEnd::TopLevel)],
-        }
+        Self::from_actions(vec![ConsumerAction::End(ConsumerEnd::TopLevel)])
     }
 
     fn function_condition(result: Rc<Cell<Option<i32>>>) -> Self {
-        Self {
-            actions: vec![ConsumerAction::End(ConsumerEnd::FunctionCondition(result))],
-        }
+        Self::from_actions(vec![ConsumerAction::End(ConsumerEnd::FunctionCondition(
+            result,
+        ))])
     }
 
     fn function_tag(result: Rc<Cell<Option<i32>>>) -> Self {
+        Self::from_actions(vec![ConsumerAction::End(ConsumerEnd::FunctionTag(result))])
+    }
+
+    fn from_actions(actions: Vec<ConsumerAction>) -> Self {
+        if actions.is_empty() {
+            return Self::empty();
+        }
         Self {
-            actions: vec![ConsumerAction::End(ConsumerEnd::FunctionTag(result))],
+            node: Some(Rc::new(ResultConsumerNode::Actions(
+                actions.into_boxed_slice(),
+            ))),
         }
     }
 
-    fn with_prefix(&self, mut prefix: Vec<StoreAction>) -> Self {
-        let mut actions = prefix
-            .drain(..)
-            .map(ConsumerAction::Store)
-            .collect::<Vec<_>>();
-        actions.extend(self.actions.iter().cloned());
-        Self { actions }
+    fn with_prefix(&self, prefix: Vec<StoreAction>) -> Self {
+        let prefix = Self::from_actions(prefix.into_iter().map(ConsumerAction::Store).collect());
+        prefix.chain(self)
     }
 
     fn chain(&self, other: &Self) -> Self {
-        let mut actions = self.actions.clone();
-        actions.extend(other.actions.iter().cloned());
-        Self { actions }
+        if self.is_empty() {
+            return other.clone();
+        }
+        if other.is_empty() {
+            return self.clone();
+        }
+        Self {
+            node: Some(Rc::new(ResultConsumerNode::Chain {
+                first: self.clone(),
+                second: other.clone(),
+            })),
+        }
     }
 
     fn is_empty(&self) -> bool {
-        self.actions.is_empty()
+        self.node.is_none()
     }
 
     fn accept(
@@ -349,44 +366,68 @@ impl ResultConsumer {
         command_storage: &mut CommandStorage,
         top_level_result: &mut Option<ExecutionOutcome>,
     ) {
-        for action in &self.actions {
-            match action {
-                ConsumerAction::Store(StoreAction::Score {
-                    kind,
-                    holders,
-                    objective,
-                }) => {
-                    let value = stored_command_value(*kind, result);
-                    for holder in holders {
-                        scoreboard.set_score_by_id(holder, *objective, value);
-                    }
-                }
-                ConsumerAction::Store(StoreAction::Storage {
-                    kind,
-                    storage,
-                    path,
-                    number_type,
-                    scale,
-                }) => {
-                    let value = storage_number(
-                        *number_type,
-                        f64::from(stored_command_value(*kind, result)) * scale,
+        let Some(root) = self.node.as_deref() else {
+            return;
+        };
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            let actions = match node {
+                ResultConsumerNode::Actions(actions) => actions.as_ref(),
+                ResultConsumerNode::Chain { first, second } => {
+                    pending.push(
+                        second
+                            .node
+                            .as_deref()
+                            .expect("a chained result consumer is non-empty"),
                     );
-                    let _ = command_storage.edit(storage, |data| path.set(data, value));
+                    pending.push(
+                        first
+                            .node
+                            .as_deref()
+                            .expect("a chained result consumer is non-empty"),
+                    );
+                    continue;
                 }
-                ConsumerAction::End(ConsumerEnd::TopLevel) => {
-                    *top_level_result = Some(ExecutionOutcome::Result {
-                        success: result.success,
-                        value: result.value,
-                    });
-                }
-                ConsumerAction::End(ConsumerEnd::FunctionCondition(condition_result)) => {
-                    condition_result.set(Some(result.value));
-                }
-                ConsumerAction::End(ConsumerEnd::FunctionTag(tag_result)) => {
-                    tag_result.set(Some(
-                        tag_result.get().unwrap_or(0).wrapping_add(result.value),
-                    ));
+            };
+            for action in actions {
+                match action {
+                    ConsumerAction::Store(StoreAction::Score {
+                        kind,
+                        holders,
+                        objective,
+                    }) => {
+                        let value = stored_command_value(*kind, result);
+                        for holder in holders {
+                            scoreboard.set_score_by_id(holder, *objective, value);
+                        }
+                    }
+                    ConsumerAction::Store(StoreAction::Storage {
+                        kind,
+                        storage,
+                        path,
+                        number_type,
+                        scale,
+                    }) => {
+                        let value = storage_number(
+                            *number_type,
+                            f64::from(stored_command_value(*kind, result)) * scale,
+                        );
+                        let _ = command_storage.edit(storage, |data| path.set(data, &value));
+                    }
+                    ConsumerAction::End(ConsumerEnd::TopLevel) => {
+                        *top_level_result = Some(ExecutionOutcome::Result {
+                            success: result.success,
+                            value: result.value,
+                        });
+                    }
+                    ConsumerAction::End(ConsumerEnd::FunctionCondition(condition_result)) => {
+                        condition_result.set(Some(result.value));
+                    }
+                    ConsumerAction::End(ConsumerEnd::FunctionTag(tag_result)) => {
+                        tag_result.set(Some(
+                            tag_result.get().unwrap_or(0).wrapping_add(result.value),
+                        ));
+                    }
                 }
             }
         }
@@ -394,7 +435,7 @@ impl ResultConsumer {
 }
 
 struct Frame {
-    function: Arc<[Instruction]>,
+    function: Instructions,
     context: ExecutionContext,
     next_instruction: usize,
     depth: usize,
@@ -408,7 +449,7 @@ struct Frame {
 #[derive(Clone)]
 struct InstantiatedFunction {
     id: Identifier,
-    instructions: Arc<[Instruction]>,
+    instructions: Instructions,
 }
 
 enum QueueEntry {
@@ -588,7 +629,7 @@ fn execute_instruction(
     command_limit: usize,
     feedback: impl FnMut(CommandFeedback),
 ) -> ExecutionReport {
-    let function = Arc::<[Instruction]>::from([instruction]);
+    let function = Arc::<[Arc<Instruction>]>::from([Arc::new(instruction)]);
     let queue = VecDeque::from([QueueEntry::Step(Frame {
         function,
         context,
@@ -1381,7 +1422,7 @@ fn execute_function_command(
         macro_cache,
         reference,
         functions,
-        arguments.as_ref(),
+        arguments.as_deref(),
         compiler,
     );
     if let Some((id, reason)) = failure {
@@ -1457,13 +1498,13 @@ enum FunctionArgumentError {
     NotCompound(&'static str),
 }
 
-fn resolve_function_arguments(
-    source: Option<&FunctionArguments>,
-    command_storage: &CommandStorage,
-) -> Result<Option<crate::nbt::CompoundTag>, FunctionArgumentError> {
+fn resolve_function_arguments<'a>(
+    source: Option<&'a FunctionArguments>,
+    command_storage: &'a CommandStorage,
+) -> Result<Option<Cow<'a, CompoundTag>>, FunctionArgumentError> {
     match source {
         None => Ok(None),
-        Some(FunctionArguments::Compound(arguments)) => Ok(Some(arguments.clone())),
+        Some(FunctionArguments::Compound(arguments)) => Ok(Some(Cow::Borrowed(arguments))),
         Some(FunctionArguments::Storage {
             storage,
             path: None,
@@ -1472,19 +1513,54 @@ fn resolve_function_arguments(
             storage,
             path: Some(path),
         }) => {
-            let root = command_storage.get(storage);
-            let mut selected = path
-                .get_with_not_found(&root)
-                .map_err(FunctionArgumentError::NotFound)?;
-            if selected.len() != 1 {
-                return Err(FunctionArgumentError::Multiple);
+            if let Some(root) = command_storage.get_ref(storage) {
+                return selected_function_arguments(path, root).map(Some);
             }
-            match selected.pop().expect("one NBT value was selected") {
-                Tag::Compound(arguments) => Ok(Some(arguments)),
-                value => Err(FunctionArgumentError::NotCompound(tag_type_name(&value))),
+
+            let root = CompoundTag::new();
+            match select_function_argument(path, &root)? {
+                crate::nbt::NbtSelection::Root(_) => Ok(Some(Cow::Owned(root))),
+                crate::nbt::NbtSelection::Tag(Tag::Compound(arguments)) => {
+                    Ok(Some(Cow::Owned(arguments.clone())))
+                }
+                crate::nbt::NbtSelection::Tag(value) => {
+                    Err(FunctionArgumentError::NotCompound(tag_type_name(value)))
+                }
+                crate::nbt::NbtSelection::ArrayElement(value) => {
+                    Err(FunctionArgumentError::NotCompound(tag_type_name(&value)))
+                }
             }
         }
     }
+}
+
+fn selected_function_arguments<'a>(
+    path: &crate::nbt::NbtPath,
+    root: &'a CompoundTag,
+) -> Result<Cow<'a, CompoundTag>, FunctionArgumentError> {
+    match select_function_argument(path, root)? {
+        crate::nbt::NbtSelection::Root(arguments) => Ok(Cow::Borrowed(arguments)),
+        crate::nbt::NbtSelection::Tag(Tag::Compound(arguments)) => Ok(Cow::Borrowed(arguments)),
+        crate::nbt::NbtSelection::Tag(value) => {
+            Err(FunctionArgumentError::NotCompound(tag_type_name(value)))
+        }
+        crate::nbt::NbtSelection::ArrayElement(value) => {
+            Err(FunctionArgumentError::NotCompound(tag_type_name(&value)))
+        }
+    }
+}
+
+fn select_function_argument<'a>(
+    path: &crate::nbt::NbtPath,
+    root: &'a CompoundTag,
+) -> Result<crate::nbt::NbtSelection<'a>, FunctionArgumentError> {
+    let mut selected = path
+        .select_with_not_found(root)
+        .map_err(FunctionArgumentError::NotFound)?;
+    if selected.len() != 1 {
+        return Err(FunctionArgumentError::Multiple);
+    }
+    Ok(selected.pop().expect("one NBT value was selected"))
 }
 
 fn function_argument_feedback(reason: &FunctionArgumentError) -> FeedbackText {
@@ -2519,9 +2595,10 @@ fn execute_data_command(
             result
         }
         DataCommand::Get { storage } => {
+            let root = command_storage.get(storage);
             send_success!(
                 silent,
-                storage_query_feedback(storage, &Tag::Compound(command_storage.get(storage))),
+                storage_query_feedback(storage, &NbtSelection::Root(root.as_ref())),
                 feedback,
             );
             1
@@ -2532,7 +2609,7 @@ fn execute_data_command(
             scale,
         } => {
             let root = command_storage.get(storage);
-            let values = match path.get_with_not_found(&root) {
+            let values = match path.select_with_not_found(root.as_ref()) {
                 Ok(values) => values,
                 Err(prefix) => {
                     return Ok(OrdinaryExecution::failure(feedback_text(|text| {
@@ -2541,14 +2618,14 @@ fn execute_data_command(
                     })));
                 }
             };
-            let [value] = values.as_slice() else {
+            let [selection] = values.as_slice() else {
                 return Ok(OrdinaryExecution::failure(literal_feedback(
                     "This argument accepts a single NBT value",
                 )));
             };
             match scale {
                 Some(scale) => {
-                    let Some(number) = value.double_value() else {
+                    let Some(number) = selection.as_tag().and_then(Tag::double_value) else {
                         return Ok(OrdinaryExecution::failure(feedback_text(|text| {
                             text.push_str("Can't get ");
                             text.push_java(path.original());
@@ -2572,10 +2649,14 @@ fn execute_data_command(
                     result
                 }
                 None => {
-                    let result = data_value_result(value).ok_or_else(|| {
+                    let result = match selection {
+                        NbtSelection::Root(compound) => i32::try_from(compound.len()).ok(),
+                        _ => selection.as_tag().and_then(data_value_result),
+                    }
+                    .ok_or_else(|| {
                         "a supported NBT get value must have a Minecraft result".to_owned()
                     })?;
-                    send_success!(silent, storage_query_feedback(storage, value), feedback);
+                    send_success!(silent, storage_query_feedback(storage, selection), feedback,);
                     result
                 }
             }
@@ -2613,6 +2694,8 @@ fn execute_data_command(
                 execution_context,
                 random,
                 source,
+                *operation,
+                path,
             ) {
                 Ok(values) => values,
                 Err(DataSourceError::Evaluation(reason)) => return Err(reason),
@@ -2636,7 +2719,7 @@ fn modified_storage_feedback(storage: &Identifier) -> FeedbackText {
     literal_feedback(&format!("Modified storage {storage}"))
 }
 
-fn storage_query_feedback(storage: &Identifier, value: &Tag) -> FeedbackText {
+fn storage_query_feedback(storage: &Identifier, value: &NbtSelection<'_>) -> FeedbackText {
     feedback_text(|text| {
         text.push_str("Storage ");
         text.push_str(&storage.to_string());
@@ -2764,13 +2847,13 @@ fn merge_storage(
     storage: &Identifier,
     value: &crate::nbt::CompoundTag,
 ) -> Result<i32, String> {
-    if Tag::Compound(value.clone()).is_too_deep(0) {
+    if value.is_too_deep(0) {
         return Err("NBT data is too deep".to_owned());
     }
     let old = command_storage.get(storage);
-    let mut merged = old.clone();
+    let mut merged = old.as_ref().clone();
     merged.merge(value);
-    if merged == old {
+    if merged == *old {
         return Err("NBT merge changed nothing".to_owned());
     }
     command_storage.set(storage.clone(), merged);
@@ -2794,8 +2877,7 @@ fn modify_storage(
                     target,
                     source
                         .last()
-                        .expect("data modification sources contain at least one value")
-                        .clone(),
+                        .expect("data modification sources contain at least one value"),
                 )
                 .map_err(nbt_edit_failure)?,
             DataModifyOperation::Merge => path.merge(target, source).map_err(nbt_edit_failure)?,
@@ -2833,6 +2915,7 @@ enum DataSourceError {
     Evaluation(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_data_source(
     program: &Program,
     scoreboard: &Scoreboard,
@@ -2840,22 +2923,27 @@ fn resolve_data_source(
     execution_context: &ExecutionContext,
     random: &mut LegacyRandom,
     source: &DataSource,
+    operation: DataModifyOperation,
+    target_path: &crate::nbt::NbtPath,
 ) -> Result<Vec<Tag>, DataSourceError> {
     match source {
-        DataSource::Value(value) => Ok(vec![value.clone()]),
+        DataSource::Value(value) => {
+            prepare_nbt_sources(vec![NbtSelection::Tag(value)], operation, target_path)
+        }
         DataSource::Storage { storage, path } => {
             let root = command_storage.get(storage);
-            path.as_ref().map_or_else(
-                || Ok(vec![Tag::Compound(root.clone())]),
+            let selections = path.as_ref().map_or_else(
+                || Ok(vec![NbtSelection::Root(root.as_ref())]),
                 |path| {
-                    path.get_with_not_found(&root).map_err(|prefix| {
+                    path.select_with_not_found(root.as_ref()).map_err(|prefix| {
                         DataSourceError::Command(feedback_text(|text| {
                             text.push_str("Found no elements matching ");
                             text.push_java(&prefix);
                         }))
                     })
                 },
-            )
+            )?;
+            prepare_nbt_sources(selections, operation, target_path)
         }
         DataSource::String {
             storage,
@@ -2864,9 +2952,9 @@ fn resolve_data_source(
         } => {
             let root = command_storage.get(storage);
             let values = path.as_ref().map_or_else(
-                || Ok(vec![Tag::Compound(root.clone())]),
+                || Ok(vec![NbtSelection::Root(root.as_ref())]),
                 |path| {
-                    path.get_with_not_found(&root).map_err(|prefix| {
+                    path.select_with_not_found(root.as_ref()).map_err(|prefix| {
                         DataSourceError::Command(feedback_text(|text| {
                             text.push_str("Found no elements matching ");
                             text.push_java(&prefix);
@@ -2875,8 +2963,14 @@ fn resolve_data_source(
                 },
             )?;
             values
-                .into_iter()
-                .map(|value| {
+                .iter()
+                .map(|selection| {
+                    let Some(value) = selection.as_tag() else {
+                        return Err(DataSourceError::Command(feedback_text(|text| {
+                            text.push_str("Expected a value: got ");
+                            text.push_java(&selection_compact_stringify(selection));
+                        })));
+                    };
                     let Some(text_value) = value.primitive_text() else {
                         return Err(DataSourceError::Command(feedback_text(|text| {
                             text.push_str("Expected a value: got ");
@@ -2940,6 +3034,65 @@ fn resolve_data_source(
     }
 }
 
+fn prepare_nbt_sources(
+    selections: Vec<NbtSelection<'_>>,
+    operation: DataModifyOperation,
+    target_path: &crate::nbt::NbtPath,
+) -> Result<Vec<Tag>, DataSourceError> {
+    match operation {
+        DataModifyOperation::Set => {
+            let selection = selections
+                .into_iter()
+                .last()
+                .expect("an NBT data source is non-empty");
+            if selection.is_too_deep(target_path.depth()) {
+                return Err(DataSourceError::Command(nbt_edit_failure(
+                    NbtEditError::DataTooDeep,
+                )));
+            }
+            Ok(vec![selection.into_owned()])
+        }
+        DataModifyOperation::Insert(_) => {
+            let mut values = Vec::with_capacity(selections.len());
+            for selection in selections {
+                let value = selection.into_owned();
+                if value.is_too_deep(target_path.depth()) {
+                    return Err(DataSourceError::Command(nbt_edit_failure(
+                        NbtEditError::DataTooDeep,
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+        DataModifyOperation::Merge => {
+            let mut values = Vec::with_capacity(selections.len());
+            for selection in selections {
+                if selection.is_too_deep(0) {
+                    return Err(DataSourceError::Command(nbt_edit_failure(
+                        NbtEditError::DataTooDeep,
+                    )));
+                }
+                if !selection.is_compound() {
+                    return Err(DataSourceError::Command(nbt_edit_failure(
+                        NbtEditError::ExpectedObject(selection.into_owned()),
+                    )));
+                }
+                values.push(selection.into_owned());
+            }
+            Ok(values)
+        }
+    }
+}
+
+fn selection_compact_stringify(selection: &NbtSelection<'_>) -> JavaString {
+    match selection {
+        NbtSelection::Root(root) => Tag::Compound((*root).clone()).compact_stringify(),
+        NbtSelection::Tag(tag) => tag.compact_stringify(),
+        NbtSelection::ArrayElement(tag) => tag.compact_stringify(),
+    }
+}
+
 fn minecraft_floor_to_i32(value: f64) -> i32 {
     value.floor() as i32
 }
@@ -2961,7 +3114,7 @@ fn instantiate_function(
     arguments: Option<&crate::nbt::CompoundTag>,
     compiler: &mut Option<CommandCompiler>,
     loot_registry: &Arc<crate::number_provider::LootRegistry>,
-) -> Result<Arc<[Instruction]>, FunctionInstantiationError> {
+) -> Result<Instructions, FunctionInstantiationError> {
     match function {
         Function::Plain(instructions) => Ok(Arc::clone(instructions)),
         Function::Macro(function) => function.instantiate(id, macro_cache, arguments, |command| {

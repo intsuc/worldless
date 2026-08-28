@@ -300,11 +300,13 @@ fn parse_envelope(
             ),
         }
     })?;
+    let namespace_id = Identifier::from_parts(namespace, "")
+        .expect("command storage namespaces are validated before loading");
     for (raw_path, value) in contents.entries() {
         let Some(resource_path) = ascii_string(raw_path) else {
             return invalid_schema(namespace, path, "storage path is not valid ASCII");
         };
-        let Some(id) = Identifier::from_parts(namespace, &resource_path) else {
+        let Some(id) = namespace_id.with_path(&resource_path) else {
             return invalid_schema(
                 namespace,
                 path,
