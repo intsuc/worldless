@@ -5,7 +5,8 @@
 //! scoreboard state and arithmetic, command storage and NBT data operations, number
 //! providers, worldless loot predicates, `compute`, `seed`, and value/reset
 //! forms of `random`, monotonic stopwatches, function macros and tags, supported
-//! `execute` conditions and pure context transformations, and result propagation.
+//! `execute` conditions and pure context transformations, caller-driven logical
+//! normal ticks, and result propagation.
 //! Supported resources can be compiled from a statically composed, ordered
 //! mixture of expanded directory data packs and in-memory packs. Construction
 //! is atomic: an invalid selected resource rejects the whole program instead of
@@ -68,6 +69,65 @@ impl fmt::Display for FunctionArgumentsParseError {
 
 impl Error for FunctionArgumentsParseError {}
 
+/// The automatic-function phase in which a logical tick failure occurred.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TickPhase {
+    /// The first-tick `minecraft:load` phase.
+    Load,
+    /// The per-tick `minecraft:tick` phase.
+    Tick,
+}
+
+impl TickPhase {
+    fn function_tag(self) -> &'static str {
+        match self {
+            Self::Load => "minecraft:load",
+            Self::Tick => "minecraft:tick",
+        }
+    }
+}
+
+/// An automatic function whose execution did not complete during a logical tick.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TickFunctionFailure {
+    phase: TickPhase,
+    function: String,
+    error: ExecutionError,
+}
+
+impl TickFunctionFailure {
+    /// Returns the automatic-function phase that selected the function.
+    pub const fn phase(&self) -> TickPhase {
+        self.phase
+    }
+
+    /// Returns the identifier of the selected function.
+    pub fn function(&self) -> &str {
+        &self.function
+    }
+
+    /// Returns the execution error for this function.
+    pub const fn error(&self) -> &ExecutionError {
+        &self.error
+    }
+}
+
+/// Host diagnostics produced while advancing one logical normal tick.
+///
+/// A failed automatic function does not stop later tag members or phases.
+#[must_use = "tick reports contain automatic-function failures"]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TickReport {
+    failures: Vec<TickFunctionFailure>,
+}
+
+impl TickReport {
+    /// Returns automatic functions that did not complete, in execution order.
+    pub fn failures(&self) -> &[TickFunctionFailure] {
+        &self.failures
+    }
+}
+
 /// Statically composes and validates the supplied data packs without creating
 /// an executable VM.
 pub fn validate_packs(packs: impl IntoIterator<Item = Pack>) -> Result<(), LoadError> {
@@ -82,6 +142,7 @@ pub struct Vm {
     command_storage: CommandStorage,
     random: RandomState,
     stopwatches: StopwatchState,
+    load_pending: bool,
 }
 
 impl Vm {
@@ -163,6 +224,52 @@ impl Vm {
         )
     }
 
+    /// Advances the VM by one caller-driven logical normal tick.
+    ///
+    /// The first tick executes every `minecraft:load` member before every
+    /// `minecraft:tick` member. Later ticks execute only `minecraft:tick`.
+    /// Each member is an independent top-level execution with the supplied
+    /// context and command limit. Its command feedback and result are
+    /// suppressed, and a failure is recorded without stopping later members.
+    pub fn tick(&mut self, context: ExecutionContext, command_limit: usize) -> TickReport {
+        let run_load = self.load_pending;
+        self.load_pending = false;
+        let Self {
+            program,
+            scoreboard,
+            command_storage,
+            random,
+            stopwatches,
+            load_pending: _,
+        } = self;
+        let mut failures = Vec::new();
+        if run_load {
+            execute_automatic_tag(
+                program,
+                scoreboard,
+                command_storage,
+                random,
+                stopwatches,
+                TickPhase::Load,
+                context,
+                command_limit,
+                &mut failures,
+            );
+        }
+        execute_automatic_tag(
+            program,
+            scoreboard,
+            command_storage,
+            random,
+            stopwatches,
+            TickPhase::Tick,
+            context,
+            command_limit,
+            &mut failures,
+        );
+        TickReport { failures }
+    }
+
     fn new(program: Program, world_seed: i64) -> Self {
         Self {
             program,
@@ -170,6 +277,44 @@ impl Vm {
             command_storage: CommandStorage::default(),
             random: RandomState::new(world_seed),
             stopwatches: StopwatchState::new(),
+            load_pending: true,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_automatic_tag(
+    program: &Program,
+    scoreboard: &mut Scoreboard,
+    command_storage: &mut CommandStorage,
+    random: &mut RandomState,
+    stopwatches: &mut StopwatchState,
+    phase: TickPhase,
+    context: ExecutionContext,
+    command_limit: usize,
+    failures: &mut Vec<TickFunctionFailure>,
+) {
+    let id = resource::Identifier::parse(phase.function_tag())
+        .expect("built-in function tag identifiers are valid");
+    let Some(functions) = program.function_tag(&id) else {
+        return;
+    };
+    for function in functions {
+        if let Err(error) = runtime::execute_automatic_function(
+            program,
+            scoreboard,
+            command_storage,
+            random,
+            stopwatches,
+            function,
+            context,
+            command_limit,
+        ) {
+            failures.push(TickFunctionFailure {
+                phase,
+                function: function.to_string(),
+                error,
+            });
         }
     }
 }

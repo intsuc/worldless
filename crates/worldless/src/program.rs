@@ -34,6 +34,10 @@ impl Program {
         self.functions.get(id)
     }
 
+    pub(crate) fn function_tag(&self, id: &Identifier) -> Option<&[Identifier]> {
+        self.function_tags.get(id).map(Vec::as_slice)
+    }
+
     pub(crate) fn loot_registry(&self) -> &Arc<LootRegistry> {
         &self.loot_registry
     }

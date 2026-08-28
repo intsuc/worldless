@@ -533,13 +533,13 @@ fn execute_instruction(
     random: &mut RandomState,
     stopwatches: &mut StopwatchState,
     instruction: Instruction,
-    mut compiler: Option<CommandCompiler>,
+    compiler: Option<CommandCompiler>,
     context: ExecutionContext,
     command_limit: usize,
-    mut feedback: impl FnMut(CommandFeedback),
+    feedback: impl FnMut(CommandFeedback),
 ) -> Result<ExecutionOutcome, ExecutionError> {
     let function = Arc::<[Instruction]>::from([instruction]);
-    let mut queue = VecDeque::from([QueueEntry::Step(Frame {
+    let queue = VecDeque::from([QueueEntry::Step(Frame {
         function,
         context,
         next_instruction: 0,
@@ -550,6 +550,77 @@ fn execute_instruction(
         result_feedback: FeedbackConsumer::empty(),
         silent: false,
     })]);
+
+    execute_queue(
+        program,
+        scoreboard,
+        command_storage,
+        random,
+        stopwatches,
+        queue,
+        compiler,
+        command_limit,
+        feedback,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_automatic_function(
+    program: &Program,
+    scoreboard: &mut Scoreboard,
+    command_storage: &mut CommandStorage,
+    random: &mut RandomState,
+    stopwatches: &mut StopwatchState,
+    id: &Identifier,
+    context: ExecutionContext,
+    command_limit: usize,
+) -> Result<(), ExecutionError> {
+    let function = program
+        .function(id)
+        .expect("a resolved function tag contains loaded functions");
+    let mut compiler = None;
+    let Ok(function) = instantiate_function(function, None, &mut compiler, program.loot_registry())
+    else {
+        return Ok(());
+    };
+    let queue = VecDeque::from([QueueEntry::Call(Frame {
+        function,
+        context,
+        next_instruction: 0,
+        depth: 0,
+        discard_depth: 0,
+        source_consumer: ResultConsumer::empty(),
+        result_consumer: ResultConsumer::empty(),
+        result_feedback: FeedbackConsumer::empty(),
+        silent: true,
+    })]);
+
+    execute_queue(
+        program,
+        scoreboard,
+        command_storage,
+        random,
+        stopwatches,
+        queue,
+        compiler,
+        command_limit,
+        drop,
+    )
+    .map(drop)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_queue(
+    program: &Program,
+    scoreboard: &mut Scoreboard,
+    command_storage: &mut CommandStorage,
+    random: &mut RandomState,
+    stopwatches: &mut StopwatchState,
+    mut queue: VecDeque<QueueEntry>,
+    mut compiler: Option<CommandCompiler>,
+    command_limit: usize,
+    mut feedback: impl FnMut(CommandFeedback),
+) -> Result<ExecutionOutcome, ExecutionError> {
     let mut quota = CommandQuota::new(command_limit);
     let mut top_level_result = None;
 

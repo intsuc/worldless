@@ -24,6 +24,8 @@ and result required by its Minecraft semantics can be represented using only:
 - static data-pack resources supplied as program input;
 - explicit invocation values whose meaning is independent of a world or live
   server identity, except for the configured level seed described below;
+- caller-driven logical normal data-pack ticks admitted only as described
+  below;
 - elapsed monotonic time admitted only through the stopwatch clock described
   below; and
 - logical computation state owned entirely by the VM and whose meaning and
@@ -107,14 +109,31 @@ deterministically from the seed. It also does not seed the unnamed level random
 stream. A composed behavior using the seed remains subject to the
 mixed-behavior rule above.
 
+## Logical normal data-pack ticks
+
+An executable Worldless VM may be advanced by one logical normal data-pack
+tick only through an explicit caller action. The initial `minecraft:load`
+function-tag lifecycle runs at the beginning of the first such tick after VM
+construction, followed by that tick's `minecraft:tick` function-tag lifecycle.
+Each subsequent logical normal tick runs the `minecraft:tick` lifecycle.
+
+This discrete lifecycle admits only the invocation of those function tags and
+the resulting transitions of otherwise in-scope VM-owned state. It does not
+represent elapsed time or a running server, and it does not introduce game
+time, scheduled callbacks, world clocks, timelines, real-time pacing, tick-rate
+control, reload processing, or any physical-world tick behavior.
+
 ## Stopwatch clock
 
 Elapsed monotonic time is in scope only as required by Minecraft's stopwatch
 semantics. The stopwatch clock advances independently of data-pack commands and
-game ticks while an executable VM exists. Its origin has no meaning and it does
-not represent calendar time, a world clock, or a live server.
+logical normal data-pack ticks while an executable VM exists. Advancing a
+logical tick does not advance the stopwatch except through actual monotonic
+elapsed time, and stopwatch time does not cause a logical tick. The stopwatch
+clock's origin has no meaning and it does not represent calendar time, a world
+clock, or a live server.
 
-This narrow exception does not bring world or server lifecycle, game ticks,
+This narrow exception does not bring world or server lifecycle, game time,
 world clocks, timelines, the `time` or `schedule` commands, or other
 time-dependent physical-world behavior into scope. A composed behavior that
 uses a stopwatch remains subject to the mixed-behavior rule above.
