@@ -4,12 +4,12 @@
 //! The current slice supports function calls and returns, persistent named
 //! scoreboard state and arithmetic, command storage and NBT data operations, number
 //! providers, worldless loot predicates, `compute`, `seed`, and value/reset
-//! forms of `random`, function macros and tags, supported `execute` conditions and pure
-//! context transformations, and result propagation. Supported resources can
-//! be compiled from a statically composed, ordered mixture of expanded
-//! directory data packs and in-memory packs. Construction is atomic: an invalid
-//! selected resource rejects the whole program instead of leaving a partially
-//! populated VM.
+//! forms of `random`, monotonic stopwatches, function macros and tags, supported
+//! `execute` conditions and pure context transformations, and result propagation.
+//! Supported resources can be compiled from a statically composed, ordered
+//! mixture of expanded directory data packs and in-memory packs. Construction
+//! is atomic: an invalid selected resource rejects the whole program instead of
+//! leaving a partially populated VM.
 
 mod execution_context;
 mod loader;
@@ -23,6 +23,7 @@ mod random;
 mod resource;
 mod resource_json;
 mod runtime;
+mod stopwatch;
 
 pub use execution_context::{ExecutionContext, Position, Rotation};
 pub use loader::{LoadError, ResourceOrigin};
@@ -34,6 +35,7 @@ use std::{error::Error, fmt};
 use nbt::{CommandStorage, CompoundTag};
 use program::{Program, Scoreboard};
 use random::RandomState;
+use stopwatch::StopwatchState;
 
 /// A compound NBT value supplied to a function invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,6 +81,7 @@ pub struct Vm {
     scoreboard: Scoreboard,
     command_storage: CommandStorage,
     random: RandomState,
+    stopwatches: StopwatchState,
 }
 
 impl Vm {
@@ -125,6 +128,7 @@ impl Vm {
             &mut self.scoreboard,
             &mut self.command_storage,
             &mut self.random,
+            &mut self.stopwatches,
             reference,
             arguments.map(FunctionArguments::compound),
             context,
@@ -151,6 +155,7 @@ impl Vm {
             &mut self.scoreboard,
             &mut self.command_storage,
             &mut self.random,
+            &mut self.stopwatches,
             command,
             context,
             command_limit,
@@ -164,6 +169,7 @@ impl Vm {
             scoreboard: Scoreboard::default(),
             command_storage: CommandStorage::default(),
             random: RandomState::new(world_seed),
+            stopwatches: StopwatchState::new(),
         }
     }
 }

@@ -24,7 +24,8 @@ and result required by its Minecraft semantics can be represented using only:
 - static data-pack resources supplied as program input;
 - explicit invocation values whose meaning is independent of a world or live
   server identity, except for the configured level seed described below;
-  and
+- elapsed monotonic time admitted only through the stopwatch clock described
+  below; and
 - logical computation state owned entirely by the VM and whose meaning and
   transitions do not require a world or live server.
 
@@ -105,6 +106,18 @@ physical-world behavior into scope, even when a result could be derived
 deterministically from the seed. It also does not seed the unnamed level random
 stream. A composed behavior using the seed remains subject to the
 mixed-behavior rule above.
+
+## Stopwatch clock
+
+Elapsed monotonic time is in scope only as required by Minecraft's stopwatch
+semantics. The stopwatch clock advances independently of data-pack commands and
+game ticks while an executable VM exists. Its origin has no meaning and it does
+not represent calendar time, a world clock, or a live server.
+
+This narrow exception does not bring world or server lifecycle, game ticks,
+world clocks, timelines, the `time` or `schedule` commands, or other
+time-dependent physical-world behavior into scope. A composed behavior that
+uses a stopwatch remains subject to the mixed-behavior rule above.
 
 ## Unsupported and unimplemented behavior
 

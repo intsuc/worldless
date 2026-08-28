@@ -85,6 +85,7 @@ pub(crate) enum Modifier {
         function: FunctionReference,
     },
     PredicateCondition(PredicateCondition),
+    StopwatchCondition(StopwatchCondition),
     ReturnRun,
 }
 
@@ -112,6 +113,29 @@ pub(crate) enum Command {
     Data(DataCommand),
     Compute(ComputeCommand),
     Random(RandomCommand),
+    Stopwatch(StopwatchCommand),
+    StopwatchCondition(StopwatchCondition),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum StopwatchCommand {
+    Create { id: Identifier },
+    Query { id: Identifier, scale: f64 },
+    Restart { id: Identifier },
+    Remove { id: Identifier },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DoubleRange {
+    pub(crate) min: Option<f64>,
+    pub(crate) max: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StopwatchCondition {
+    pub(crate) expected: bool,
+    pub(crate) id: Identifier,
+    pub(crate) range: DoubleRange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

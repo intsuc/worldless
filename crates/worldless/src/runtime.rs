@@ -11,10 +11,12 @@ use crate::{
         Command, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation, DataSource,
         FunctionArguments, Instruction, Modifier, ObjectiveId, PredicateCondition, Program,
         RandomCommand, ResolvedFunctions, ScoreCondition, ScoreHolderSet, ScorePredicate,
-        Scoreboard, ScoreboardCommand, StorageCondition, StorageNumberType, StoreKind,
+        Scoreboard, ScoreboardCommand, StopwatchCommand, StopwatchCondition, StorageCondition,
+        StorageNumberType, StoreKind,
     },
     random::{LegacyRandom, RandomState},
     resource::{FunctionReference, Identifier},
+    stopwatch::StopwatchState,
 };
 
 /// A command-feedback text payload preserved as Java UTF-16 code units.
@@ -459,6 +461,7 @@ pub(crate) fn execute_function(
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
+    stopwatches: &mut StopwatchState,
     input: &str,
     arguments: Option<&CompoundTag>,
     context: ExecutionContext,
@@ -482,6 +485,7 @@ pub(crate) fn execute_function(
         scoreboard,
         command_storage,
         random,
+        stopwatches,
         instruction,
         None,
         context,
@@ -496,6 +500,7 @@ pub(crate) fn execute_command(
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
+    stopwatches: &mut StopwatchState,
     input: &str,
     context: ExecutionContext,
     command_limit: usize,
@@ -511,6 +516,7 @@ pub(crate) fn execute_command(
         scoreboard,
         command_storage,
         random,
+        stopwatches,
         instruction,
         Some(compiler),
         context,
@@ -525,6 +531,7 @@ fn execute_instruction(
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
+    stopwatches: &mut StopwatchState,
     instruction: Instruction,
     mut compiler: Option<CommandCompiler>,
     context: ExecutionContext,
@@ -706,6 +713,14 @@ fn execute_instruction(
                                     == condition.expected;
                             }
                         }
+                        Modifier::StopwatchCondition(condition) => {
+                            quota.increment();
+                            forked = true;
+                            if active {
+                                active = stopwatch_condition_matches(stopwatches, condition)
+                                    .unwrap_or(false);
+                            }
+                        }
                         Modifier::FunctionCondition {
                             expected,
                             function: function_reference,
@@ -882,7 +897,9 @@ fn execute_instruction(
                     | Command::PredicateCondition(_)
                     | Command::Data(_)
                     | Command::Compute(_)
-                    | Command::Random(_) => {
+                    | Command::Random(_)
+                    | Command::Stopwatch(_)
+                    | Command::StopwatchCondition(_) => {
                         queue.push_front(QueueEntry::ExecuteOrdinary {
                             frame,
                             context,
@@ -962,6 +979,15 @@ fn execute_instruction(
                     Command::Random(command) => {
                         execute_random_command(random, command, frame.silent, &mut feedback)
                     }
+                    Command::Stopwatch(command) => {
+                        execute_stopwatch_command(stopwatches, command, frame.silent, &mut feedback)
+                    }
+                    Command::StopwatchCondition(condition) => execute_stopwatch_condition(
+                        stopwatches,
+                        condition,
+                        frame.silent,
+                        &mut feedback,
+                    ),
                     Command::Function { .. } | Command::Return { .. } => {
                         unreachable!("only ordinary commands are queued for ordinary execution")
                     }
@@ -1977,6 +2003,102 @@ fn execute_condition(
         }
     }
     if scoreboard.evaluate_condition(condition) == Some(true) {
+        send_success!(silent, literal_feedback("Test passed"), feedback);
+        OrdinaryExecution::success(1)
+    } else {
+        OrdinaryExecution::failure(literal_feedback("Test failed"))
+    }
+}
+
+fn stopwatch_condition_matches(
+    stopwatches: &StopwatchState,
+    condition: &StopwatchCondition,
+) -> Option<bool> {
+    let elapsed_seconds = stopwatches.elapsed_seconds(&condition.id)?;
+    let at_or_above_min = condition
+        .range
+        .min
+        .is_none_or(|minimum| elapsed_seconds >= minimum);
+    let at_or_below_max = condition
+        .range
+        .max
+        .is_none_or(|maximum| elapsed_seconds <= maximum);
+    Some((at_or_above_min && at_or_below_max) == condition.expected)
+}
+
+fn missing_stopwatch(id: &Identifier) -> FeedbackText {
+    literal_feedback(&format!("Stopwatch '{id}' does not exist"))
+}
+
+fn execute_stopwatch_command(
+    stopwatches: &mut StopwatchState,
+    command: &StopwatchCommand,
+    silent: bool,
+    feedback: &mut impl FnMut(CommandFeedback),
+) -> OrdinaryExecution {
+    match command {
+        StopwatchCommand::Create { id } => {
+            if !stopwatches.create(id.clone()) {
+                return OrdinaryExecution::failure(literal_feedback(&format!(
+                    "Stopwatch '{id}' already exists"
+                )));
+            }
+            send_success!(
+                silent,
+                literal_feedback(&format!("Created stopwatch '{id}'")),
+                feedback,
+            );
+            OrdinaryExecution::success(1)
+        }
+        StopwatchCommand::Query { id, scale } => {
+            let Some(query) = stopwatches.query(id, *scale) else {
+                return OrdinaryExecution::failure(missing_stopwatch(id));
+            };
+            send_success!(
+                silent,
+                literal_feedback(&format!(
+                    "Stopwatch '{id}' has run for {}s",
+                    java_f64(query.elapsed_seconds)
+                )),
+                feedback,
+            );
+            OrdinaryExecution::success(query.result)
+        }
+        StopwatchCommand::Restart { id } => {
+            if !stopwatches.restart(id) {
+                return OrdinaryExecution::failure(missing_stopwatch(id));
+            }
+            send_success!(
+                silent,
+                literal_feedback(&format!("Restarted stopwatch '{id}'")),
+                feedback,
+            );
+            OrdinaryExecution::success(1)
+        }
+        StopwatchCommand::Remove { id } => {
+            if !stopwatches.remove(id) {
+                return OrdinaryExecution::failure(missing_stopwatch(id));
+            }
+            send_success!(
+                silent,
+                literal_feedback(&format!("Removed stopwatch '{id}'")),
+                feedback,
+            );
+            OrdinaryExecution::success(1)
+        }
+    }
+}
+
+fn execute_stopwatch_condition(
+    stopwatches: &StopwatchState,
+    condition: &StopwatchCondition,
+    silent: bool,
+    feedback: &mut impl FnMut(CommandFeedback),
+) -> OrdinaryExecution {
+    let Some(matches) = stopwatch_condition_matches(stopwatches, condition) else {
+        return OrdinaryExecution::failure(missing_stopwatch(&condition.id));
+    };
+    if matches {
         send_success!(silent, literal_feedback("Test passed"), feedback);
         OrdinaryExecution::success(1)
     } else {

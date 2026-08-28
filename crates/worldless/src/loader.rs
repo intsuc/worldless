@@ -18,7 +18,10 @@ use worldless_brigadier::{
     },
     builder::{ArgumentBuilder, LiteralArgumentBuilder, RequiredArgumentBuilder},
     context::{CommandContext, ContextError},
-    exceptions::{CommandSyntaxException, SimpleCommandExceptionType},
+    exceptions::{
+        BUILT_IN_EXCEPTIONS, BuiltInExceptionProvider, CommandSyntaxException,
+        SimpleCommandExceptionType,
+    },
 };
 
 use crate::{
@@ -38,10 +41,11 @@ use crate::{
     },
     program::{
         Command as CompiledCommand, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation,
-        DataSource, DataStringSubstring, FunctionArguments, Instruction, IntegerRange, Modifier,
-        PredicateCondition, Program, RandomCommand, RandomSequenceSettings, ScoreComparison,
-        ScoreCondition, ScoreHolderSet, ScorePredicate, ScoreReference, ScoreboardCommand,
-        ScoreboardOperation, StorageCondition, StorageNumberType, StoreKind,
+        DataSource, DataStringSubstring, DoubleRange, FunctionArguments, Instruction, IntegerRange,
+        Modifier, PredicateCondition, Program, RandomCommand, RandomSequenceSettings,
+        ScoreComparison, ScoreCondition, ScoreHolderSet, ScorePredicate, ScoreReference,
+        ScoreboardCommand, ScoreboardOperation, StopwatchCommand, StopwatchCondition,
+        StorageCondition, StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier, is_allowed_in_identifier},
     resource_json,
@@ -1688,6 +1692,10 @@ impl CommandCompiler {
             .expect("the command tree contains no conflicting random literal");
 
         dispatcher
+            .register(stopwatch_command_branch())
+            .expect("the command tree contains no conflicting stopwatch literal");
+
+        dispatcher
             .register(data_command_branch(Arc::clone(&loot_registry)))
             .expect("the command tree contains no conflicting data literal");
 
@@ -2010,6 +2018,85 @@ fn random_command_branch() -> LiteralArgumentBuilder<LoweringSource> {
         .expect("the random literal can contain reset")
         .then(roll_branch)
         .expect("the random literal can reject roll")
+}
+
+fn stopwatch_command_branch() -> LiteralArgumentBuilder<LoweringSource> {
+    let create: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Stopwatch(StopwatchCommand::Create {
+                id: identifier(context, "id"),
+            }))
+    });
+    let query: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Stopwatch(StopwatchCommand::Query {
+                id: identifier(context, "id"),
+                scale: 1.0,
+            }))
+    });
+    let scaled_query: Command<LoweringSource> = Rc::new(|context| {
+        let scale = DoubleArgumentType::get_double(context, "scale")
+            .expect("the scaled stopwatch query is attached below its scale argument");
+        context
+            .source()
+            .record(CompiledCommand::Stopwatch(StopwatchCommand::Query {
+                id: identifier(context, "id"),
+                scale,
+            }))
+    });
+    let restart: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Stopwatch(StopwatchCommand::Restart {
+                id: identifier(context, "id"),
+            }))
+    });
+    let remove: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Stopwatch(StopwatchCommand::Remove {
+                id: identifier(context, "id"),
+            }))
+    });
+
+    LiteralArgumentBuilder::literal("stopwatch")
+        .then(
+            LiteralArgumentBuilder::literal("create")
+                .then(RequiredArgumentBuilder::argument("id", IdentifierArgument).executes(create))
+                .expect("stopwatch create can contain an identifier"),
+        )
+        .expect("stopwatch can contain create")
+        .then(
+            LiteralArgumentBuilder::literal("query")
+                .then(
+                    RequiredArgumentBuilder::argument("id", IdentifierArgument)
+                        .executes(query)
+                        .then(
+                            RequiredArgumentBuilder::argument(
+                                "scale",
+                                DoubleArgumentType::double(),
+                            )
+                            .executes(scaled_query),
+                        )
+                        .expect("a stopwatch query identifier can contain a scale"),
+                )
+                .expect("stopwatch query can contain an identifier"),
+        )
+        .expect("stopwatch can contain query")
+        .then(
+            LiteralArgumentBuilder::literal("restart")
+                .then(RequiredArgumentBuilder::argument("id", IdentifierArgument).executes(restart))
+                .expect("stopwatch restart can contain an identifier"),
+        )
+        .expect("stopwatch can contain restart")
+        .then(
+            LiteralArgumentBuilder::literal("remove")
+                .then(RequiredArgumentBuilder::argument("id", IdentifierArgument).executes(remove))
+                .expect("stopwatch remove can contain an identifier"),
+        )
+        .expect("stopwatch can contain remove")
 }
 
 fn random_reset_settings_branch(
@@ -2550,8 +2637,52 @@ fn execute_condition_branch(
             loot_registry,
         ))
         .expect("a conditional can contain the predicate literal")
+        .then(stopwatch_condition_branch(expected, execute.clone()))
+        .expect("a conditional can contain the stopwatch literal")
         .then(storage_data_condition_branch(expected, execute))
         .expect("a conditional can contain storage data")
+}
+
+fn stopwatch_condition_branch(
+    expected: bool,
+    execute: worldless_brigadier::tree::Node<LoweringSource>,
+) -> LiteralArgumentBuilder<LoweringSource> {
+    let terminal: Command<LoweringSource> = Rc::new(move |context| {
+        context
+            .source()
+            .record(CompiledCommand::StopwatchCondition(stopwatch_condition(
+                context, expected,
+            )))
+    });
+    let modifier = Rc::new(move |context: &CommandContext<LoweringSource>| {
+        Ok(vec![Rc::new(context.source().with_modifier(
+            Modifier::StopwatchCondition(stopwatch_condition(context, expected)),
+        ))])
+    });
+
+    LiteralArgumentBuilder::literal("stopwatch")
+        .then(
+            RequiredArgumentBuilder::argument("id", IdentifierArgument)
+                .then(
+                    RequiredArgumentBuilder::argument("range", DoubleRangeArgument)
+                        .executes(terminal)
+                        .fork(execute, modifier)
+                        .expect("a complete stopwatch condition can redirect to execute"),
+                )
+                .expect("a stopwatch condition identifier can contain a range"),
+        )
+        .expect("the stopwatch literal can contain an identifier")
+}
+
+fn stopwatch_condition(
+    context: &CommandContext<LoweringSource>,
+    expected: bool,
+) -> StopwatchCondition {
+    StopwatchCondition {
+        expected,
+        id: identifier(context, "id"),
+        range: double_range(context, "range"),
+    }
 }
 
 fn predicate_condition_branch(
@@ -2924,6 +3055,13 @@ fn integer_range(context: &CommandContext<LoweringSource>, name: &str) -> Intege
         .argument::<IntegerRange>(name)
         .map(|range| *range)
         .expect("the command executor is attached below the requested integer range")
+}
+
+fn double_range(context: &CommandContext<LoweringSource>, name: &str) -> DoubleRange {
+    context
+        .argument::<DoubleRange>(name)
+        .map(|range| *range)
+        .expect("the command executor is attached below the requested double range")
 }
 
 fn nbt_path(context: &CommandContext<LoweringSource>, name: &str) -> NbtPath {
@@ -3504,9 +3642,95 @@ impl ArgumentType<LoweringSource> for IntegerRangeArgument {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DoubleRangeArgument;
+
+enum DoubleRangeParseError {
+    Empty,
+    Swapped,
+    InvalidDouble(String),
+}
+
+impl ArgumentType<LoweringSource> for DoubleRangeArgument {
+    type Value = DoubleRange;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let start = reader.cursor();
+        let parsed = (|| {
+            let min = parse_double_range_bound(reader)?;
+            let max = if reader.can_read_n(2)
+                && reader.peek() == b'.' as u16
+                && reader.peek_offset(1) == b'.' as u16
+            {
+                reader.skip();
+                reader.skip();
+                parse_double_range_bound(reader)?
+            } else {
+                min
+            };
+
+            if min.is_none() && max.is_none() {
+                return Err(DoubleRangeParseError::Empty);
+            }
+            if min
+                .zip(max)
+                .is_some_and(|(min, max)| min.total_cmp(&max).is_gt())
+            {
+                return Err(DoubleRangeParseError::Swapped);
+            }
+            Ok(DoubleRange { min, max })
+        })();
+
+        parsed.map_err(|error| {
+            reader.set_cursor(start);
+            match error {
+                DoubleRangeParseError::Empty => SimpleCommandExceptionType::new(
+                    LiteralMessage::new("Expected value or range of values"),
+                )
+                .create_with_context(reader),
+                DoubleRangeParseError::Swapped => SimpleCommandExceptionType::new(
+                    LiteralMessage::new("Min cannot be bigger than max"),
+                )
+                .create_with_context(reader),
+                DoubleRangeParseError::InvalidDouble(value) => BUILT_IN_EXCEPTIONS
+                    .reader_invalid_double()
+                    .create_with_context(reader, value),
+            }
+        })
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["0.0..5.2", "0", "-5.4", "-100.76..", "..100"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+fn parse_double_range_bound(
+    reader: &mut StringReader,
+) -> Result<Option<f64>, DoubleRangeParseError> {
+    let start = reader.cursor();
+    while reader.can_read() && is_allowed_range_number(reader) {
+        reader.skip();
+    }
+    if start == reader.cursor() {
+        return Ok(None);
+    }
+    let value = reader.substring(start, reader.cursor());
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| DoubleRangeParseError::InvalidDouble(value))
+}
+
 fn parse_integer_range_bound(reader: &mut StringReader) -> Result<Option<i32>, &'static str> {
     let start = reader.cursor();
-    while reader.can_read() && is_allowed_integer_range_number(reader) {
+    while reader.can_read() && is_allowed_range_number(reader) {
         reader.skip();
     }
     if start == reader.cursor() {
@@ -3519,7 +3743,7 @@ fn parse_integer_range_bound(reader: &mut StringReader) -> Result<Option<i32>, &
         .map_err(|_| "invalid integer in integer range")
 }
 
-fn is_allowed_integer_range_number(reader: &StringReader) -> bool {
+fn is_allowed_range_number(reader: &StringReader) -> bool {
     match reader.peek() {
         unit if matches!(unit, 0x30..=0x39) || unit == b'-' as u16 => true,
         unit if unit == b'.' as u16 => {
@@ -3956,6 +4180,126 @@ mod tests {
                 .unwrap_err()
                 .contains("outside Worldless scope")
         );
+    }
+
+    #[test]
+    fn compiler_lowers_stopwatch_commands_and_conditions() {
+        let compiler = CommandCompiler::new();
+
+        assert!(matches!(
+            compiler
+                .compile("stopwatch create example:timer")
+                .unwrap()
+                .command,
+            CompiledCommand::Stopwatch(StopwatchCommand::Create { ref id })
+                if id.to_string() == "example:timer"
+        ));
+        assert!(matches!(
+            compiler
+                .compile("stopwatch query example:timer")
+                .unwrap()
+                .command,
+            CompiledCommand::Stopwatch(StopwatchCommand::Query { ref id, scale })
+                if id.to_string() == "example:timer" && scale == 1.0
+        ));
+        assert!(matches!(
+            compiler
+                .compile("stopwatch query example:timer -2.5")
+                .unwrap()
+                .command,
+            CompiledCommand::Stopwatch(StopwatchCommand::Query { scale: -2.5, .. })
+        ));
+        assert!(matches!(
+            compiler
+                .compile("stopwatch restart example:timer")
+                .unwrap()
+                .command,
+            CompiledCommand::Stopwatch(StopwatchCommand::Restart { .. })
+        ));
+        assert!(matches!(
+            compiler
+                .compile("stopwatch remove example:timer")
+                .unwrap()
+                .command,
+            CompiledCommand::Stopwatch(StopwatchCommand::Remove { .. })
+        ));
+
+        let terminal = compiler
+            .compile("execute unless stopwatch example:timer ..1.25")
+            .unwrap();
+        assert!(terminal.modifiers.is_empty());
+        assert!(matches!(
+            terminal.command,
+            CompiledCommand::StopwatchCondition(StopwatchCondition {
+                expected: false,
+                range: DoubleRange {
+                    min: None,
+                    max: Some(1.25)
+                },
+                ..
+            })
+        ));
+
+        let conditional = compiler
+            .compile("execute if stopwatch example:timer -0.0..0.0 run return 3")
+            .unwrap();
+        assert!(matches!(
+            conditional.modifiers.as_slice(),
+            [Modifier::StopwatchCondition(StopwatchCondition {
+                expected: true,
+                range: DoubleRange {
+                    min: Some(min),
+                    max: Some(max)
+                },
+                ..
+            })] if min.is_sign_negative() && *max == 0.0 && !max.is_sign_negative()
+        ));
+        assert!(matches!(
+            conditional.command,
+            CompiledCommand::Return {
+                success: true,
+                value: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn compiler_rejects_invalid_stopwatch_syntax() {
+        let compiler = CommandCompiler::new();
+
+        for invalid in [
+            "stopwatch",
+            "stopwatch create",
+            "stopwatch create Invalid:timer",
+            "stopwatch query example:timer 1 extra",
+            "stopwatch restart example:timer extra",
+            "stopwatch remove example:timer extra",
+            "execute if stopwatch example:timer",
+            "execute if stopwatch example:timer ..",
+            "execute if stopwatch example:timer 2..1",
+            "execute if stopwatch example:timer 0..-0",
+            "execute if stopwatch example:timer 1e2",
+        ] {
+            assert!(compiler.compile(invalid).is_err(), "accepted {invalid:?}");
+        }
+
+        for (invalid, expected_message) in [
+            (
+                "execute if stopwatch example:timer ..",
+                "Expected value or range of values",
+            ),
+            (
+                "execute if stopwatch example:timer 2..1",
+                "Min cannot be bigger than max",
+            ),
+            ("execute if stopwatch example:timer .", "Invalid double '.'"),
+        ] {
+            let error = compiler.compile(invalid).unwrap_err();
+            assert!(
+                error.starts_with(expected_message),
+                "unexpected error for {invalid:?}: {error}"
+            );
+        }
     }
 
     #[test]
