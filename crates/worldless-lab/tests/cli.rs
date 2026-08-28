@@ -19,9 +19,9 @@ fn check_emits_machine_readable_success() {
     assert_eq!(report["execution"]["vm_state"], "fresh");
     assert_eq!(report["execution"]["macro_cache"], "cold");
     assert_eq!(report["suites"][0]["suite"], "concat");
-    assert_eq!(report["suites"][0]["case_count"], 5);
+    assert_eq!(report["suites"][0]["case_count"], 11);
     assert_eq!(report["suites"][0]["variant_count"], 1);
-    assert_eq!(report["suites"][0]["invocation_count"], 5);
+    assert_eq!(report["suites"][0]["invocation_count"], 11);
 }
 
 #[test]

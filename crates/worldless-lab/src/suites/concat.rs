@@ -17,6 +17,14 @@ struct Input {
     second: &'static str,
 }
 
+// Twelve tokens, including the leading single quote, exceeded the old sequential composer.
+const ELEVEN_DOUBLE_QUOTES: &str = concat!(
+    "\"", "\"", "\"", "\"", "\"", "\"", "\"", "\"", "\"", "\"", "\""
+);
+const ELEVEN_BACKSLASHES: &str = concat!(
+    "\\", "\\", "\\", "\\", "\\", "\\", "\\", "\\", "\\", "\\", "\\"
+);
+
 const INPUTS: &[Input] = &[
     Input {
         slug: "ordinary_fast_path",
@@ -32,6 +40,36 @@ const INPUTS: &[Input] = &[
         slug: "escape_boundary_slow_path",
         first: "\\",
         second: "n",
+    },
+    Input {
+        slug: "single_special_slow_path",
+        first: "",
+        second: "\\",
+    },
+    Input {
+        slug: "adjacent_special_pair",
+        first: "\"",
+        second: "\\",
+    },
+    Input {
+        slug: "odd_special_tokens",
+        first: "'",
+        second: "\"\\",
+    },
+    Input {
+        slug: "power_of_two_tokens",
+        first: "'",
+        second: "\"\\\"",
+    },
+    Input {
+        slug: "dense_quote_tokens",
+        first: "'",
+        second: ELEVEN_DOUBLE_QUOTES,
+    },
+    Input {
+        slug: "dense_backslash_tokens",
+        first: "'",
+        second: ELEVEN_BACKSLASHES,
     },
     Input {
         slug: "empty_strings",

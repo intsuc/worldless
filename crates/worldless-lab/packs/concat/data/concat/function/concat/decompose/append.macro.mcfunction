@@ -1,1 +1,1 @@
-$data modify storage concat: parts[-2] append string storage concat: decompose $(start) $(end)
+$data modify storage concat: tokens append string storage concat: decompose $(start) $(end)
