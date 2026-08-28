@@ -47,7 +47,7 @@ where
 
 fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
     assert_eq!(
-        vm.execute_function(function, None, context(), LIMIT)
+        vm.execute_function(function, None, context(), LIMIT, drop)
             .unwrap(),
         expected,
         "{function}"
@@ -425,7 +425,7 @@ fn macro_conditions_have_no_arguments_and_top_level_failure_is_explicit() {
 
     assert_function(&mut vm, "example:unless_macro", returned(true, 1));
     assert_eq!(
-        vm.execute_function("example:macro", None, context(), LIMIT)
+        vm.execute_function("example:macro", None, context(), LIMIT, drop)
             .unwrap(),
         returned(false, 0)
     );
@@ -459,8 +459,8 @@ fn macro_instantiation_does_not_consume_command_quota() {
 
     for limit in 1..=8 {
         assert_eq!(
-            vm.execute_function("example:plain_call", None, context(), limit),
-            vm.execute_function("example:macro_call", None, context(), limit),
+            vm.execute_function("example:plain_call", None, context(), limit, drop),
+            vm.execute_function("example:macro_call", None, context(), limit, drop),
             "limit {limit}"
         );
     }

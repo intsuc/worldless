@@ -1,16 +1,17 @@
 use std::{
     ffi::{OsStr, OsString},
     fmt,
+    io::{self, BufRead, IsTerminal, Write},
     path::PathBuf,
     process::ExitCode,
 };
 
 use worldless::{
-    ExecutionContext, ExecutionOutcome, FunctionArguments, Pack, Position, Rotation, Vm,
-    validate_packs,
+    CommandFeedback, ExecutionContext, ExecutionOutcome, FunctionArguments, Pack, Position,
+    Rotation, Vm, validate_packs,
 };
 
-const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] function [--arguments <COMPOUND_SNBT>] <FUNCTION_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] tag [--arguments <COMPOUND_SNBT>] <TAG_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] command <COMMAND>";
+const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] function [--arguments <COMPOUND_SNBT>] <FUNCTION_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] tag [--arguments <COMPOUND_SNBT>] <TAG_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] command <COMMAND>\n       worldless repl --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>]";
 const DEFAULT_COMMAND_LIMIT: usize = 65_536;
 const DEFAULT_POSITION: Position = Position::new(0.0, 0.0, 0.0);
 const DEFAULT_ROTATION: Rotation = Rotation::new(0.0, 0.0);
@@ -24,12 +25,20 @@ enum CliCommand {
         packs: Vec<PathBuf>,
     },
     Run {
-        packs: Vec<PathBuf>,
-        world_seed: i64,
-        command_limit: usize,
-        context: ExecutionContext,
+        options: RuntimeOptions,
         invocation: CliInvocation,
     },
+    Repl {
+        options: RuntimeOptions,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+struct RuntimeOptions {
+    packs: Vec<PathBuf>,
+    world_seed: i64,
+    command_limit: usize,
+    context: ExecutionContext,
 }
 
 #[derive(Debug, PartialEq)]
@@ -68,10 +77,7 @@ fn main() -> ExitCode {
             println!("ok");
         }
         CliCommand::Run {
-            packs,
-            world_seed,
-            command_limit,
-            context,
+            options,
             invocation,
         } => {
             let invocation = match invocation {
@@ -97,27 +103,87 @@ fn main() -> ExitCode {
                 }
                 CliInvocation::Command(command) => Invocation::Command(command),
             };
-            let mut vm = match Vm::from_packs(packs.into_iter().map(Pack::directory), world_seed) {
+            let mut vm = match load_vm(&options) {
                 Ok(vm) => vm,
                 Err(error) => {
                     eprintln!("error: {error}");
                     return ExitCode::from(EXIT_LOAD);
                 }
             };
+            let stdout = io::stdout();
+            let mut stdout = stdout.lock();
+            let mut output_error = None;
             let outcome = match invocation {
                 Invocation::Function {
                     reference,
                     arguments,
-                } => vm.execute_function(&reference, arguments.as_ref(), context, command_limit),
-                Invocation::Command(command) => {
-                    vm.execute_command(&command, context, command_limit)
+                } => vm.execute_function(
+                    &reference,
+                    arguments.as_ref(),
+                    options.context,
+                    options.command_limit,
+                    |feedback| write_feedback_or_record(&mut stdout, feedback, &mut output_error),
+                ),
+                Invocation::Command(command) => vm.execute_command(
+                    &command,
+                    options.context,
+                    options.command_limit,
+                    |feedback| write_feedback_or_record(&mut stdout, feedback, &mut output_error),
+                ),
+            };
+            if let Some(error) = output_error {
+                eprintln!("error: failed to write stdout: {error}");
+                return ExitCode::from(EXIT_EXECUTION);
+            }
+            match outcome {
+                Ok(outcome) => {
+                    if let Err(error) =
+                        write_outcome(&mut stdout, outcome).and_then(|()| stdout.flush())
+                    {
+                        eprintln!("error: failed to write stdout: {error}");
+                        return ExitCode::from(EXIT_EXECUTION);
+                    }
+                }
+                Err(error) => {
+                    if let Err(output_error) = stdout.flush() {
+                        eprintln!("error: failed to write stdout: {output_error}");
+                        return ExitCode::from(EXIT_EXECUTION);
+                    }
+                    eprintln!("error: {error}");
+                    return ExitCode::from(EXIT_EXECUTION);
+                }
+            }
+        }
+        CliCommand::Repl { options } => {
+            let mut vm = match load_vm(&options) {
+                Ok(vm) => vm,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(EXIT_LOAD);
                 }
             };
-            match outcome {
-                Ok(ExecutionOutcome::NoResult) => println!("no-result"),
-                Ok(ExecutionOutcome::Result { success, value }) => {
-                    println!("result success={success} value={value}")
-                }
+            let stdin = io::stdin();
+            let interactive = stdin.is_terminal();
+            let stdout = io::stdout();
+            let stderr = io::stderr();
+            let mut stdin = stdin.lock();
+            let mut stdout = stdout.lock();
+            let mut stderr = stderr.lock();
+            let result = repl(
+                &mut vm,
+                options.context,
+                options.command_limit,
+                &mut stdin,
+                &mut stdout,
+                &mut stderr,
+                interactive,
+            );
+            drop(stdin);
+            drop(stdout);
+            drop(stderr);
+            match result {
+                Ok(false) => {}
+                Ok(true) => return ExitCode::from(EXIT_EXECUTION),
                 Err(error) => {
                     eprintln!("error: {error}");
                     return ExitCode::from(EXIT_EXECUTION);
@@ -127,6 +193,145 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn load_vm(options: &RuntimeOptions) -> Result<Vm, worldless::LoadError> {
+    Vm::from_packs(
+        options.packs.iter().map(Pack::directory),
+        options.world_seed,
+    )
+}
+
+fn repl(
+    vm: &mut Vm,
+    context: ExecutionContext,
+    command_limit: usize,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    diagnostics: &mut impl Write,
+    interactive: bool,
+) -> io::Result<bool> {
+    let mut line = String::new();
+    let mut line_number = 0_usize;
+    let mut had_execution_error = false;
+
+    loop {
+        if interactive {
+            diagnostics
+                .write_all(b"worldless> ")
+                .and_then(|()| diagnostics.flush())
+                .map_err(|error| contextual_io_error("write the REPL prompt", error))?;
+        }
+
+        line.clear();
+        let bytes_read = input
+            .read_line(&mut line)
+            .map_err(|error| contextual_io_error("read REPL input", error))?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+        remove_line_ending(&mut line);
+        if line.is_empty() {
+            continue;
+        }
+        if line == ":quit" {
+            break;
+        }
+
+        let mut output_error = None;
+        let outcome = vm.execute_command(&line, context, command_limit, |feedback| {
+            write_feedback_or_record(output, feedback, &mut output_error);
+        });
+        if let Some(error) = output_error {
+            return Err(contextual_io_error("write REPL output", error));
+        }
+        match outcome {
+            Ok(outcome) => {
+                write_outcome(output, outcome)
+                    .and_then(|()| output.flush())
+                    .map_err(|error| contextual_io_error("write REPL output", error))?;
+            }
+            Err(error) => {
+                output
+                    .flush()
+                    .map_err(|error| contextual_io_error("write REPL output", error))?;
+                had_execution_error = true;
+                writeln!(diagnostics, "error: line {line_number}: {error}")
+                    .and_then(|()| diagnostics.flush())
+                    .map_err(|error| contextual_io_error("write REPL diagnostics", error))?;
+            }
+        }
+    }
+
+    Ok(had_execution_error)
+}
+
+fn remove_line_ending(line: &mut String) {
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+}
+
+fn write_feedback_or_record(
+    output: &mut impl Write,
+    feedback: CommandFeedback,
+    output_error: &mut Option<io::Error>,
+) {
+    if output_error.is_none()
+        && let Err(error) = write_feedback(output, feedback)
+    {
+        *output_error = Some(error);
+    }
+}
+
+fn write_feedback(output: &mut impl Write, feedback: CommandFeedback) -> io::Result<()> {
+    let (kind, text) = match feedback {
+        CommandFeedback::Success(text) => ("success", text),
+        CommandFeedback::Failure(text) => ("failure", text),
+    };
+    write!(output, "feedback kind={kind} text=\"")?;
+    write_escaped_utf16(output, text.as_utf16())?;
+    output.write_all(b"\"\n")
+}
+
+fn write_escaped_utf16(output: &mut impl Write, text: &[u16]) -> io::Result<()> {
+    for decoded in char::decode_utf16(text.iter().copied()) {
+        match decoded {
+            Ok('"') => output.write_all(b"\\\"")?,
+            Ok('\\') => output.write_all(b"\\\\")?,
+            Ok('\n') => output.write_all(b"\\n")?,
+            Ok('\r') => output.write_all(b"\\r")?,
+            Ok('\t') => output.write_all(b"\\t")?,
+            Ok(character)
+                if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') =>
+            {
+                write!(output, "\\u{{{:x}}}", u32::from(character))?;
+            }
+            Ok(character) => {
+                let mut buffer = [0_u8; 4];
+                output.write_all(character.encode_utf8(&mut buffer).as_bytes())?;
+            }
+            Err(error) => write!(output, "\\u{{{:x}}}", error.unpaired_surrogate())?,
+        }
+    }
+    Ok(())
+}
+
+fn write_outcome(output: &mut impl Write, outcome: ExecutionOutcome) -> io::Result<()> {
+    match outcome {
+        ExecutionOutcome::NoResult => writeln!(output, "no-result"),
+        ExecutionOutcome::Result { success, value } => {
+            writeln!(output, "result success={success} value={value}")
+        }
+    }
+}
+
+fn contextual_io_error(operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("failed to {operation}: {error}"))
 }
 
 enum Invocation {
@@ -146,6 +351,8 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<CliComman
         parse_check(arguments)
     } else if command == "run" {
         parse_run(arguments)
+    } else if command == "repl" {
+        parse_repl(arguments)
     } else {
         Err(usage_error(format!("unknown command {command:?}")))
     }
@@ -165,6 +372,60 @@ fn parse_check(mut arguments: impl Iterator<Item = OsString>) -> Result<CliComma
 
 fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, UsageError> {
     let mut arguments = arguments.peekable();
+    let options = parse_runtime_options(&mut arguments)?;
+
+    let target = arguments
+        .next()
+        .ok_or_else(|| usage_error("missing run target; expected function, tag, or command"))?;
+    if is_runtime_option(&target) {
+        return Err(misplaced_runtime_option(target));
+    }
+    let invocation = if target == "function" {
+        parse_function_invocation(&mut arguments, false)?
+    } else if target == "tag" {
+        parse_function_invocation(&mut arguments, true)?
+    } else if target == "command" {
+        CliInvocation::Command(parse_command(arguments.next())?)
+    } else if is_option(&target) {
+        return Err(unexpected_argument(target));
+    } else {
+        return Err(usage_error(format!("unknown run target {target:?}")));
+    };
+
+    if let Some(argument) = arguments.next() {
+        if is_runtime_option(&argument) {
+            return Err(misplaced_runtime_option(argument));
+        }
+        if argument == "--arguments" {
+            return Err(usage_error("duplicate --arguments"));
+        }
+        return Err(unexpected_argument(argument));
+    }
+
+    Ok(CliCommand::Run {
+        options,
+        invocation,
+    })
+}
+
+fn parse_repl(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, UsageError> {
+    let mut arguments = arguments.peekable();
+    let options = parse_runtime_options(&mut arguments)?;
+    if let Some(argument) = arguments.next() {
+        if is_runtime_option(&argument) {
+            return Err(misplaced_runtime_option(argument));
+        }
+        return Err(unexpected_argument(argument));
+    }
+    Ok(CliCommand::Repl { options })
+}
+
+fn parse_runtime_options<I>(
+    arguments: &mut std::iter::Peekable<I>,
+) -> Result<RuntimeOptions, UsageError>
+where
+    I: Iterator<Item = OsString>,
+{
     let mut packs = Vec::new();
     while arguments
         .peek()
@@ -221,47 +482,11 @@ fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, Us
         DEFAULT_ROTATION
     };
 
-    if arguments
-        .peek()
-        .is_some_and(|argument| argument == "--world-seed")
-    {
-        return Err(usage_error("duplicate --world-seed"));
-    }
-
-    let target = arguments
-        .next()
-        .ok_or_else(|| usage_error("missing run target; expected function, tag, or command"))?;
-    let invocation = if target == "function" {
-        parse_function_invocation(&mut arguments, false)?
-    } else if target == "tag" {
-        parse_function_invocation(&mut arguments, true)?
-    } else if target == "command" {
-        CliInvocation::Command(parse_command(arguments.next())?)
-    } else if is_option(&target) {
-        return Err(unexpected_argument(target));
-    } else {
-        return Err(usage_error(format!("unknown run target {target:?}")));
-    };
-
-    if let Some(argument) = arguments.next() {
-        if argument == "--world-seed" {
-            return Err(usage_error("duplicate --world-seed"));
-        }
-        if argument == "--command-limit" {
-            return Err(usage_error("duplicate --command-limit"));
-        }
-        if argument == "--arguments" {
-            return Err(usage_error("duplicate --arguments"));
-        }
-        return Err(unexpected_argument(argument));
-    }
-
-    Ok(CliCommand::Run {
+    Ok(RuntimeOptions {
         packs,
         world_seed,
         command_limit,
         context: ExecutionContext::new(position, rotation),
-        invocation,
     })
 }
 
@@ -471,6 +696,27 @@ fn is_known_option(argument: &OsStr) -> bool {
         || argument == "--arguments"
 }
 
+fn is_runtime_option(argument: &OsStr) -> bool {
+    argument == "--pack"
+        || argument == "--world-seed"
+        || argument == "--command-limit"
+        || argument == "--position"
+        || argument == "--rotation"
+}
+
+fn misplaced_runtime_option(argument: OsString) -> UsageError {
+    if argument == "--world-seed" {
+        usage_error("duplicate --world-seed")
+    } else if argument == "--pack" {
+        usage_error("--pack must precede --world-seed")
+    } else {
+        usage_error(format!(
+            "{} is duplicated or out of order",
+            argument.to_string_lossy()
+        ))
+    }
+}
+
 fn unexpected_argument(argument: OsString) -> UsageError {
     if is_option(&argument) {
         usage_error(format!("unknown option {argument:?}"))
@@ -495,6 +741,20 @@ mod tests {
         CliInvocation::Function {
             reference: reference.to_owned(),
             arguments: None,
+        }
+    }
+
+    fn options(
+        packs: &[&str],
+        world_seed: i64,
+        command_limit: usize,
+        context: ExecutionContext,
+    ) -> RuntimeOptions {
+        RuntimeOptions {
+            packs: packs.iter().map(PathBuf::from).collect(),
+            world_seed,
+            command_limit,
+            context,
         }
     }
 
@@ -529,12 +789,14 @@ mod tests {
             ])
             .unwrap(),
             CliCommand::Run {
-                packs: vec![PathBuf::from("low"), PathBuf::from("high")],
-                world_seed: -123,
-                command_limit: 12,
-                context: ExecutionContext::new(
-                    Position::new(-1.5, 2.0, -3.25),
-                    Rotation::new(-90.0, 45.5),
+                options: options(
+                    &["low", "high"],
+                    -123,
+                    12,
+                    ExecutionContext::new(
+                        Position::new(-1.5, 2.0, -3.25),
+                        Rotation::new(-90.0, 45.5),
+                    ),
                 ),
                 invocation: function("example:main"),
             }
@@ -542,12 +804,87 @@ mod tests {
     }
 
     #[test]
+    fn repl_uses_the_shared_runtime_options_without_a_target() {
+        assert_eq!(
+            parse(&[
+                "repl",
+                "--pack",
+                "low",
+                "--pack",
+                "high",
+                "--world-seed",
+                "-7",
+                "--command-limit",
+                "9",
+                "--position",
+                "1",
+                "2",
+                "3",
+                "--rotation",
+                "90",
+                "-45",
+            ])
+            .unwrap(),
+            CliCommand::Repl {
+                options: options(
+                    &["low", "high"],
+                    -7,
+                    9,
+                    ExecutionContext::new(Position::new(1.0, 2.0, 3.0), Rotation::new(90.0, -45.0),),
+                ),
+            }
+        );
+
+        assert_eq!(
+            parse(&["repl", "--pack", "pack", "--world-seed", "0"]).unwrap(),
+            CliCommand::Repl {
+                options: options(
+                    &["pack"],
+                    0,
+                    DEFAULT_COMMAND_LIMIT,
+                    ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                ),
+            }
+        );
+
+        for arguments in [
+            &["repl", "--pack", "pack", "--world-seed", "0", "command"][..],
+            &[
+                "repl",
+                "--pack",
+                "pack",
+                "--world-seed",
+                "0",
+                "--world-seed",
+                "1",
+            ],
+            &[
+                "repl",
+                "--pack",
+                "pack",
+                "--world-seed",
+                "0",
+                "--position",
+                "0",
+                "0",
+                "0",
+                "--command-limit",
+                "1",
+            ],
+        ] {
+            assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+        }
+    }
+
+    #[test]
     fn parses_function_tags_arguments_and_single_commands() {
         let defaults = |invocation| CliCommand::Run {
-            packs: vec![PathBuf::from("pack")],
-            world_seed: 0,
-            command_limit: DEFAULT_COMMAND_LIMIT,
-            context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+            options: options(
+                &["pack"],
+                0,
+                DEFAULT_COMMAND_LIMIT,
+                ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+            ),
             invocation,
         };
 
@@ -699,10 +1036,12 @@ mod tests {
             ])
             .unwrap(),
             CliCommand::Run {
-                packs: vec![PathBuf::from("pack")],
-                world_seed: 123,
-                command_limit: DEFAULT_COMMAND_LIMIT,
-                context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                options: options(
+                    &["pack"],
+                    123,
+                    DEFAULT_COMMAND_LIMIT,
+                    ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                ),
                 invocation: function("example:main"),
             }
         );
@@ -720,10 +1059,12 @@ mod tests {
             ])
             .unwrap(),
             CliCommand::Run {
-                packs: vec![PathBuf::from("pack")],
-                world_seed: 123,
-                command_limit: 12,
-                context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                options: options(
+                    &["pack"],
+                    123,
+                    12,
+                    ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                ),
                 invocation: function("example:main"),
             }
         );
@@ -743,10 +1084,12 @@ mod tests {
             ])
             .unwrap(),
             CliCommand::Run {
-                packs: vec![PathBuf::from("pack")],
-                world_seed: 123,
-                command_limit: DEFAULT_COMMAND_LIMIT,
-                context: ExecutionContext::new(Position::new(1.0, 2.0, 3.0), DEFAULT_ROTATION),
+                options: options(
+                    &["pack"],
+                    123,
+                    DEFAULT_COMMAND_LIMIT,
+                    ExecutionContext::new(Position::new(1.0, 2.0, 3.0), DEFAULT_ROTATION),
+                ),
                 invocation: function("example:main"),
             }
         );
@@ -765,10 +1108,12 @@ mod tests {
             ])
             .unwrap(),
             CliCommand::Run {
-                packs: vec![PathBuf::from("pack")],
-                world_seed: 123,
-                command_limit: DEFAULT_COMMAND_LIMIT,
-                context: ExecutionContext::new(DEFAULT_POSITION, Rotation::new(90.0, -45.0)),
+                options: options(
+                    &["pack"],
+                    123,
+                    DEFAULT_COMMAND_LIMIT,
+                    ExecutionContext::new(DEFAULT_POSITION, Rotation::new(90.0, -45.0)),
+                ),
                 invocation: function("example:main"),
             }
         );
@@ -792,6 +1137,8 @@ mod tests {
             &["run", "--world-seed", "1", "function", "example:main"],
             &["run", "--command-limit", "1", "function", "example:main"],
             &["run", "--pack", ""],
+            &["repl"],
+            &["repl", "--pack", "pack"],
         ] {
             assert!(parse(arguments).is_err(), "accepted {arguments:?}");
         }
@@ -812,10 +1159,12 @@ mod tests {
                 ])
                 .unwrap(),
                 CliCommand::Run {
-                    packs: vec![PathBuf::from("pack")],
-                    world_seed: value,
-                    command_limit: DEFAULT_COMMAND_LIMIT,
-                    context: ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                    options: options(
+                        &["pack"],
+                        value,
+                        DEFAULT_COMMAND_LIMIT,
+                        ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                    ),
                     invocation: function("example:main"),
                 }
             );
@@ -1169,9 +1518,76 @@ mod tests {
                 "example:main",
                 "extra",
             ],
+            &["repl", "--pack", "pack", "--world-seed", "0", "--unknown"],
         ] {
             assert!(parse(arguments).is_err(), "accepted {arguments:?}");
         }
+    }
+
+    #[test]
+    fn removes_only_lf_and_crlf_line_endings() {
+        for (input, expected) in [
+            ("command\n", "command"),
+            ("command\r\n", "command"),
+            ("command\r", "command\r"),
+            (" command \n", " command "),
+            ("", ""),
+        ] {
+            let mut line = input.to_owned();
+            remove_line_ending(&mut line);
+            assert_eq!(line, expected);
+        }
+    }
+
+    #[test]
+    fn interactive_repl_prompts_on_stderr_before_each_input_line() {
+        let mut vm = Vm::from_packs(
+            [Pack::memory(std::iter::empty::<worldless::MemoryResource>())],
+            0,
+        )
+        .unwrap();
+        let mut input = io::Cursor::new(b"\n:quit\n");
+        let mut output = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        assert!(
+            !repl(
+                &mut vm,
+                ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                DEFAULT_COMMAND_LIMIT,
+                &mut input,
+                &mut output,
+                &mut diagnostics,
+                true,
+            )
+            .unwrap()
+        );
+        assert!(output.is_empty());
+        assert_eq!(diagnostics, b"worldless> worldless> ");
+    }
+
+    #[test]
+    fn feedback_text_rendering_preserves_event_boundaries_and_utf16() {
+        let mut output = Vec::new();
+        write_escaped_utf16(
+            &mut output,
+            &[
+                b'a' as u16,
+                b'"' as u16,
+                b'\\' as u16,
+                b'\n' as u16,
+                0x0001,
+                0x2028,
+                0xd83d,
+                0xde00,
+                0xd800,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "a\\\"\\\\\\n\\u{1}\\u{2028}\u{1f600}\\u{d800}"
+        );
     }
 
     #[cfg(unix)]

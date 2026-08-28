@@ -47,6 +47,14 @@ pub(crate) struct FunctionBuilder {
     parameters: Vec<JavaString>,
 }
 
+#[derive(Debug)]
+pub(crate) enum FunctionInstantiationError {
+    MissingArguments,
+    MissingArgument(JavaString),
+    Parse { command: JavaString, reason: String },
+    Other(String),
+}
+
 impl FunctionBuilder {
     pub(crate) fn new() -> Self {
         Self {
@@ -109,18 +117,20 @@ impl MacroFunction {
         &self,
         arguments: Option<&CompoundTag>,
         mut compile: impl FnMut(Vec<u16>) -> Result<Instruction, String>,
-    ) -> Result<Arc<[Instruction]>, String> {
-        let arguments = arguments.ok_or_else(|| "macro function requires arguments".to_owned())?;
+    ) -> Result<Arc<[Instruction]>, FunctionInstantiationError> {
+        let arguments = arguments.ok_or(FunctionInstantiationError::MissingArguments)?;
         let values = self
             .parameters
             .iter()
-            .map(|parameter| -> Result<JavaString, String> {
-                let value = arguments.get(parameter).ok_or_else(|| {
-                    format!("missing macro argument `{}`", parameter.to_string_lossy())
-                })?;
-                Ok(value.macro_stringify())
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+            .map(
+                |parameter| -> Result<JavaString, FunctionInstantiationError> {
+                    let value = arguments.get(parameter).ok_or_else(|| {
+                        FunctionInstantiationError::MissingArgument(parameter.clone())
+                    })?;
+                    Ok(value.macro_stringify())
+                },
+            )
+            .collect::<Result<Vec<_>, FunctionInstantiationError>>()?;
 
         {
             let mut cache = self
@@ -150,7 +160,13 @@ impl MacroFunction {
                         .iter()
                         .map(|&index| &values[index])
                         .collect::<Vec<_>>();
-                    compile(template.substitute(&substitutions)?)
+                    let command = template
+                        .substitute(&substitutions)
+                        .map_err(FunctionInstantiationError::Other)?;
+                    compile(command.clone()).map_err(|reason| FunctionInstantiationError::Parse {
+                        command: JavaString::from_units(command),
+                        reason,
+                    })
                 }
             })
             .collect::<Result<Vec<_>, _>>()

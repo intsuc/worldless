@@ -46,7 +46,7 @@ fn returned(value: i32) -> ExecutionOutcome {
 }
 
 fn execute(vm: &mut Vm, id: &str, initial: ExecutionContext) -> ExecutionOutcome {
-    vm.execute_function(id, None, initial, LIMIT).unwrap()
+    vm.execute_function(id, None, initial, LIMIT, drop).unwrap()
 }
 
 #[test]
@@ -318,19 +318,19 @@ fn context_redirects_consume_quota_even_when_the_chain_is_inactive() {
     let initial = context(1.0, 2.0, 3.0, 4.0, 5.0);
 
     assert_eq!(
-        vm.execute_function("example:all_transforms", None, initial, 6),
+        vm.execute_function("example:all_transforms", None, initial, 6, drop),
         Err(ExecutionError::CommandLimitExceeded { limit: 6 })
     );
     assert_eq!(
-        vm.execute_function("example:all_transforms", None, initial, 7),
+        vm.execute_function("example:all_transforms", None, initial, 7, drop),
         Ok(returned(61))
     );
     assert_eq!(
-        vm.execute_function("example:inactive", None, initial, 4),
+        vm.execute_function("example:inactive", None, initial, 4, drop),
         Err(ExecutionError::CommandLimitExceeded { limit: 4 })
     );
     assert_eq!(
-        vm.execute_function("example:inactive", None, initial, 5),
+        vm.execute_function("example:inactive", None, initial, 5, drop),
         Ok(ExecutionOutcome::Result {
             success: false,
             value: 0,

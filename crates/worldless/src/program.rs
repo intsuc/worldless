@@ -357,6 +357,7 @@ pub(crate) struct ObjectiveId(u64);
 #[derive(Debug, Default)]
 pub(crate) struct Scoreboard {
     objectives: HashMap<String, ObjectiveId>,
+    objective_names: HashMap<ObjectiveId, String>,
     holders: BTreeMap<JavaString, HashMap<ObjectiveId, i32>>,
     next_objective_id: u64,
 }
@@ -382,11 +383,22 @@ impl Scoreboard {
         let id = ObjectiveId(self.next_objective_id);
         self.next_objective_id = next_objective_id;
         self.objectives.insert(objective.to_owned(), id);
+        self.objective_names.insert(id, objective.to_owned());
         Some(self.list_objectives())
     }
 
     pub(crate) fn list_objectives(&self) -> i32 {
         scoreboard_count(self.objectives.len(), "objectives")
+    }
+
+    pub(crate) fn objective_names(&self) -> Vec<&str> {
+        let mut names = self
+            .objectives
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
     }
 
     pub(crate) fn remove_objective(&mut self, objective: &str) -> Option<i32> {
@@ -401,11 +413,36 @@ impl Scoreboard {
         scoreboard_count(self.holders.len(), "score holders")
     }
 
-    pub(crate) fn list_player_scores(&self, holder: &JavaString) -> i32 {
-        scoreboard_count(
-            self.holders.get(holder).map_or(0, HashMap::len),
-            "scores for one holder",
-        )
+    pub(crate) fn holder_names(&self) -> impl Iterator<Item = &JavaString> {
+        self.holders.keys()
+    }
+
+    pub(crate) fn player_score_count(&self, holder: &JavaString) -> i32 {
+        let count = self.holders.get(holder).map_or(0, HashMap::len);
+        scoreboard_count(count, "scores for one holder")
+    }
+
+    pub(crate) fn player_scores(&self, holder: &JavaString) -> Vec<(&str, i32)> {
+        let Some(scores) = self.holders.get(holder) else {
+            return Vec::new();
+        };
+        let mut entries = scores
+            .iter()
+            .filter_map(|(id, value)| {
+                self.objective_names
+                    .get(id)
+                    .map(|name| (name.as_str(), *id, *value))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|(left_name, left_id, _), (right_name, right_id, _)| {
+            left_name
+                .cmp(right_name)
+                .then_with(|| left_id.0.cmp(&right_id.0))
+        });
+        entries
+            .into_iter()
+            .map(|(name, _, value)| (name, value))
+            .collect()
     }
 
     pub(crate) fn resolve_holders(&self, holders: &ScoreHolderSet) -> Option<Vec<JavaString>> {

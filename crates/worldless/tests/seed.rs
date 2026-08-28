@@ -34,7 +34,7 @@ fn seed_returns_the_java_narrowing_conversion_of_the_configured_seed() {
     ] {
         let mut vm = load(seed, &[]).unwrap();
         assert_eq!(
-            vm.execute_command("seed", context(), LIMIT).unwrap(),
+            vm.execute_command("seed", context(), LIMIT, drop).unwrap(),
             returned(seed as i32),
             "seed {seed}"
         );
@@ -65,22 +65,22 @@ fn seed_participates_in_return_and_store_result_flow() {
     .unwrap();
 
     assert_eq!(
-        vm.execute_function("example:return_seed", None, context(), LIMIT)
+        vm.execute_function("example:return_seed", None, context(), LIMIT, drop)
             .unwrap(),
         returned(seed as i32)
     );
     assert_eq!(
-        vm.execute_function("example:store_seed", None, context(), LIMIT)
+        vm.execute_function("example:store_seed", None, context(), LIMIT, drop)
             .unwrap(),
         ExecutionOutcome::NoResult
     );
     assert_eq!(
-        vm.execute_function("example:read_result", None, context(), LIMIT)
+        vm.execute_function("example:read_result", None, context(), LIMIT, drop)
             .unwrap(),
         returned(seed as i32)
     );
     assert_eq!(
-        vm.execute_function("example:read_success", None, context(), LIMIT)
+        vm.execute_function("example:read_success", None, context(), LIMIT, drop)
             .unwrap(),
         returned(1)
     );
@@ -91,11 +91,11 @@ fn seed_is_counted_as_an_ordinary_command() {
     let mut vm = load(42, &[]).unwrap();
 
     assert_eq!(
-        vm.execute_command("seed", context(), 1),
+        vm.execute_command("seed", context(), 1, drop),
         Err(ExecutionError::CommandLimitExceeded { limit: 1 })
     );
     assert_eq!(
-        vm.execute_command("seed", context(), 2).unwrap(),
+        vm.execute_command("seed", context(), 2, drop).unwrap(),
         returned(42)
     );
 }
@@ -105,7 +105,9 @@ fn observing_the_seed_does_not_consume_random_state() {
     let mut observed = load(-8_765_432_101, &[]).unwrap();
     let mut control = load(-8_765_432_101, &[]).unwrap();
 
-    observed.execute_command("seed", context(), LIMIT).unwrap();
+    observed
+        .execute_command("seed", context(), LIMIT, drop)
+        .unwrap();
     for command in [
         "random value 0..100",
         "random value 0..100 example:sequence",
@@ -113,8 +115,12 @@ fn observing_the_seed_does_not_consume_random_state() {
         "random value 0..100 example:sequence",
     ] {
         assert_eq!(
-            observed.execute_command(command, context(), LIMIT).unwrap(),
-            control.execute_command(command, context(), LIMIT).unwrap()
+            observed
+                .execute_command(command, context(), LIMIT, drop)
+                .unwrap(),
+            control
+                .execute_command(command, context(), LIMIT, drop)
+                .unwrap()
         );
     }
 }

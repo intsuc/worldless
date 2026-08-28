@@ -50,22 +50,22 @@ fn execute_function_accepts_plain_and_macro_arguments_without_defaulting_absence
     let empty = FunctionArguments::from_snbt("{}").unwrap();
 
     assert_eq!(
-        vm.execute_function("example:plain", Some(&unused), context(), LIMIT)
+        vm.execute_function("example:plain", Some(&unused), context(), LIMIT, drop)
             .unwrap(),
         result(true, 3)
     );
     assert_eq!(
-        vm.execute_function("example:macro", Some(&value), context(), LIMIT)
+        vm.execute_function("example:macro", Some(&value), context(), LIMIT, drop)
             .unwrap(),
         result(true, 7)
     );
     assert_eq!(
-        vm.execute_function("example:macro", None, context(), LIMIT)
+        vm.execute_function("example:macro", None, context(), LIMIT, drop)
             .unwrap(),
         result(false, 0)
     );
     assert_eq!(
-        vm.execute_function("example:macro", Some(&empty), context(), LIMIT)
+        vm.execute_function("example:macro", Some(&empty), context(), LIMIT, drop)
             .unwrap(),
         result(false, 0)
     );
@@ -76,7 +76,7 @@ fn invalid_function_references_are_rejected_before_execution() {
     let mut vm = compile(&[("example:plain", "return 3\n")], &[]);
 
     assert_eq!(
-        vm.execute_function("Example:plain", None, context(), LIMIT),
+        vm.execute_function("Example:plain", None, context(), LIMIT, drop),
         Err(ExecutionError::InvalidFunctionReference {
             input: "Example:plain".to_owned(),
         })
@@ -106,18 +106,18 @@ fn execute_function_tags_use_function_command_results() {
     );
 
     assert_eq!(
-        vm.execute_function("#example:wrapping", None, context(), LIMIT)
+        vm.execute_function("#example:wrapping", None, context(), LIMIT, drop)
             .unwrap(),
         result(true, i32::MIN)
     );
     assert_eq!(
-        vm.execute_function("#example:fallthrough", None, context(), LIMIT)
+        vm.execute_function("#example:fallthrough", None, context(), LIMIT, drop)
             .unwrap(),
         ExecutionOutcome::NoResult
     );
     for reference in ["example:missing", "#example:missing", "#example:empty"] {
         assert_eq!(
-            vm.execute_function(reference, None, context(), LIMIT)
+            vm.execute_function(reference, None, context(), LIMIT, drop)
                 .unwrap(),
             result(false, 0),
             "{reference}"
@@ -160,27 +160,38 @@ fn tag_macros_share_arguments_and_instantiation_failure_keeps_only_the_prefix() 
     let incomplete = FunctionArguments::from_snbt("{other:1}").unwrap();
 
     assert_eq!(
-        vm.execute_function("#example:shared", Some(&shared), context(), LIMIT)
+        vm.execute_function("#example:shared", Some(&shared), context(), LIMIT, drop)
             .unwrap(),
         result(true, 12)
     );
     assert_eq!(
-        vm.execute_function("example:setup", None, context(), LIMIT)
+        vm.execute_function("example:setup", None, context(), LIMIT, drop)
             .unwrap(),
         ExecutionOutcome::NoResult
     );
     assert_eq!(
-        vm.execute_function("#example:failing", Some(&incomplete), context(), LIMIT)
-            .unwrap(),
+        vm.execute_function(
+            "#example:failing",
+            Some(&incomplete),
+            context(),
+            LIMIT,
+            drop
+        )
+        .unwrap(),
         result(false, 0)
     );
     assert_eq!(
-        vm.execute_command("scoreboard players get #prefix state", context(), LIMIT)
-            .unwrap(),
+        vm.execute_command(
+            "scoreboard players get #prefix state",
+            context(),
+            LIMIT,
+            drop
+        )
+        .unwrap(),
         result(true, 1)
     );
     assert_eq!(
-        vm.execute_command("scoreboard players get #late state", context(), LIMIT)
+        vm.execute_command("scoreboard players get #late state", context(), LIMIT, drop)
             .unwrap(),
         result(true, 0)
     );
@@ -202,13 +213,18 @@ fn execute_command_reports_results_and_no_result_for_each_entry_kind() {
     );
 
     assert_eq!(
-        vm.execute_command("scoreboard objectives list", context(), LIMIT)
+        vm.execute_command("scoreboard objectives list", context(), LIMIT, drop)
             .unwrap(),
         result(true, 0)
     );
     assert_eq!(
-        vm.execute_command("scoreboard players get #missing values", context(), LIMIT)
-            .unwrap(),
+        vm.execute_command(
+            "scoreboard players get #missing values",
+            context(),
+            LIMIT,
+            drop
+        )
+        .unwrap(),
         result(false, 0)
     );
     assert_eq!(
@@ -216,6 +232,7 @@ fn execute_command_reports_results_and_no_result_for_each_entry_kind() {
             "execute if score #missing values matches 1 run return 9",
             context(),
             LIMIT,
+            drop
         )
         .unwrap(),
         ExecutionOutcome::NoResult
@@ -225,30 +242,33 @@ fn execute_command_reports_results_and_no_result_for_each_entry_kind() {
             "return run execute if score #missing values matches 1 run return 9",
             context(),
             LIMIT,
+            drop
         )
         .unwrap(),
         result(false, 0)
     );
     assert_eq!(
-        vm.execute_command("return 7", context(), LIMIT).unwrap(),
+        vm.execute_command("return 7", context(), LIMIT, drop)
+            .unwrap(),
         result(true, 7)
     );
     assert_eq!(
-        vm.execute_command("/return 8", context(), LIMIT).unwrap(),
+        vm.execute_command("/return 8", context(), LIMIT, drop)
+            .unwrap(),
         result(true, 8)
     );
     assert_eq!(
-        vm.execute_command("function example:plain", context(), LIMIT)
+        vm.execute_command("function example:plain", context(), LIMIT, drop)
             .unwrap(),
         result(true, 4)
     );
     assert_eq!(
-        vm.execute_command("function #example:both", context(), LIMIT)
+        vm.execute_command("function #example:both", context(), LIMIT, drop)
             .unwrap(),
         result(true, 3)
     );
     assert_eq!(
-        vm.execute_command("function example:macro {value:11}", context(), LIMIT)
+        vm.execute_command("function example:macro {value:11}", context(), LIMIT, drop)
             .unwrap(),
         result(true, 11)
     );
@@ -264,12 +284,17 @@ fn invalid_and_unsupported_commands_are_rejected_before_side_effects() {
         let mut vm = compile(&[], &[]);
 
         assert!(
-            vm.execute_command(invalid, context(), LIMIT).is_err(),
+            vm.execute_command(invalid, context(), LIMIT, drop).is_err(),
             "accepted {invalid:?}"
         );
         assert_eq!(
-            vm.execute_command("scoreboard objectives add marker dummy", context(), LIMIT)
-                .unwrap(),
+            vm.execute_command(
+                "scoreboard objectives add marker dummy",
+                context(),
+                LIMIT,
+                drop
+            )
+            .unwrap(),
             result(true, 1),
             "{invalid:?} changed state before failing"
         );
@@ -281,7 +306,7 @@ fn direct_command_quota_does_not_include_a_synthetic_function_call() {
     let mut vm = compile(&[], &[]);
 
     assert_eq!(
-        vm.execute_command("scoreboard objectives list", context(), 2)
+        vm.execute_command("scoreboard objectives list", context(), 2, drop)
             .unwrap(),
         result(true, 0)
     );

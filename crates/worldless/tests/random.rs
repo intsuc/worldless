@@ -29,7 +29,7 @@ fn load(
 }
 
 fn execute(vm: &mut Vm, id: &str) -> Result<ExecutionOutcome, ExecutionError> {
-    vm.execute_function(id, None, context(), LIMIT)
+    vm.execute_function(id, None, context(), LIMIT, drop)
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn excluding_the_sequence_id_gives_equal_independent_streams() {
 }
 
 #[test]
-fn invalid_runtime_ranges_do_not_report_or_consume_a_result() {
+fn invalid_runtime_ranges_report_failure_without_consuming_randomness() {
     let mut vm = load(
         &[
             (
@@ -175,10 +175,13 @@ fn invalid_runtime_ranges_do_not_report_or_consume_a_result() {
         execute(&mut vm, "example:setup").unwrap(),
         ExecutionOutcome::NoResult
     );
-    assert_eq!(execute(&mut vm, "example:store").unwrap(), returned(9));
+    assert_eq!(execute(&mut vm, "example:store").unwrap(), returned(0));
     assert_eq!(
         execute(&mut vm, "example:return_run").unwrap(),
-        ExecutionOutcome::NoResult
+        ExecutionOutcome::Result {
+            success: false,
+            value: 0,
+        }
     );
     assert_eq!(
         execute(&mut vm, "example:widest_accepted").unwrap(),

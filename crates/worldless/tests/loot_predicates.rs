@@ -101,7 +101,7 @@ fn returned(success: bool, value: i32) -> ExecutionOutcome {
 
 fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
     assert_eq!(
-        vm.execute_function(function, None, context(), LIMIT)
+        vm.execute_function(function, None, context(), LIMIT, drop)
             .unwrap(),
         expected,
         "{function}"
@@ -535,7 +535,7 @@ fn missing_required_context_is_an_evaluation_error_and_respects_short_circuiting
         "example:active_false",
         "example:inverted",
     ] {
-        match vm.execute_function(function, None, context(), LIMIT) {
+        match vm.execute_function(function, None, context(), LIMIT, drop) {
             Err(ExecutionError::PredicateEvaluationFailed { reason }) => {
                 assert!(reason.contains("enchantment_active"), "{reason}");
             }
@@ -649,7 +649,7 @@ fn uniform_after(predicate: &str, predicate_tags: &[(&str, &str)]) -> i32 {
         predicate_tags,
     );
     match vm
-        .execute_function("example:main", None, context(), LIMIT)
+        .execute_function("example:main", None, context(), LIMIT, drop)
         .unwrap()
     {
         ExecutionOutcome::Result {

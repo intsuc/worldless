@@ -1,7 +1,8 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -74,6 +75,18 @@ fn worldless(arguments: &[&std::ffi::OsStr]) -> Output {
         .unwrap()
 }
 
+fn worldless_with_stdin(arguments: &[&std::ffi::OsStr], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_worldless"))
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
@@ -140,17 +153,34 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
 
     let output = run("example:returned");
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "result success=false value=0\n");
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "feedback kind=success text=\"Running function example:returned\"\n",
+            "feedback kind=success text=\"Function example:returned returned 0\"\n",
+            "result success=false value=0\n",
+        )
+    );
     assert!(output.stderr.is_empty());
 
     let output = run("example:value");
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "result success=true value=42\n");
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "feedback kind=success text=\"Running function example:value\"\n",
+            "feedback kind=success text=\"Function example:value returned 42\"\n",
+            "result success=true value=42\n",
+        )
+    );
     assert!(output.stderr.is_empty());
 
     let output = run("example:fell_through");
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "no-result\n");
+    assert_eq!(
+        text(&output.stdout),
+        "feedback kind=success text=\"Running function example:fell_through\"\nno-result\n"
+    );
     assert!(output.stderr.is_empty());
 
     let output = worldless(&[
@@ -165,12 +195,26 @@ fn run_reports_each_function_outcome_and_uses_later_packs_as_higher_priority() {
         "example:default_context".as_ref(),
     ]);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "result success=true value=1\n");
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "feedback kind=success text=\"Running function example:default_context\"\n",
+            "feedback kind=success text=\"Function example:default_context returned 1\"\n",
+            "result success=true value=1\n",
+        )
+    );
     assert!(output.stderr.is_empty());
 
     let output = run("example:context");
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "result success=true value=1\n");
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "feedback kind=success text=\"Running function example:context\"\n",
+            "feedback kind=success text=\"Function example:context returned 1\"\n",
+            "result success=true value=1\n",
+        )
+    );
     assert!(output.stderr.is_empty());
 }
 
@@ -204,17 +248,53 @@ fn run_executes_macro_arguments_function_tags_and_one_raw_command() {
         "example:macro".as_ref(),
     ]);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "result success=true value=9\n");
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "feedback kind=success text=\"Running function example:macro\"\n",
+            "feedback kind=success text=\"Function example:macro returned 9\"\n",
+            "result success=true value=9\n",
+        )
+    );
     assert!(output.stderr.is_empty());
 
     let output = run(&["tag".as_ref(), "example:both".as_ref()]);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "result success=true value=3\n");
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "feedback kind=success text=\"Running functions example:one, example:two\"\n",
+            "feedback kind=success text=\"Function example:one returned 1\"\n",
+            "feedback kind=success text=\"Function example:two returned 2\"\n",
+            "result success=true value=3\n",
+        )
+    );
     assert!(output.stderr.is_empty());
 
     let output = run(&["command".as_ref(), "return 7".as_ref()]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(text(&output.stdout), "result success=true value=7\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn run_renders_feedback_before_the_command_outcome() {
+    let pack = TestPack::new();
+    let output = worldless(&[
+        "run".as_ref(),
+        "--pack".as_ref(),
+        pack.root().as_os_str(),
+        "--world-seed".as_ref(),
+        "42".as_ref(),
+        "command".as_ref(),
+        "seed".as_ref(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        text(&output.stdout),
+        "feedback kind=success text=\"Seed: [42]\"\nresult success=true value=42\n"
+    );
     assert!(output.stderr.is_empty());
 }
 
@@ -255,8 +335,191 @@ fn check_is_seedless_and_run_requires_a_seed_for_named_random_sequences() {
         "example:random".as_ref(),
     ]);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout), "result success=true value=78\n");
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "feedback kind=success text=\"Running function example:random\"\n",
+            "feedback kind=success text=\"Function example:random returned 78\"\n",
+            "result success=true value=78\n",
+        )
+    );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn repl_keeps_vm_state_and_resets_the_invocation_budget_for_each_line() {
+    let pack = TestPack::new();
+    let output = worldless_with_stdin(
+        &[
+            "repl".as_ref(),
+            "--pack".as_ref(),
+            pack.root().as_os_str(),
+            "--world-seed".as_ref(),
+            "0".as_ref(),
+            "--command-limit".as_ref(),
+            "2".as_ref(),
+        ],
+        b"scoreboard objectives add values dummy\nscoreboard players set #counter values 1\nscoreboard players add #counter values 2\nscoreboard players get #counter values\n:quit\nreturn 99\n",
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "feedback kind=success text=\"Created new objective [values]\"\n",
+            "result success=true value=1\n",
+            "feedback kind=success text=\"Set [values] for #counter to 1\"\n",
+            "result success=true value=1\n",
+            "feedback kind=success text=\"Added 2 to [values] for #counter (now 3)\"\n",
+            "result success=true value=3\n",
+            "feedback kind=success text=\"#counter has 3 [values]\"\n",
+            "result success=true value=3\n",
+        )
+    );
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+}
+
+#[test]
+fn repl_writes_success_and_failure_feedback_to_stdout_in_execution_order() {
+    let pack = TestPack::new();
+    let output = worldless_with_stdin(
+        &[
+            "repl".as_ref(),
+            "--pack".as_ref(),
+            pack.root().as_os_str(),
+            "--world-seed".as_ref(),
+            "0".as_ref(),
+        ],
+        b"scoreboard objectives add values dummy\nscoreboard objectives add values dummy\n:quit\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "feedback kind=success text=\"Created new objective [values]\"\n",
+            "result success=true value=1\n",
+            "feedback kind=failure text=\"An objective already exists by that name\"\n",
+            "result success=false value=0\n",
+        )
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn repl_accepts_raw_macro_function_and_function_tag_commands() {
+    let pack = TestPack::new();
+    pack.write_function("example:macro", "$return $(value)\n");
+    pack.write_function("example:one", "return 1\n");
+    pack.write_function("example:two", "return 2\n");
+    pack.write_function_tag(
+        "example:both",
+        r#"{"values":["example:one","example:two"]}"#,
+    );
+    let output = worldless_with_stdin(
+        &[
+            "repl".as_ref(),
+            "--pack".as_ref(),
+            pack.root().as_os_str(),
+            "--world-seed".as_ref(),
+            "0".as_ref(),
+        ],
+        b"function example:macro {value:9}\nfunction #example:both\n:quit\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "feedback kind=success text=\"Running function example:macro\"\n",
+            "feedback kind=success text=\"Function example:macro returned 9\"\n",
+            "result success=true value=9\n",
+            "feedback kind=success text=\"Running functions example:one, example:two\"\n",
+            "feedback kind=success text=\"Function example:one returned 1\"\n",
+            "feedback kind=success text=\"Function example:two returned 2\"\n",
+            "result success=true value=3\n",
+        )
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn repl_ignores_empty_lines_resets_context_and_stops_at_eof() {
+    let pack = TestPack::new();
+    pack.write_predicate(
+        "example:origin",
+        r#"{"type":"location_check","predicate":{"position":{"x":0,"y":0,"z":0}}}"#,
+    );
+    let output = worldless_with_stdin(
+        &[
+            "repl".as_ref(),
+            "--pack".as_ref(),
+            pack.root().as_os_str(),
+            "--world-seed".as_ref(),
+            "0".as_ref(),
+        ],
+        b"\r\nexecute positioned 1 2 3 run return 1\nreturn run execute if predicate example:origin",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "result success=true value=1\n",
+            "feedback kind=success text=\"Test passed\"\n",
+            "result success=true value=1\n",
+        )
+    );
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+}
+
+#[test]
+fn repl_continues_after_execution_errors_and_reports_them_at_exit() {
+    let pack = TestPack::new();
+    let output = worldless_with_stdin(
+        &[
+            "repl".as_ref(),
+            "--pack".as_ref(),
+            pack.root().as_os_str(),
+            "--world-seed".as_ref(),
+            "0".as_ref(),
+        ],
+        b"\n\r\nnot-a-worldless-command\nreturn 7\n",
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(text(&output.stdout), "result success=true value=7\n");
+    let stderr = text(&output.stderr);
+    assert!(stderr.starts_with("error: line 3: "), "{stderr}");
+    assert!(stderr.contains("command compilation failed"), "{stderr}");
+    assert!(!stderr.contains("worldless> "), "{stderr}");
+}
+
+#[test]
+fn repl_rejects_non_utf8_input_as_an_execution_failure() {
+    let pack = TestPack::new();
+    let output = worldless_with_stdin(
+        &[
+            "repl".as_ref(),
+            "--pack".as_ref(),
+            pack.root().as_os_str(),
+            "--world-seed".as_ref(),
+            "0".as_ref(),
+        ],
+        &[0xff],
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("failed to read REPL input"), "{stderr}");
+    assert!(!stderr.contains("usage: worldless"), "{stderr}");
 }
 
 #[test]
@@ -297,8 +560,34 @@ fn usage_load_and_execution_failures_have_distinct_exit_codes() {
     assert!(stderr.starts_with("error: "), "{stderr}");
     assert!(!stderr.contains("usage: worldless"), "{stderr}");
 
+    let output = worldless_with_stdin(
+        &[
+            "repl".as_ref(),
+            "--pack".as_ref(),
+            missing.as_os_str(),
+            "--world-seed".as_ref(),
+            "0".as_ref(),
+        ],
+        b"",
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(stderr.starts_with("error: "), "{stderr}");
+    assert!(!stderr.contains("usage: worldless"), "{stderr}");
+
     let pack = TestPack::new();
     pack.write_function("example:main", "return 1\n");
+
+    let output = worldless_with_stdin(
+        &["repl".as_ref(), "--pack".as_ref(), pack.root().as_os_str()],
+        b"",
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("missing required --world-seed"), "{stderr}");
+    assert!(stderr.contains("usage: worldless"), "{stderr}");
 
     let output = worldless(&[
         "run".as_ref(),

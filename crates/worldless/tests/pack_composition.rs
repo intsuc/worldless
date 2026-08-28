@@ -93,7 +93,8 @@ fn returned(value: i32) -> ExecutionOutcome {
 
 fn assert_function(vm: &mut Vm, id: &str, expected: ExecutionOutcome) {
     assert_eq!(
-        vm.execute_function(id, None, context(), LIMIT).unwrap(),
+        vm.execute_function(id, None, context(), LIMIT, drop)
+            .unwrap(),
         expected,
         "{id}"
     );
@@ -371,7 +372,7 @@ fn directory_and_memory_packs_share_the_same_priority_order() {
 fn an_empty_pack_stack_builds_an_empty_vm() {
     let mut vm = Vm::from_packs(std::iter::empty::<Pack>(), 0).unwrap();
     assert_eq!(
-        vm.execute_function("example:missing", None, context(), LIMIT)
+        vm.execute_function("example:missing", None, context(), LIMIT, drop)
             .unwrap(),
         ExecutionOutcome::Result {
             success: false,

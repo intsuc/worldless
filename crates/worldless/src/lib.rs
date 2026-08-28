@@ -27,7 +27,7 @@ mod runtime;
 pub use execution_context::{ExecutionContext, Position, Rotation};
 pub use loader::{LoadError, ResourceOrigin};
 pub use pack::{MemoryResource, Pack, ResourceKind};
-pub use runtime::{ExecutionError, ExecutionOutcome};
+pub use runtime::{CommandFeedback, ExecutionError, ExecutionOutcome, FeedbackText};
 
 use std::{error::Error, fmt};
 
@@ -110,12 +110,15 @@ impl Vm {
     /// The command limit follows Minecraft's queue limit: reaching the limit stops
     /// execution, so a completed invocation always consumes less than
     /// `command_limit`.
+    ///
+    /// `feedback` receives the invocation's [`CommandFeedback`] events.
     pub fn execute_function(
         &mut self,
         reference: &str,
         arguments: Option<&FunctionArguments>,
         context: ExecutionContext,
         command_limit: usize,
+        feedback: impl FnMut(CommandFeedback),
     ) -> Result<ExecutionOutcome, ExecutionError> {
         runtime::execute_function(
             &self.program,
@@ -126,6 +129,7 @@ impl Vm {
             arguments.map(FunctionArguments::compound),
             context,
             command_limit,
+            feedback,
         )
     }
 
@@ -133,11 +137,14 @@ impl Vm {
     ///
     /// The input may omit its leading `/` or contain exactly one. Parsing and
     /// support validation complete before the command can mutate VM state.
+    ///
+    /// `feedback` receives the invocation's [`CommandFeedback`] events.
     pub fn execute_command(
         &mut self,
         command: &str,
         context: ExecutionContext,
         command_limit: usize,
+        feedback: impl FnMut(CommandFeedback),
     ) -> Result<ExecutionOutcome, ExecutionError> {
         runtime::execute_command(
             &self.program,
@@ -147,6 +154,7 @@ impl Vm {
             command,
             context,
             command_limit,
+            feedback,
         )
     }
 

@@ -87,7 +87,7 @@ fn load_memory(resources: impl IntoIterator<Item = MemoryResource>) -> Result<Vm
 
 fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
     assert_eq!(
-        vm.execute_function(function, None, context(), LIMIT)
+        vm.execute_function(function, None, context(), LIMIT, drop)
             .unwrap(),
         expected,
         "{function}"
@@ -966,7 +966,7 @@ fn invalid_uniform_integer_range_aborts_the_execution_queue() {
     );
 
     assert!(matches!(
-        vm.execute_function("example:overflow", None, context(), LIMIT),
+        vm.execute_function("example:overflow", None, context(), LIMIT, drop),
         Err(ExecutionError::NumberProviderEvaluationFailed { reason })
             if reason.contains("bound must be positive")
     ));
