@@ -92,7 +92,12 @@ fn text(bytes: &[u8]) -> String {
 }
 
 #[test]
-fn check_loads_an_explicit_pack_stack() {
+fn check_accepts_empty_and_explicit_pack_stacks() {
+    let output = worldless(&["check".as_ref()]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(text(&output.stdout), "ok\n");
+    assert!(output.stderr.is_empty());
+
     let pack = TestPack::new();
     let output = worldless(&["check".as_ref(), "--pack".as_ref(), pack.root().as_os_str()]);
 
@@ -279,11 +284,8 @@ fn run_executes_macro_arguments_function_tags_and_one_raw_command() {
 
 #[test]
 fn run_renders_feedback_before_the_command_outcome() {
-    let pack = TestPack::new();
     let output = worldless(&[
         "run".as_ref(),
-        "--pack".as_ref(),
-        pack.root().as_os_str(),
         "--world-seed".as_ref(),
         "42".as_ref(),
         "command".as_ref(),
@@ -347,13 +349,10 @@ fn check_is_seedless_and_run_requires_a_seed_for_named_random_sequences() {
 }
 
 #[test]
-fn repl_keeps_vm_state_and_resets_the_invocation_budget_for_each_line() {
-    let pack = TestPack::new();
+fn repl_without_packs_keeps_vm_state_and_resets_each_invocation_budget() {
     let output = worldless_with_stdin(
         &[
             "repl".as_ref(),
-            "--pack".as_ref(),
-            pack.root().as_os_str(),
             "--world-seed".as_ref(),
             "0".as_ref(),
             "--command-limit".as_ref(),

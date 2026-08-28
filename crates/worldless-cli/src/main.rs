@@ -11,7 +11,7 @@ use worldless::{
     Rotation, Vm, validate_packs,
 };
 
-const USAGE: &str = "usage: worldless check --pack <DIR> [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] function [--arguments <COMPOUND_SNBT>] <FUNCTION_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] tag [--arguments <COMPOUND_SNBT>] <TAG_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] command <COMMAND>\n       worldless repl --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>]";
+const USAGE: &str = "usage: worldless check [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] function [--arguments <COMPOUND_SNBT>] <FUNCTION_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] tag [--arguments <COMPOUND_SNBT>] <TAG_ID>\n       worldless run [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] command <COMMAND>\n       worldless repl [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>]";
 const DEFAULT_COMMAND_LIMIT: usize = 65_536;
 const DEFAULT_POSITION: Position = Position::new(0.0, 0.0, 0.0);
 const DEFAULT_ROTATION: Rotation = Rotation::new(0.0, 0.0);
@@ -366,7 +366,6 @@ fn parse_check(mut arguments: impl Iterator<Item = OsString>) -> Result<CliComma
         }
         packs.push(parse_pack_path(arguments.next())?);
     }
-    require_pack(&packs)?;
     Ok(CliCommand::Check { packs })
 }
 
@@ -381,8 +380,10 @@ fn parse_run(arguments: impl Iterator<Item = OsString>) -> Result<CliCommand, Us
         return Err(misplaced_runtime_option(target));
     }
     let invocation = if target == "function" {
+        require_pack(&options.packs)?;
         parse_function_invocation(&mut arguments, false)?
     } else if target == "tag" {
+        require_pack(&options.packs)?;
         parse_function_invocation(&mut arguments, true)?
     } else if target == "command" {
         CliInvocation::Command(parse_command(arguments.next())?)
@@ -434,8 +435,6 @@ where
         arguments.next();
         packs.push(parse_pack_path(arguments.next())?);
     }
-    require_pack(&packs)?;
-
     if !arguments
         .peek()
         .is_some_and(|argument| argument == "--world-seed")
@@ -761,6 +760,10 @@ mod tests {
     #[test]
     fn accepts_check_and_run_and_preserves_pack_order() {
         assert_eq!(
+            parse(&["check"]).unwrap(),
+            CliCommand::Check { packs: Vec::new() }
+        );
+        assert_eq!(
             parse(&["check", "--pack", "pack"]).unwrap(),
             CliCommand::Check {
                 packs: vec![PathBuf::from("pack")]
@@ -840,6 +843,17 @@ mod tests {
             CliCommand::Repl {
                 options: options(
                     &["pack"],
+                    0,
+                    DEFAULT_COMMAND_LIMIT,
+                    ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                ),
+            }
+        );
+        assert_eq!(
+            parse(&["repl", "--world-seed", "0"]).unwrap(),
+            CliCommand::Repl {
+                options: options(
+                    &[],
                     0,
                     DEFAULT_COMMAND_LIMIT,
                     ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
@@ -938,6 +952,18 @@ mod tests {
             defaults(CliInvocation::Command(
                 "scoreboard players get #value example".to_owned()
             ))
+        );
+        assert_eq!(
+            parse(&["run", "--world-seed", "0", "command", "seed"]).unwrap(),
+            CliCommand::Run {
+                options: options(
+                    &[],
+                    0,
+                    DEFAULT_COMMAND_LIMIT,
+                    ExecutionContext::new(DEFAULT_POSITION, DEFAULT_ROTATION),
+                ),
+                invocation: CliInvocation::Command("seed".to_owned()),
+            }
         );
         assert_eq!(
             parse(&[
@@ -1127,14 +1153,14 @@ mod tests {
     }
 
     #[test]
-    fn requires_nonempty_explicit_packs() {
+    fn validates_pack_and_runtime_requirements() {
         for arguments in [
-            &["check"][..],
-            &["check", "--pack"],
+            &["check", "--pack"][..],
             &["check", "--pack", "--pack", "pack"],
             &["check", "--pack", "--unknown"],
             &["check", "--pack", ""],
             &["run", "--world-seed", "1", "function", "example:main"],
+            &["run", "--world-seed", "1", "tag", "example:main"],
             &["run", "--command-limit", "1", "function", "example:main"],
             &["run", "--pack", ""],
             &["repl"],
