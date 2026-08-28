@@ -8,7 +8,8 @@ use std::{
 };
 
 use worldless::{
-    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+    CompiledProgram, ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack,
+    ResourceKind, Vm,
 };
 
 const LIMIT: usize = 512;
@@ -82,12 +83,13 @@ fn compile_with_tags(
 }
 
 fn load_memory(resources: impl IntoIterator<Item = MemoryResource>) -> Result<Vm, LoadError> {
-    Vm::from_packs([Pack::memory(resources)], 0)
+    CompiledProgram::from_packs([Pack::memory(resources)]).map(|program| program.create_vm(0))
 }
 
 fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
     assert_eq!(
         vm.execute_function(function, None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         expected,
         "{function}"
@@ -673,7 +675,9 @@ fn directory_loader_reads_number_provider_resources_and_tags() {
         r#"{"values":["example:one","example:two"]}"#,
     );
 
-    let mut vm = Vm::from_packs([Pack::directory(pack.root())], 0).unwrap();
+    let mut vm = CompiledProgram::from_packs([Pack::directory(pack.root())])
+        .map(|program| program.create_vm(0))
+        .unwrap();
     assert_function(&mut vm, "example:main", returned(true, 3));
 }
 
@@ -693,7 +697,9 @@ fn directory_loader_applies_a_worldless_override_of_the_fast_cooking_predicate()
         "return run compute default minecraft:cooking/speed_default integer\n",
     );
 
-    let mut vm = Vm::from_packs([Pack::directory(pack.root())], 0).unwrap();
+    let mut vm = CompiledProgram::from_packs([Pack::directory(pack.root())])
+        .map(|program| program.create_vm(0))
+        .unwrap();
     assert_function(&mut vm, "example:burn_time", returned(true, 25));
     assert_function(&mut vm, "example:speed", returned(true, 2));
 }
@@ -966,7 +972,7 @@ fn invalid_uniform_integer_range_aborts_the_execution_queue() {
     );
 
     assert!(matches!(
-        vm.execute_function("example:overflow", None, context(), LIMIT, drop),
+        vm.execute_function("example:overflow", None, context(), LIMIT, drop).into_result(),
         Err(ExecutionError::NumberProviderEvaluationFailed { reason })
             if reason.contains("bound must be positive")
     ));

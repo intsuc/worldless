@@ -5,7 +5,7 @@ use worldless_brigadier::exceptions::{java_f32, java_f64};
 use crate::{
     execution_context::ExecutionContext,
     loader::CommandCompiler,
-    macro_function::{Function, FunctionInstantiationError},
+    macro_function::{Function, FunctionInstantiationError, MacroCacheState},
     nbt::{CommandStorage, CompoundTag, JavaString, NbtEditError, Tag},
     program::{
         Command, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation, DataSource,
@@ -70,6 +70,42 @@ pub enum ExecutionOutcome {
     NoResult,
     /// Execution invoked the top-level result callback.
     Result { success: bool, value: i32 },
+}
+
+/// The completion and command-quota consumption of one VM invocation.
+#[must_use = "execution reports contain the invocation result and quota consumption"]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionReport {
+    result: Result<ExecutionOutcome, ExecutionError>,
+    quota_used: usize,
+}
+
+impl ExecutionReport {
+    pub(crate) fn new(result: Result<ExecutionOutcome, ExecutionError>, quota_used: usize) -> Self {
+        Self { result, quota_used }
+    }
+
+    /// Returns the queue quota consumed by this invocation.
+    ///
+    /// A completed invocation consumes less than its supplied command limit.
+    /// A failed indivisible command chain can consume the limit or exceed it
+    /// before the VM reports [`ExecutionError::CommandLimitExceeded`].
+    pub const fn quota_used(&self) -> usize {
+        self.quota_used
+    }
+
+    /// Returns the invocation result without consuming the report.
+    pub fn result(&self) -> Result<ExecutionOutcome, &ExecutionError> {
+        match &self.result {
+            Ok(outcome) => Ok(*outcome),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Consumes the report and returns the invocation result.
+    pub fn into_result(self) -> Result<ExecutionOutcome, ExecutionError> {
+        self.result
+    }
 }
 
 /// An error that prevents a VM invocation from completing.
@@ -458,6 +494,7 @@ impl CommandQuota {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_function(
     program: &Program,
+    macro_cache: &mut MacroCacheState,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
@@ -467,12 +504,15 @@ pub(crate) fn execute_function(
     context: ExecutionContext,
     command_limit: usize,
     feedback: impl FnMut(CommandFeedback),
-) -> Result<ExecutionOutcome, ExecutionError> {
-    let reference = FunctionReference::parse(input).ok_or_else(|| {
-        ExecutionError::InvalidFunctionReference {
-            input: input.to_owned(),
-        }
-    })?;
+) -> ExecutionReport {
+    let Some(reference) = FunctionReference::parse(input) else {
+        return ExecutionReport::new(
+            Err(ExecutionError::InvalidFunctionReference {
+                input: input.to_owned(),
+            }),
+            0,
+        );
+    };
     let instruction = Instruction {
         modifiers: Vec::new(),
         command: Command::Function {
@@ -482,6 +522,7 @@ pub(crate) fn execute_function(
     };
     execute_instruction(
         program,
+        macro_cache,
         scoreboard,
         command_storage,
         random,
@@ -497,6 +538,7 @@ pub(crate) fn execute_function(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_command(
     program: &Program,
+    macro_cache: &mut MacroCacheState,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
@@ -505,14 +547,21 @@ pub(crate) fn execute_command(
     context: ExecutionContext,
     command_limit: usize,
     feedback: impl FnMut(CommandFeedback),
-) -> Result<ExecutionOutcome, ExecutionError> {
+) -> ExecutionReport {
     let command = input.strip_prefix('/').unwrap_or(input);
     let compiler = CommandCompiler::with_loot_registry(Arc::clone(program.loot_registry()));
-    let instruction = compiler
-        .compile(command)
-        .map_err(|reason| ExecutionError::CommandCompilationFailed { reason })?;
+    let instruction = match compiler.compile(command) {
+        Ok(instruction) => instruction,
+        Err(reason) => {
+            return ExecutionReport::new(
+                Err(ExecutionError::CommandCompilationFailed { reason }),
+                0,
+            );
+        }
+    };
     execute_instruction(
         program,
+        macro_cache,
         scoreboard,
         command_storage,
         random,
@@ -528,6 +577,7 @@ pub(crate) fn execute_command(
 #[allow(clippy::too_many_arguments)]
 fn execute_instruction(
     program: &Program,
+    macro_cache: &mut MacroCacheState,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
@@ -537,7 +587,7 @@ fn execute_instruction(
     context: ExecutionContext,
     command_limit: usize,
     feedback: impl FnMut(CommandFeedback),
-) -> Result<ExecutionOutcome, ExecutionError> {
+) -> ExecutionReport {
     let function = Arc::<[Instruction]>::from([instruction]);
     let queue = VecDeque::from([QueueEntry::Step(Frame {
         function,
@@ -553,6 +603,7 @@ fn execute_instruction(
 
     execute_queue(
         program,
+        macro_cache,
         scoreboard,
         command_storage,
         random,
@@ -567,6 +618,7 @@ fn execute_instruction(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_automatic_function(
     program: &Program,
+    macro_cache: &mut MacroCacheState,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
@@ -574,14 +626,20 @@ pub(crate) fn execute_automatic_function(
     id: &Identifier,
     context: ExecutionContext,
     command_limit: usize,
-) -> Result<(), ExecutionError> {
+) -> ExecutionReport {
     let function = program
         .function(id)
         .expect("a resolved function tag contains loaded functions");
     let mut compiler = None;
-    let Ok(function) = instantiate_function(function, None, &mut compiler, program.loot_registry())
-    else {
-        return Ok(());
+    let Ok(function) = instantiate_function(
+        id,
+        function,
+        macro_cache,
+        None,
+        &mut compiler,
+        program.loot_registry(),
+    ) else {
+        return ExecutionReport::new(Ok(ExecutionOutcome::NoResult), 0);
     };
     let queue = VecDeque::from([QueueEntry::Call(Frame {
         function,
@@ -597,6 +655,7 @@ pub(crate) fn execute_automatic_function(
 
     execute_queue(
         program,
+        macro_cache,
         scoreboard,
         command_storage,
         random,
@@ -606,22 +665,52 @@ pub(crate) fn execute_automatic_function(
         command_limit,
         drop,
     )
-    .map(drop)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn execute_queue(
     program: &Program,
+    macro_cache: &mut MacroCacheState,
+    scoreboard: &mut Scoreboard,
+    command_storage: &mut CommandStorage,
+    random: &mut RandomState,
+    stopwatches: &mut StopwatchState,
+    queue: VecDeque<QueueEntry>,
+    compiler: Option<CommandCompiler>,
+    command_limit: usize,
+    feedback: impl FnMut(CommandFeedback),
+) -> ExecutionReport {
+    let mut quota = CommandQuota::new(command_limit);
+    let result = execute_queue_inner(
+        program,
+        macro_cache,
+        scoreboard,
+        command_storage,
+        random,
+        stopwatches,
+        queue,
+        compiler,
+        &mut quota,
+        command_limit,
+        feedback,
+    );
+    ExecutionReport::new(result, quota.used)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_queue_inner(
+    program: &Program,
+    macro_cache: &mut MacroCacheState,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
     stopwatches: &mut StopwatchState,
     mut queue: VecDeque<QueueEntry>,
     mut compiler: Option<CommandCompiler>,
+    quota: &mut CommandQuota,
     command_limit: usize,
     mut feedback: impl FnMut(CommandFeedback),
 ) -> Result<ExecutionOutcome, ExecutionError> {
-    let mut quota = CommandQuota::new(command_limit);
     let mut top_level_result = None;
 
     loop {
@@ -826,6 +915,7 @@ fn execute_queue(
 
                             let (condition_functions, _) = instantiate_resolved_prefix(
                                 program,
+                                macro_cache,
                                 function_reference,
                                 condition_functions,
                                 None,
@@ -926,6 +1016,7 @@ fn execute_queue(
                         let command_consumer = frame.source_consumer.with_prefix(stores);
                         execute_function_command(
                             program,
+                            macro_cache,
                             scoreboard,
                             command_storage,
                             &mut compiler,
@@ -1186,6 +1277,7 @@ fn execute_queue(
 #[allow(clippy::too_many_arguments)]
 fn execute_function_command(
     program: &Program,
+    macro_cache: &mut MacroCacheState,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
     compiler: &mut Option<CommandCompiler>,
@@ -1284,8 +1376,14 @@ fn execute_function_command(
         function_scheduled_feedback(reference, &functions),
         feedback,
     );
-    let (instances, failure) =
-        instantiate_resolved_prefix(program, reference, functions, arguments.as_ref(), compiler);
+    let (instances, failure) = instantiate_resolved_prefix(
+        program,
+        macro_cache,
+        reference,
+        functions,
+        arguments.as_ref(),
+        compiler,
+    );
     if let Some((id, reason)) = failure {
         send_failure!(
             frame.silent,
@@ -1423,6 +1521,7 @@ fn tag_type_name(tag: &Tag) -> &'static str {
 
 fn instantiate_resolved_prefix(
     program: &Program,
+    macro_cache: &mut MacroCacheState,
     reference: &FunctionReference,
     functions: ResolvedFunctions<'_>,
     arguments: Option<&crate::nbt::CompoundTag>,
@@ -1434,20 +1533,22 @@ fn instantiate_resolved_prefix(
     let mut instances = Vec::new();
     match functions {
         ResolvedFunctions::Single(function) => {
-            match instantiate_function(function, arguments, compiler, program.loot_registry()) {
+            let FunctionReference::Function(id) = reference else {
+                unreachable!("a single function resolution has a function reference")
+            };
+            match instantiate_function(
+                id,
+                function,
+                macro_cache,
+                arguments,
+                compiler,
+                program.loot_registry(),
+            ) {
                 Ok(instructions) => instances.push(InstantiatedFunction {
-                    id: match reference {
-                        FunctionReference::Function(id) => id.clone(),
-                        FunctionReference::Tag(_) => {
-                            unreachable!("a single function resolution has a function reference")
-                        }
-                    },
+                    id: id.clone(),
                     instructions,
                 }),
                 Err(reason) => {
-                    let FunctionReference::Function(id) = reference else {
-                        unreachable!("a single function resolution has a function reference")
-                    };
                     return (instances, Some((id.clone(), reason)));
                 }
             }
@@ -1457,7 +1558,14 @@ fn instantiate_resolved_prefix(
                 let function = program
                     .function(id)
                     .expect("resolved function tags contain loaded functions");
-                match instantiate_function(function, arguments, compiler, program.loot_registry()) {
+                match instantiate_function(
+                    id,
+                    function,
+                    macro_cache,
+                    arguments,
+                    compiler,
+                    program.loot_registry(),
+                ) {
                     Ok(instructions) => instances.push(InstantiatedFunction {
                         id: id.clone(),
                         instructions,
@@ -2847,14 +2955,16 @@ fn discard_at_depth_or_higher(queue: &mut VecDeque<QueueEntry>, depth: usize) {
 }
 
 fn instantiate_function(
+    id: &Identifier,
     function: &Function,
+    macro_cache: &mut MacroCacheState,
     arguments: Option<&crate::nbt::CompoundTag>,
     compiler: &mut Option<CommandCompiler>,
     loot_registry: &Arc<crate::number_provider::LootRegistry>,
 ) -> Result<Arc<[Instruction]>, FunctionInstantiationError> {
     match function {
         Function::Plain(instructions) => Ok(Arc::clone(instructions)),
-        Function::Macro(function) => function.instantiate(arguments, |command| {
+        Function::Macro(function) => function.instantiate(id, macro_cache, arguments, |command| {
             compiler
                 .get_or_insert_with(|| {
                     CommandCompiler::with_loot_registry(Arc::clone(loot_registry))

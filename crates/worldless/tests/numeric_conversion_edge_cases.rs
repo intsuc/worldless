@@ -1,7 +1,7 @@
 mod common;
 
 use common::context;
-use worldless::{ExecutionOutcome, MemoryResource, Pack, ResourceKind, Vm};
+use worldless::{CompiledProgram, ExecutionOutcome, MemoryResource, Pack, ResourceKind, Vm};
 
 const LIMIT: usize = 1_024;
 
@@ -10,12 +10,12 @@ fn returned(success: bool, value: i32) -> ExecutionOutcome {
 }
 
 fn compile(functions: &[(&str, &str)]) -> Vm {
-    Vm::from_packs(
-        [Pack::memory(functions.iter().map(|(id, source)| {
-            MemoryResource::new(ResourceKind::Function, *id, *source)
-        }))],
-        0,
-    )
+    CompiledProgram::from_packs([Pack::memory(
+        functions
+            .iter()
+            .map(|(id, source)| MemoryResource::new(ResourceKind::Function, *id, *source)),
+    )])
+    .map(|program| program.create_vm(0))
     .unwrap()
 }
 
@@ -56,6 +56,7 @@ execute if score #correction edge matches 2147483647.. if score #low edge matche
 
     assert_eq!(
         vm.execute_function("example:init", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::NoResult
     );
@@ -76,18 +77,22 @@ execute if score #correction edge matches 2147483647.. if score #low edge matche
             LIMIT,
             drop,
         )
+        .into_result()
         .unwrap();
         vm.execute_function("example:split", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap();
 
         assert_eq!(
             vm.execute_command("scoreboard players get #high edge", context(), LIMIT, drop,)
+                .into_result()
                 .unwrap(),
             returned(true, (value >> 32) as i32),
             "high half of {value}",
         );
         assert_eq!(
             vm.execute_command("scoreboard players get #low edge", context(), LIMIT, drop,)
+                .into_result()
                 .unwrap(),
             returned(true, value as i32),
             "low half of {value}",

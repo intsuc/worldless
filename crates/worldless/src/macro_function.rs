@@ -1,6 +1,6 @@
 use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
+    collections::{HashMap, VecDeque},
+    sync::Arc,
 };
 
 use unicode_general_category::{GeneralCategory, get_general_category};
@@ -8,11 +8,17 @@ use unicode_general_category::{GeneralCategory, get_general_category};
 use crate::{
     nbt::{CompoundTag, JavaString},
     program::Instruction,
+    resource::Identifier,
 };
 
 pub(crate) const MAX_COMMAND_LENGTH: usize = 2_000_000;
 const MAX_CACHE_ENTRIES: usize = 8;
 type MacroCache = VecDeque<(Vec<JavaString>, Arc<[Instruction]>)>;
+
+#[derive(Debug, Default)]
+pub(crate) struct MacroCacheState {
+    functions: HashMap<Identifier, MacroCache>,
+}
 
 #[derive(Debug)]
 pub(crate) enum Function {
@@ -24,12 +30,11 @@ pub(crate) enum Function {
 pub(crate) struct MacroFunction {
     entries: Vec<MacroEntry>,
     parameters: Vec<JavaString>,
-    cache: Mutex<MacroCache>,
 }
 
 #[derive(Debug)]
 enum MacroEntry {
-    Plain(Instruction),
+    Plain(Box<Instruction>),
     Template {
         template: StringTemplate,
         parameters: Vec<usize>,
@@ -64,7 +69,7 @@ impl FunctionBuilder {
     }
 
     pub(crate) fn add_command(&mut self, instruction: Instruction) {
-        self.entries.push(MacroEntry::Plain(instruction));
+        self.entries.push(MacroEntry::Plain(Box::new(instruction)));
     }
 
     pub(crate) fn add_macro(&mut self, command: &str) -> Result<(), String> {
@@ -94,14 +99,13 @@ impl FunctionBuilder {
             Function::Macro(MacroFunction {
                 entries: self.entries,
                 parameters: self.parameters,
-                cache: Mutex::new(VecDeque::new()),
             })
         } else {
             let instructions = self
                 .entries
                 .into_iter()
                 .map(|entry| match entry {
-                    MacroEntry::Plain(instruction) => instruction,
+                    MacroEntry::Plain(instruction) => *instruction,
                     MacroEntry::Template { .. } => {
                         unreachable!("a template marks its function as a macro")
                     }
@@ -115,6 +119,8 @@ impl FunctionBuilder {
 impl MacroFunction {
     pub(crate) fn instantiate(
         &self,
+        id: &Identifier,
+        caches: &mut MacroCacheState,
         arguments: Option<&CompoundTag>,
         mut compile: impl FnMut(Vec<u16>) -> Result<Instruction, String>,
     ) -> Result<Arc<[Instruction]>, FunctionInstantiationError> {
@@ -133,10 +139,7 @@ impl MacroFunction {
             .collect::<Result<Vec<_>, FunctionInstantiationError>>()?;
 
         {
-            let mut cache = self
-                .cache
-                .lock()
-                .expect("the macro cache lock is not poisoned");
+            let cache = caches.functions.entry(id.clone()).or_default();
             if let Some(index) = cache.iter().position(|(key, _)| key == &values) {
                 let cached = cache
                     .remove(index)
@@ -151,7 +154,7 @@ impl MacroFunction {
             .entries
             .iter()
             .map(|entry| match entry {
-                MacroEntry::Plain(instruction) => Ok(instruction.clone()),
+                MacroEntry::Plain(instruction) => Ok(instruction.as_ref().clone()),
                 MacroEntry::Template {
                     template,
                     parameters,
@@ -171,10 +174,7 @@ impl MacroFunction {
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Arc::<[Instruction]>::from)?;
-        let mut cache = self
-            .cache
-            .lock()
-            .expect("the macro cache lock is not poisoned");
+        let cache = caches.functions.entry(id.clone()).or_default();
         if cache.len() == MAX_CACHE_ENTRIES {
             cache.pop_front();
         }
@@ -283,6 +283,17 @@ fn check_command_length(length: usize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program::Command;
+
+    fn return_instruction() -> Instruction {
+        Instruction {
+            modifiers: Vec::new(),
+            command: Command::Return {
+                success: true,
+                value: 1,
+            },
+        }
+    }
 
     #[test]
     fn parses_java_variable_names_and_literal_dollars() {
@@ -297,5 +308,40 @@ mod tests {
                 .is_ok_and(|(_, variables)| variables == vec![JavaString::from("")])
         );
         assert!(StringTemplate::parse("return $(𐐀)").is_err());
+    }
+
+    #[test]
+    fn macro_caches_are_owned_by_each_vm_state() {
+        let mut builder = FunctionBuilder::new();
+        builder.add_macro("$return $(value)").unwrap();
+        let Function::Macro(function) = builder.build() else {
+            panic!("a macro command builds a macro function")
+        };
+        let id = Identifier::parse("example:macro").unwrap();
+        let arguments = CompoundTag::from_snbt("{value:1}").unwrap();
+        let mut first = MacroCacheState::default();
+        let mut second = MacroCacheState::default();
+        let mut compilations = 0;
+
+        function
+            .instantiate(&id, &mut first, Some(&arguments), |_| {
+                compilations += 1;
+                Ok(return_instruction())
+            })
+            .unwrap();
+        function
+            .instantiate(&id, &mut first, Some(&arguments), |_| {
+                compilations += 1;
+                Ok(return_instruction())
+            })
+            .unwrap();
+        function
+            .instantiate(&id, &mut second, Some(&arguments), |_| {
+                compilations += 1;
+                Ok(return_instruction())
+            })
+            .unwrap();
+
+        assert_eq!(compilations, 2);
     }
 }

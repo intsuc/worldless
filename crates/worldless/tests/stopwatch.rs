@@ -2,7 +2,8 @@ mod common;
 
 use common::context;
 use worldless::{
-    CommandFeedback, ExecutionError, ExecutionOutcome, MemoryResource, Pack, ResourceKind, Vm,
+    CommandFeedback, CompiledProgram, ExecutionError, ExecutionOutcome, MemoryResource, Pack,
+    ResourceKind, Vm,
 };
 
 const LIMIT: usize = 64;
@@ -31,7 +32,9 @@ fn load(functions: &[(&str, &str)]) -> Vm {
     let resources = functions
         .iter()
         .map(|(id, source)| MemoryResource::new(ResourceKind::Function, *id, *source));
-    Vm::from_packs([Pack::memory(resources)], 0).unwrap()
+    CompiledProgram::from_packs([Pack::memory(resources)])
+        .map(|program| program.create_vm(0))
+        .unwrap()
 }
 
 fn execute(
@@ -42,7 +45,9 @@ fn execute(
     Vec<RenderedFeedback>,
 ) {
     let mut feedback = Vec::new();
-    let outcome = vm.execute_command(command, context(), LIMIT, |event| feedback.push(event));
+    let outcome = vm
+        .execute_command(command, context(), LIMIT, |event| feedback.push(event))
+        .into_result();
     (outcome, rendered(feedback))
 }
 
@@ -271,6 +276,7 @@ fn state_persists_across_invocations_and_query_can_return_zero() {
     );
     assert_eq!(
         vm.execute_function("example:query", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         returned(true, 0)
     );
@@ -284,7 +290,8 @@ fn quota_errors_do_not_roll_back_an_executed_stopwatch_command() {
     )]);
 
     assert_eq!(
-        vm.execute_function("example:create_at_limit", None, context(), 2, drop),
+        vm.execute_function("example:create_at_limit", None, context(), 2, drop)
+            .into_result(),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_eq!(

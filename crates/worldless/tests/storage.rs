@@ -2,7 +2,8 @@ mod common;
 
 use common::context;
 use worldless::{
-    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+    CompiledProgram, ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack,
+    ResourceKind, Vm,
 };
 
 const LIMIT: usize = 512;
@@ -21,17 +22,16 @@ where
     N: AsRef<str>,
     S: AsRef<str>,
 {
-    Vm::from_packs(
-        [Pack::memory(functions.into_iter().map(|(id, source)| {
-            MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
-        }))],
-        0,
-    )
+    CompiledProgram::from_packs([Pack::memory(functions.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+    }))])
+    .map(|program| program.create_vm(0))
 }
 
 fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
     assert_eq!(
         vm.execute_function(function, None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         expected,
         "{function}"
@@ -1040,21 +1040,25 @@ fn storage_side_effects_before_the_command_limit_are_not_rolled_back() {
 
     assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_eq!(
-        vm.execute_function("example:modify_at_limit", None, context(), 2, drop),
+        vm.execute_function("example:modify_at_limit", None, context(), 2, drop)
+            .into_result(),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_function(&mut vm, "example:read_modified", returned(true, 7));
     assert_eq!(
-        vm.execute_function("example:store_at_limit", None, context(), 2, drop),
+        vm.execute_function("example:store_at_limit", None, context(), 2, drop)
+            .into_result(),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_function(&mut vm, "example:read_stored", returned(true, 6));
     assert_eq!(
-        vm.execute_function("example:condition_at_limit", None, context(), 2, drop),
+        vm.execute_function("example:condition_at_limit", None, context(), 2, drop)
+            .into_result(),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_eq!(
         vm.execute_function("example:condition_at_limit", None, context(), 3, drop)
+            .into_result()
             .unwrap(),
         returned(true, 9)
     );
@@ -1065,7 +1069,8 @@ fn storage_side_effects_before_the_command_limit_are_not_rolled_back() {
             context(),
             2,
             drop
-        ),
+        )
+        .into_result(),
         Err(ExecutionError::CommandLimitExceeded { limit: 2 })
     );
     assert_eq!(
@@ -1076,6 +1081,7 @@ fn storage_side_effects_before_the_command_limit_are_not_rolled_back() {
             3,
             drop
         )
+        .into_result()
         .unwrap(),
         returned(true, 1)
     );

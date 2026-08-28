@@ -7,8 +7,8 @@ use std::{
 };
 
 use worldless::{
-    CommandFeedback, ExecutionContext, ExecutionOutcome, FunctionArguments, Pack, Position,
-    Rotation, Vm, validate_packs,
+    CommandFeedback, CompiledProgram, CompoundTag, ExecutionContext, ExecutionOutcome, Pack,
+    Position, Rotation, Vm,
 };
 
 const USAGE: &str = "usage: worldless check [--pack <DIR> ...]\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] function [--arguments <COMPOUND_SNBT>] <FUNCTION_ID>\n       worldless run --pack <DIR> [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] tag [--arguments <COMPOUND_SNBT>] <TAG_ID>\n       worldless run [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>] command <COMMAND>\n       worldless repl [--pack <DIR> ...] --world-seed <I64> [--command-limit <USIZE>] [--position <X> <Y> <Z>] [--rotation <YAW> <PITCH>]";
@@ -70,7 +70,8 @@ fn main() -> ExitCode {
 
     match command {
         CliCommand::Check { packs } => {
-            if let Err(error) = validate_packs(packs.into_iter().map(Pack::directory)) {
+            if let Err(error) = CompiledProgram::from_packs(packs.into_iter().map(Pack::directory))
+            {
                 eprintln!("error: {error}");
                 return ExitCode::from(EXIT_LOAD);
             }
@@ -85,17 +86,14 @@ fn main() -> ExitCode {
                     reference,
                     arguments,
                 } => {
-                    let arguments = match arguments
-                        .as_deref()
-                        .map(FunctionArguments::from_snbt)
-                        .transpose()
-                    {
-                        Ok(arguments) => arguments,
-                        Err(error) => {
-                            eprintln!("error: {error}");
-                            return ExitCode::from(EXIT_EXECUTION);
-                        }
-                    };
+                    let arguments =
+                        match arguments.as_deref().map(CompoundTag::from_snbt).transpose() {
+                            Ok(arguments) => arguments,
+                            Err(error) => {
+                                eprintln!("error: invalid function arguments: {}", error.reason());
+                                return ExitCode::from(EXIT_EXECUTION);
+                            }
+                        };
                     Invocation::Function {
                         reference,
                         arguments,
@@ -117,19 +115,27 @@ fn main() -> ExitCode {
                 Invocation::Function {
                     reference,
                     arguments,
-                } => vm.execute_function(
-                    &reference,
-                    arguments.as_ref(),
-                    options.context,
-                    options.command_limit,
-                    |feedback| write_feedback_or_record(&mut stdout, feedback, &mut output_error),
-                ),
-                Invocation::Command(command) => vm.execute_command(
-                    &command,
-                    options.context,
-                    options.command_limit,
-                    |feedback| write_feedback_or_record(&mut stdout, feedback, &mut output_error),
-                ),
+                } => vm
+                    .execute_function(
+                        &reference,
+                        arguments.as_ref(),
+                        options.context,
+                        options.command_limit,
+                        |feedback| {
+                            write_feedback_or_record(&mut stdout, feedback, &mut output_error)
+                        },
+                    )
+                    .into_result(),
+                Invocation::Command(command) => vm
+                    .execute_command(
+                        &command,
+                        options.context,
+                        options.command_limit,
+                        |feedback| {
+                            write_feedback_or_record(&mut stdout, feedback, &mut output_error)
+                        },
+                    )
+                    .into_result(),
             };
             if let Some(error) = output_error {
                 eprintln!("error: failed to write stdout: {error}");
@@ -196,10 +202,8 @@ fn main() -> ExitCode {
 }
 
 fn load_vm(options: &RuntimeOptions) -> Result<Vm, worldless::LoadError> {
-    Vm::from_packs(
-        options.packs.iter().map(Pack::directory),
-        options.world_seed,
-    )
+    CompiledProgram::from_packs(options.packs.iter().map(Pack::directory))
+        .map(|program| program.create_vm(options.world_seed))
 }
 
 fn repl(
@@ -240,9 +244,11 @@ fn repl(
         }
 
         let mut output_error = None;
-        let outcome = vm.execute_command(&line, context, command_limit, |feedback| {
-            write_feedback_or_record(output, feedback, &mut output_error);
-        });
+        let outcome = vm
+            .execute_command(&line, context, command_limit, |feedback| {
+                write_feedback_or_record(output, feedback, &mut output_error);
+            })
+            .into_result();
         if let Some(error) = output_error {
             return Err(contextual_io_error("write REPL output", error));
         }
@@ -337,7 +343,7 @@ fn contextual_io_error(operation: &str, error: io::Error) -> io::Error {
 enum Invocation {
     Function {
         reference: String,
-        arguments: Option<FunctionArguments>,
+        arguments: Option<CompoundTag>,
     },
     Command(String),
 }
@@ -1567,10 +1573,10 @@ mod tests {
 
     #[test]
     fn interactive_repl_prompts_on_stderr_before_each_input_line() {
-        let mut vm = Vm::from_packs(
-            [Pack::memory(std::iter::empty::<worldless::MemoryResource>())],
-            0,
-        )
+        let mut vm = CompiledProgram::from_packs([Pack::memory(std::iter::empty::<
+            worldless::MemoryResource,
+        >())])
+        .map(|program| program.create_vm(0))
         .unwrap();
         let mut input = io::Cursor::new(b"\n:quit\n");
         let mut output = Vec::new();

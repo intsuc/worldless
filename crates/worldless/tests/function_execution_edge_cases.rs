@@ -1,7 +1,9 @@
 mod common;
 
 use common::context;
-use worldless::{ExecutionError, ExecutionOutcome, MemoryResource, Pack, ResourceKind, Vm};
+use worldless::{
+    CompiledProgram, ExecutionError, ExecutionOutcome, MemoryResource, Pack, ResourceKind, Vm,
+};
 
 const LIMIT: usize = 1_024;
 
@@ -22,7 +24,9 @@ fn compile(
     let tags = tags
         .into_iter()
         .map(|(id, source)| MemoryResource::new(ResourceKind::FunctionTag, id, source));
-    Vm::from_packs([Pack::memory(functions.chain(tags))], 0).unwrap()
+    CompiledProgram::from_packs([Pack::memory(functions.chain(tags))])
+        .map(|program| program.create_vm(0))
+        .unwrap()
 }
 
 fn function(id: &str, source: &str) -> (String, String) {
@@ -57,27 +61,33 @@ fn floating_point_counter_steps_at_both_valid_boundaries() {
     );
 
     vm.execute_function("example:set_lower", None, context(), LIMIT, drop)
+        .into_result()
         .unwrap();
     assert_eq!(
         vm.execute_function("example:increment", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         returned(LOWER + 1)
     );
     assert_eq!(
         vm.execute_function("example:decrement", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         returned(LOWER)
     );
 
     vm.execute_function("example:set_below_upper", None, context(), LIMIT, drop)
+        .into_result()
         .unwrap();
     assert_eq!(
         vm.execute_function("example:increment", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         returned(UPPER)
     );
     assert_eq!(
         vm.execute_function("example:decrement", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         returned(UPPER - 1)
     );
@@ -146,29 +156,35 @@ fn deep_list_mapped_trie_keeps_distinct_signed_index_leaves() {
     let mut vm = compile(functions, []);
 
     vm.execute_function("example:setup", None, context(), LIMIT, drop)
+        .into_result()
         .unwrap();
     assert_eq!(
         vm.execute_function("example:insert_zero", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         returned(0)
     );
     assert_eq!(
         vm.execute_function("example:insert_one", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         returned(1)
     );
     assert_eq!(
         vm.execute_function("example:insert_negative_one", None, context(), LIMIT, drop,)
+            .into_result()
             .unwrap(),
         returned(i32::MAX)
     );
     assert_eq!(
         vm.execute_function("example:read_zero", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         returned(0)
     );
     assert_eq!(
         vm.execute_function("example:read_one", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         returned(1)
     );
@@ -202,13 +218,16 @@ fn recursive_first_tag_member_starves_its_tails_and_later_siblings() {
     );
 
     vm.execute_function("example:setup", None, context(), LIMIT, drop)
+        .into_result()
         .unwrap();
     assert_eq!(
-        vm.execute_function("#example:recursive_tag", None, context(), 20, drop),
+        vm.execute_function("#example:recursive_tag", None, context(), 20, drop)
+            .into_result(),
         Err(ExecutionError::CommandLimitExceeded { limit: 20 })
     );
     assert_eq!(
         vm.execute_function("example:check", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         returned(1)
     );

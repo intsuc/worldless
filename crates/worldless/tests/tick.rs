@@ -2,7 +2,8 @@ mod common;
 
 use common::context;
 use worldless::{
-    ExecutionError, ExecutionOutcome, MemoryResource, Pack, ResourceKind, TickPhase, Vm,
+    CompiledProgram, ExecutionError, ExecutionOutcome, MemoryResource, Pack, ResourceKind,
+    TickPhase, Vm,
 };
 
 const LIMIT: usize = 256;
@@ -16,7 +17,9 @@ fn function_tag(id: &str, values: &str) -> MemoryResource {
 }
 
 fn compile(resources: impl IntoIterator<Item = MemoryResource>) -> Vm {
-    Vm::from_packs([Pack::memory(resources)], 0).unwrap()
+    CompiledProgram::from_packs([Pack::memory(resources)])
+        .map(|program| program.create_vm(0))
+        .unwrap()
 }
 
 fn score(vm: &mut Vm, holder: &str) -> i32 {
@@ -30,6 +33,7 @@ fn score(vm: &mut Vm, holder: &str) -> i32 {
             LIMIT,
             drop,
         )
+        .into_result()
         .unwrap()
     else {
         panic!("score query did not return a result");
@@ -68,6 +72,7 @@ fn first_normal_tick_runs_load_before_tick_and_later_ticks_skip_load() {
 
     assert_eq!(
         vm.execute_command("scoreboard objectives list", context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: true,
@@ -123,6 +128,7 @@ fn automatic_members_have_isolated_queues_and_failures_do_not_stop_the_tick() {
         LIMIT,
         drop,
     )
+    .into_result()
     .unwrap();
 
     let first = vm.tick(context(), 3);

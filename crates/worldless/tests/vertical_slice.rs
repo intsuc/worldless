@@ -8,8 +8,8 @@ use std::{
 };
 
 use worldless::{
-    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind,
-    ResourceOrigin, Vm,
+    CompiledProgram, ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack,
+    ResourceKind, ResourceOrigin, Vm,
 };
 
 static NEXT_PACK: AtomicU64 = AtomicU64::new(0);
@@ -80,16 +80,15 @@ where
     N: AsRef<str>,
     S: AsRef<str>,
 {
-    Vm::from_packs(
-        [Pack::memory(functions.into_iter().map(|(id, source)| {
-            MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
-        }))],
-        0,
-    )
+    CompiledProgram::from_packs([Pack::memory(functions.into_iter().map(|(id, source)| {
+        MemoryResource::new(ResourceKind::Function, id.as_ref(), source.as_ref())
+    }))])
+    .map(|program| program.create_vm(0))
 }
 
 fn load_directory_pack(path: impl AsRef<Path>) -> Result<Vm, LoadError> {
-    Vm::from_packs([Pack::directory(path.as_ref())], 0)
+    CompiledProgram::from_packs([Pack::directory(path.as_ref())])
+        .map(|program| program.create_vm(0))
 }
 
 #[test]
@@ -105,6 +104,7 @@ fn executes_nested_paths_and_return_run() {
     .unwrap();
     assert_eq!(
         vm.execute_function("example:main", None, context(), 8, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: true,
@@ -122,6 +122,7 @@ fn a_normal_child_return_does_not_return_from_its_parent() {
     .unwrap();
     assert_eq!(
         vm.execute_function("example:main", None, context(), 5, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: true,
@@ -140,6 +141,7 @@ fn reports_failure_and_fallthrough_distinctly() {
     .unwrap();
     assert_eq!(
         vm.execute_function("example:failure", None, context(), 2, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: false,
@@ -148,11 +150,13 @@ fn reports_failure_and_fallthrough_distinctly() {
     );
     assert_eq!(
         vm.execute_function("example:empty", None, context(), 2, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::NoResult
     );
     assert_eq!(
         vm.execute_function("example:", None, context(), 2, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: true,
@@ -171,6 +175,7 @@ fn return_run_converts_child_fallthrough_to_failure() {
     .unwrap();
     assert_eq!(
         vm.execute_function("example:main", None, context(), 4, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: false,
@@ -184,7 +189,8 @@ fn enforces_the_minecraft_queue_limit_without_rust_recursion() {
     let mut vm = load_functions([("example:loop", "function example:loop\n")]).unwrap();
 
     assert_eq!(
-        vm.execute_function("example:loop", None, context(), 10, drop),
+        vm.execute_function("example:loop", None, context(), 10, drop)
+            .into_result(),
         Err(ExecutionError::CommandLimitExceeded { limit: 10 })
     );
 }
@@ -194,11 +200,13 @@ fn reaching_the_limit_before_the_first_command_is_an_error() {
     let mut vm = load_functions([("example:main", "return 1\n")]).unwrap();
 
     assert_eq!(
-        vm.execute_function("example:main", None, context(), 1, drop),
+        vm.execute_function("example:main", None, context(), 1, drop)
+            .into_result(),
         Err(ExecutionError::CommandLimitExceeded { limit: 1 })
     );
     assert_eq!(
         vm.execute_function("example:main", None, context(), 2, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: true,
@@ -217,6 +225,7 @@ fn unresolved_nested_calls_fail_without_stopping_the_function() {
 
     assert_eq!(
         vm.execute_function("example:main", None, context(), 2, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: true,
@@ -226,6 +235,7 @@ fn unresolved_nested_calls_fail_without_stopping_the_function() {
 
     assert_eq!(
         vm.execute_function("example:only_missing", None, context(), 2, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::NoResult
     );
@@ -241,6 +251,7 @@ fn unresolved_return_run_discards_the_current_frame() {
 
     assert_eq!(
         vm.execute_function("example:main", None, context(), 3, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::NoResult
     );
@@ -302,6 +313,7 @@ fn loads_function_tags_from_the_target_resource_directory() {
     let mut vm = load_directory_pack(pack.root()).unwrap();
     assert_eq!(
         vm.execute_function("example:main", None, context(), 3, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: true,
@@ -410,6 +422,7 @@ fn maps_nested_and_empty_paths_while_ignoring_invalid_resource_paths() {
     let mut vm = load_directory_pack(pack.root()).unwrap();
     assert_eq!(
         vm.execute_function("example:not_loaded", None, context(), 2, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: false,
@@ -418,6 +431,7 @@ fn maps_nested_and_empty_paths_while_ignoring_invalid_resource_paths() {
     );
     assert_eq!(
         vm.execute_function("example:nested/valid", None, context(), 2, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: true,
@@ -426,6 +440,7 @@ fn maps_nested_and_empty_paths_while_ignoring_invalid_resource_paths() {
     );
     assert_eq!(
         vm.execute_function("example:", None, context(), 2, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: true,

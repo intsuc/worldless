@@ -8,8 +8,8 @@ use std::{
 };
 
 use worldless::{
-    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind,
-    ResourceOrigin, Vm,
+    CompiledProgram, ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack,
+    ResourceKind, ResourceOrigin, Vm,
 };
 
 const LIMIT: usize = 256;
@@ -75,15 +75,13 @@ fn resources(
     let predicate_tags = predicate_tags
         .iter()
         .map(|(id, source)| MemoryResource::new(ResourceKind::PredicateTag, *id, *source));
-    Vm::from_packs(
-        [Pack::memory(
-            functions
-                .chain(number_providers)
-                .chain(predicates)
-                .chain(predicate_tags),
-        )],
-        0,
-    )
+    CompiledProgram::from_packs([Pack::memory(
+        functions
+            .chain(number_providers)
+            .chain(predicates)
+            .chain(predicate_tags),
+    )])
+    .map(|program| program.create_vm(0))
 }
 
 fn compile(
@@ -102,6 +100,7 @@ fn returned(success: bool, value: i32) -> ExecutionOutcome {
 fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
     assert_eq!(
         vm.execute_function(function, None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         expected,
         "{function}"
@@ -303,7 +302,9 @@ fn directory_loader_reads_predicate_resources_and_tags() {
         r#"{"values":["example:falsehood","example:truth"]}"#,
     );
 
-    let mut vm = Vm::from_packs([Pack::directory(pack.root())], 0).unwrap();
+    let mut vm = CompiledProgram::from_packs([Pack::directory(pack.root())])
+        .map(|program| program.create_vm(0))
+        .unwrap();
     assert_function(&mut vm, "example:main", returned(true, 7));
 }
 
@@ -314,7 +315,10 @@ fn directory_loader_reports_the_invalid_predicate_path_and_reason() {
     pack.write(relative_path, r#"{"type":"all_of"}"#);
     let expected_path = pack.root().join(relative_path);
 
-    match Vm::from_packs([Pack::directory(pack.root())], 0).unwrap_err() {
+    match CompiledProgram::from_packs([Pack::directory(pack.root())])
+        .map(|program| program.create_vm(0))
+        .unwrap_err()
+    {
         LoadError::InvalidPredicate { origin, reason } => {
             assert_eq!(origin, ResourceOrigin::Directory(expected_path));
             assert_eq!(reason, "`root` is missing field `terms`");
@@ -535,7 +539,10 @@ fn missing_required_context_is_an_evaluation_error_and_respects_short_circuiting
         "example:active_false",
         "example:inverted",
     ] {
-        match vm.execute_function(function, None, context(), LIMIT, drop) {
+        match vm
+            .execute_function(function, None, context(), LIMIT, drop)
+            .into_result()
+        {
             Err(ExecutionError::PredicateEvaluationFailed { reason }) => {
                 assert!(reason.contains("enchantment_active"), "{reason}");
             }
@@ -650,6 +657,7 @@ fn uniform_after(predicate: &str, predicate_tags: &[(&str, &str)]) -> i32 {
     );
     match vm
         .execute_function("example:main", None, context(), LIMIT, drop)
+        .into_result()
         .unwrap()
     {
         ExecutionOutcome::Result {

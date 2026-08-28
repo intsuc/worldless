@@ -1,7 +1,9 @@
 mod common;
 
 use common::context;
-use worldless::{ExecutionOutcome, FunctionArguments, MemoryResource, Pack, ResourceKind, Vm};
+use worldless::{
+    CompiledProgram, CompoundTag, ExecutionOutcome, MemoryResource, Pack, ResourceKind, Vm,
+};
 
 const LIMIT: usize = 512;
 
@@ -10,11 +12,15 @@ fn returned(success: bool, value: i32) -> ExecutionOutcome {
 }
 
 fn empty_vm() -> Vm {
-    Vm::from_packs([Pack::memory(std::iter::empty::<MemoryResource>())], 0).unwrap()
+    CompiledProgram::from_packs([Pack::memory(std::iter::empty::<MemoryResource>())])
+        .map(|program| program.create_vm(0))
+        .unwrap()
 }
 
 fn execute(vm: &mut Vm, command: &str) -> ExecutionOutcome {
-    vm.execute_command(command, context(), LIMIT, drop).unwrap()
+    vm.execute_command(command, context(), LIMIT, drop)
+        .into_result()
+        .unwrap()
 }
 
 fn initialize_storage(vm: &mut Vm, storage: &str, value: &str) {
@@ -105,7 +111,9 @@ $return run data get storage _ array_suffix_to_id.$(key)
 "#,
         ),
     ];
-    let mut vm = Vm::from_packs([Pack::memory(resources)], 0).unwrap();
+    let mut vm = CompiledProgram::from_packs([Pack::memory(resources)])
+        .map(|program| program.create_vm(0))
+        .unwrap();
     assert_eq!(
         execute(
             &mut vm,
@@ -135,9 +143,10 @@ $return run data get storage _ array_suffix_to_id.$(key)
         ("12_", 12),
     ] {
         let arguments =
-            FunctionArguments::from_snbt(&format!(r#"{{accessor:"example: {key}"}}"#)).unwrap();
+            CompoundTag::from_snbt(&format!(r#"{{accessor:"example: {key}"}}"#)).unwrap();
         assert_eq!(
             vm.execute_function("minecraft:get_id", Some(&arguments), context(), LIMIT, drop,)
+                .into_result()
                 .unwrap(),
             returned(true, expected),
             "tag at key {key}"

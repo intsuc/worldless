@@ -1,6 +1,6 @@
 use worldless::{
-    ExecutionContext, ExecutionError, ExecutionOutcome, MemoryResource, Pack, Position,
-    ResourceKind, Rotation, Vm,
+    CompiledProgram, ExecutionContext, ExecutionError, ExecutionOutcome, MemoryResource, Pack,
+    Position, ResourceKind, Rotation, Vm,
 };
 
 const LIMIT: usize = 256;
@@ -31,7 +31,9 @@ fn location(id: &str, x: &str, y: &str, z: &str) -> MemoryResource {
 }
 
 fn compile(resources: impl IntoIterator<Item = MemoryResource>) -> Vm {
-    Vm::from_packs([Pack::memory(resources)], 0).unwrap()
+    CompiledProgram::from_packs([Pack::memory(resources)])
+        .map(|program| program.create_vm(0))
+        .unwrap()
 }
 
 fn context(x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> ExecutionContext {
@@ -46,7 +48,9 @@ fn returned(value: i32) -> ExecutionOutcome {
 }
 
 fn execute(vm: &mut Vm, id: &str, initial: ExecutionContext) -> ExecutionOutcome {
-    vm.execute_function(id, None, initial, LIMIT, drop).unwrap()
+    vm.execute_function(id, None, initial, LIMIT, drop)
+        .into_result()
+        .unwrap()
 }
 
 #[test]
@@ -318,19 +322,23 @@ fn context_redirects_consume_quota_even_when_the_chain_is_inactive() {
     let initial = context(1.0, 2.0, 3.0, 4.0, 5.0);
 
     assert_eq!(
-        vm.execute_function("example:all_transforms", None, initial, 6, drop),
+        vm.execute_function("example:all_transforms", None, initial, 6, drop)
+            .into_result(),
         Err(ExecutionError::CommandLimitExceeded { limit: 6 })
     );
     assert_eq!(
-        vm.execute_function("example:all_transforms", None, initial, 7, drop),
+        vm.execute_function("example:all_transforms", None, initial, 7, drop)
+            .into_result(),
         Ok(returned(61))
     );
     assert_eq!(
-        vm.execute_function("example:inactive", None, initial, 4, drop),
+        vm.execute_function("example:inactive", None, initial, 4, drop)
+            .into_result(),
         Err(ExecutionError::CommandLimitExceeded { limit: 4 })
     );
     assert_eq!(
-        vm.execute_function("example:inactive", None, initial, 5, drop),
+        vm.execute_function("example:inactive", None, initial, 5, drop)
+            .into_result(),
         Ok(ExecutionOutcome::Result {
             success: false,
             value: 0,

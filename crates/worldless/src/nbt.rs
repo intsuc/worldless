@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, hash_map::Entry},
+    error::Error,
     fmt,
 };
 
@@ -96,9 +97,43 @@ impl fmt::Display for JavaString {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CompoundTag(BTreeMap<JavaString, Tag>);
+pub struct CompoundTag(BTreeMap<JavaString, Tag>);
+
+/// An error produced while parsing a compound SNBT value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompoundTagParseError {
+    reason: String,
+}
+
+impl CompoundTagParseError {
+    /// Returns the parser diagnostic without the public error context.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl fmt::Display for CompoundTagParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid compound tag: {}", self.reason)
+    }
+}
+
+impl Error for CompoundTagParseError {}
 
 impl CompoundTag {
+    /// Parses one complete compound SNBT value.
+    pub fn from_snbt(input: &str) -> Result<Self, CompoundTagParseError> {
+        parse_compound_fully(input).map_err(|reason| CompoundTagParseError { reason })
+    }
+
+    /// Returns compact SNBT preserving Java UTF-16 code units exactly.
+    pub fn to_compact_snbt_utf16(&self) -> Vec<u16> {
+        Tag::Compound(self.clone())
+            .compact_stringify()
+            .units()
+            .to_vec()
+    }
+
     pub(crate) fn new() -> Self {
         Self(BTreeMap::new())
     }

@@ -2,7 +2,8 @@ mod common;
 
 use common::context;
 use worldless::{
-    ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, Vm,
+    CompiledProgram, ExecutionError, ExecutionOutcome, LoadError, MemoryResource, Pack,
+    ResourceKind, Vm,
 };
 
 const LIMIT: usize = 128;
@@ -25,11 +26,13 @@ fn load(
     let providers = providers
         .iter()
         .map(|(id, source)| MemoryResource::new(ResourceKind::NumberProvider, *id, *source));
-    Vm::from_packs([Pack::memory(functions.chain(providers))], world_seed)
+    CompiledProgram::from_packs([Pack::memory(functions.chain(providers))])
+        .map(|program| program.create_vm(world_seed))
 }
 
 fn execute(vm: &mut Vm, id: &str) -> Result<ExecutionOutcome, ExecutionError> {
     vm.execute_function(id, None, context(), LIMIT, drop)
+        .into_result()
 }
 
 #[test]

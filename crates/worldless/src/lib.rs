@@ -28,46 +28,69 @@ mod stopwatch;
 
 pub use execution_context::{ExecutionContext, Position, Rotation};
 pub use loader::{LoadError, ResourceOrigin};
+pub use nbt::{CompoundTag, CompoundTagParseError};
 pub use pack::{MemoryResource, Pack, ResourceKind};
-pub use runtime::{CommandFeedback, ExecutionError, ExecutionOutcome, FeedbackText};
+pub use runtime::{
+    CommandFeedback, ExecutionError, ExecutionOutcome, ExecutionReport, FeedbackText,
+};
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
-use nbt::{CommandStorage, CompoundTag};
+use macro_function::MacroCacheState;
+use nbt::CommandStorage;
 use program::{Program, Scoreboard};
 use random::RandomState;
+use resource::Identifier;
 use stopwatch::StopwatchState;
 
-/// A compound NBT value supplied to a function invocation.
+/// An invalid command-storage identifier supplied to the host API.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FunctionArguments(CompoundTag);
+pub struct StorageIdParseError {
+    input: String,
+}
 
-impl FunctionArguments {
-    /// Parses one complete compound SNBT value.
-    pub fn from_snbt(input: &str) -> Result<Self, FunctionArgumentsParseError> {
-        nbt::parse_compound_fully(input)
-            .map(Self)
-            .map_err(|reason| FunctionArgumentsParseError { reason })
-    }
-
-    pub(crate) fn compound(&self) -> &CompoundTag {
-        &self.0
+impl StorageIdParseError {
+    /// Returns the invalid identifier text.
+    pub fn input(&self) -> &str {
+        &self.input
     }
 }
 
-/// An error produced while parsing function arguments from SNBT.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FunctionArgumentsParseError {
-    reason: String,
-}
-
-impl fmt::Display for FunctionArgumentsParseError {
+impl fmt::Display for StorageIdParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "invalid function arguments: {}", self.reason)
+        write!(formatter, "invalid storage identifier {:?}", self.input)
     }
 }
 
-impl Error for FunctionArgumentsParseError {}
+impl Error for StorageIdParseError {}
+
+/// A statically composed and compiled worldless data-pack program.
+#[derive(Clone, Debug)]
+pub struct CompiledProgram {
+    program: Arc<Program>,
+}
+
+impl CompiledProgram {
+    /// Statically composes and compiles the supplied data packs.
+    ///
+    /// Inputs are ordered from lowest to highest priority. A higher ordinary
+    /// resource replaces a lower resource with the same identifier. Tag files
+    /// instead compose in pack order and may discard accumulated lower entries
+    /// with their `replace` field.
+    pub fn from_packs(packs: impl IntoIterator<Item = Pack>) -> Result<Self, LoadError> {
+        loader::load_packs(packs).map(|program| Self {
+            program: Arc::new(program),
+        })
+    }
+
+    /// Creates a VM with fresh logical state and a VM-local macro cache.
+    ///
+    /// `world_seed` is the VM's immutable configured level seed. It does not
+    /// seed the unnamed random stream or represent a loaded world.
+    pub fn create_vm(&self, world_seed: i64) -> Vm {
+        Vm::new(Arc::clone(&self.program), world_seed)
+    }
+}
 
 /// The automatic-function phase in which a logical tick failure occurred.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,16 +151,11 @@ impl TickReport {
     }
 }
 
-/// Statically composes and validates the supplied data packs without creating
-/// an executable VM.
-pub fn validate_packs(packs: impl IntoIterator<Item = Pack>) -> Result<(), LoadError> {
-    loader::load_packs(packs).map(drop)
-}
-
-/// A loaded worldless data-pack program.
+/// One executable instance of a compiled worldless data-pack program.
 #[derive(Debug)]
 pub struct Vm {
-    program: Program,
+    program: Arc<Program>,
+    macro_cache: MacroCacheState,
     scoreboard: Scoreboard,
     command_storage: CommandStorage,
     random: RandomState,
@@ -146,19 +164,20 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Statically composes and compiles the supplied data packs.
+    /// Returns the exact compound stored under `id`, or `None` when it is absent.
+    pub fn storage(&self, id: &str) -> Result<Option<&CompoundTag>, StorageIdParseError> {
+        let id = parse_storage_id(id)?;
+        Ok(self.command_storage.get_ref(&id))
+    }
+
+    /// Replaces the whole compound stored under `id` without executing a command.
     ///
-    /// Inputs are ordered from lowest to highest priority. A higher ordinary
-    /// resource replaces a lower resource with the same identifier. Tag files
-    /// instead compose in pack order and may discard accumulated lower entries
-    /// with their `replace` field.
-    /// `world_seed` is the VM's immutable configured level seed. It does not
-    /// seed the VM's unnamed random stream or represent a loaded world.
-    pub fn from_packs(
-        packs: impl IntoIterator<Item = Pack>,
-        world_seed: i64,
-    ) -> Result<Self, LoadError> {
-        loader::load_packs(packs).map(|program| Self::new(program, world_seed))
+    /// An empty compound removes the storage, matching the VM's command-storage
+    /// invariant.
+    pub fn set_storage(&mut self, id: &str, value: CompoundTag) -> Result<(), StorageIdParseError> {
+        let id = parse_storage_id(id)?;
+        self.command_storage.set(id, value);
+        Ok(())
     }
 
     /// Executes Minecraft's `function` command without a physical world.
@@ -179,19 +198,20 @@ impl Vm {
     pub fn execute_function(
         &mut self,
         reference: &str,
-        arguments: Option<&FunctionArguments>,
+        arguments: Option<&CompoundTag>,
         context: ExecutionContext,
         command_limit: usize,
         feedback: impl FnMut(CommandFeedback),
-    ) -> Result<ExecutionOutcome, ExecutionError> {
+    ) -> ExecutionReport {
         runtime::execute_function(
-            &self.program,
+            self.program.as_ref(),
+            &mut self.macro_cache,
             &mut self.scoreboard,
             &mut self.command_storage,
             &mut self.random,
             &mut self.stopwatches,
             reference,
-            arguments.map(FunctionArguments::compound),
+            arguments,
             context,
             command_limit,
             feedback,
@@ -210,9 +230,10 @@ impl Vm {
         context: ExecutionContext,
         command_limit: usize,
         feedback: impl FnMut(CommandFeedback),
-    ) -> Result<ExecutionOutcome, ExecutionError> {
+    ) -> ExecutionReport {
         runtime::execute_command(
-            &self.program,
+            self.program.as_ref(),
+            &mut self.macro_cache,
             &mut self.scoreboard,
             &mut self.command_storage,
             &mut self.random,
@@ -236,6 +257,7 @@ impl Vm {
         self.load_pending = false;
         let Self {
             program,
+            macro_cache,
             scoreboard,
             command_storage,
             random,
@@ -246,6 +268,7 @@ impl Vm {
         if run_load {
             execute_automatic_tag(
                 program,
+                macro_cache,
                 scoreboard,
                 command_storage,
                 random,
@@ -258,6 +281,7 @@ impl Vm {
         }
         execute_automatic_tag(
             program,
+            macro_cache,
             scoreboard,
             command_storage,
             random,
@@ -270,9 +294,10 @@ impl Vm {
         TickReport { failures }
     }
 
-    fn new(program: Program, world_seed: i64) -> Self {
+    fn new(program: Arc<Program>, world_seed: i64) -> Self {
         Self {
             program,
+            macro_cache: MacroCacheState::default(),
             scoreboard: Scoreboard::default(),
             command_storage: CommandStorage::default(),
             random: RandomState::new(world_seed),
@@ -285,6 +310,7 @@ impl Vm {
 #[allow(clippy::too_many_arguments)]
 fn execute_automatic_tag(
     program: &Program,
+    macro_cache: &mut MacroCacheState,
     scoreboard: &mut Scoreboard,
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
@@ -302,6 +328,7 @@ fn execute_automatic_tag(
     for function in functions {
         if let Err(error) = runtime::execute_automatic_function(
             program,
+            macro_cache,
             scoreboard,
             command_storage,
             random,
@@ -309,7 +336,9 @@ fn execute_automatic_tag(
             function,
             context,
             command_limit,
-        ) {
+        )
+        .into_result()
+        {
             failures.push(TickFunctionFailure {
                 phase,
                 function: function.to_string(),
@@ -317,4 +346,10 @@ fn execute_automatic_tag(
             });
         }
     }
+}
+
+fn parse_storage_id(input: &str) -> Result<Identifier, StorageIdParseError> {
+    Identifier::parse(input).ok_or_else(|| StorageIdParseError {
+        input: input.to_owned(),
+    })
 }

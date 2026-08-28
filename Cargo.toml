@@ -4,5 +4,6 @@ members = [
     "crates/worldless-brigadier",
     "crates/worldless-cli",
     "crates/worldless-dev",
+    "crates/worldless-lab",
 ]
 resolver = "3"

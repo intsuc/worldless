@@ -2,7 +2,8 @@ mod common;
 
 use common::context;
 use worldless::{
-    CommandFeedback, ExecutionError, ExecutionOutcome, MemoryResource, Pack, ResourceKind, Vm,
+    CommandFeedback, CompiledProgram, ExecutionError, ExecutionOutcome, MemoryResource, Pack,
+    ResourceKind, Vm,
 };
 
 const LIMIT: usize = 128;
@@ -27,7 +28,9 @@ fn load(seed: i64, functions: &[(&str, &str)]) -> Vm {
     let resources = functions
         .iter()
         .map(|(id, source)| MemoryResource::new(ResourceKind::Function, *id, *source));
-    Vm::from_packs([Pack::memory(resources)], seed).unwrap()
+    CompiledProgram::from_packs([Pack::memory(resources)])
+        .map(|program| program.create_vm(seed))
+        .unwrap()
 }
 
 fn execute(
@@ -38,7 +41,9 @@ fn execute(
     Vec<RenderedFeedback>,
 ) {
     let mut feedback = Vec::new();
-    let outcome = vm.execute_command(command, context(), LIMIT, |event| feedback.push(event));
+    let outcome = vm
+        .execute_command(command, context(), LIMIT, |event| feedback.push(event))
+        .into_result();
     (outcome, rendered(feedback))
 }
 
@@ -138,6 +143,7 @@ fn called_function_bodies_are_silent_but_the_outer_call_reports_in_order() {
         .execute_function("example:outer", None, context(), LIMIT, |event| {
             feedback.push(event)
         })
+        .into_result()
         .unwrap();
 
     assert_eq!(
@@ -172,13 +178,16 @@ fn tag_instantiation_failure_precedes_results_from_the_queued_prefix() {
             r#"{"values":["example:prefix","example:bad","example:late"]}"#,
         ),
     ];
-    let mut vm = Vm::from_packs([Pack::memory(functions)], 0).unwrap();
+    let mut vm = CompiledProgram::from_packs([Pack::memory(functions)])
+        .map(|program| program.create_vm(0))
+        .unwrap();
     let mut feedback = Vec::new();
 
     let outcome = vm
         .execute_function("#example:partial", None, context(), LIMIT, |event| {
             feedback.push(event)
         })
+        .into_result()
         .unwrap();
 
     assert_eq!(
@@ -242,9 +251,11 @@ fn feedback_emitted_before_a_command_limit_error_is_not_lost() {
     let mut vm = load(0, &[("example:main", "return 1\n")]);
     let mut feedback = Vec::new();
 
-    let outcome = vm.execute_function("example:main", None, context(), 1, |event| {
-        feedback.push(event)
-    });
+    let outcome = vm
+        .execute_function("example:main", None, context(), 1, |event| {
+            feedback.push(event)
+        })
+        .into_result();
 
     assert_eq!(
         outcome,

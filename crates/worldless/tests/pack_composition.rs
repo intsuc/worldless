@@ -8,7 +8,8 @@ use std::{
 };
 
 use worldless::{
-    ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind, ResourceOrigin, Vm,
+    CompiledProgram, ExecutionOutcome, LoadError, MemoryResource, Pack, ResourceKind,
+    ResourceOrigin, Vm,
 };
 
 const LIMIT: usize = 256;
@@ -94,6 +95,7 @@ fn returned(value: i32) -> ExecutionOutcome {
 fn assert_function(vm: &mut Vm, id: &str, expected: ExecutionOutcome) {
     assert_eq!(
         vm.execute_function(id, None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         expected,
         "{id}"
@@ -123,7 +125,9 @@ fn later_packs_override_ordinary_resources_without_hiding_unrelated_resources() 
         predicate("example:condition", r#"{"type":"all_of","terms":[]}"#),
     ]);
 
-    let mut vm = Vm::from_packs([low, high], 0).unwrap();
+    let mut vm = CompiledProgram::from_packs([low, high])
+        .map(|program| program.create_vm(0))
+        .unwrap();
     for (id, value) in [
         ("example:function_winner", 2),
         ("example:low_only", 4),
@@ -156,18 +160,18 @@ fn only_the_selected_ordinary_resource_is_validated() {
         predicate("example:condition", r#"{"type":"all_of","terms":[]}"#),
     ]);
 
-    let mut vm = Vm::from_packs([low, high], 0).unwrap();
+    let mut vm = CompiledProgram::from_packs([low, high])
+        .map(|program| program.create_vm(0))
+        .unwrap();
     assert_function(&mut vm, "example:function_winner", returned(8));
     assert_function(&mut vm, "example:provider_result", returned(6));
     assert_function(&mut vm, "example:predicate_result", returned(9));
 
-    let error = Vm::from_packs(
-        [
-            Pack::memory([function("example:broken", "return 1\n")]),
-            Pack::memory([function("example:broken", "not a command\n")]),
-        ],
-        0,
-    )
+    let error = CompiledProgram::from_packs([
+        Pack::memory([function("example:broken", "return 1\n")]),
+        Pack::memory([function("example:broken", "not a command\n")]),
+    ])
+    .map(|program| program.create_vm(0))
     .unwrap_err();
     assert!(matches!(
         error,
@@ -183,13 +187,11 @@ fn only_the_selected_ordinary_resource_is_validated() {
     let expected_path = directory
         .root()
         .join("data/example/function/broken.mcfunction");
-    let error = Vm::from_packs(
-        [
-            Pack::memory([function("example:broken", "return 1\n")]),
-            Pack::directory(directory.root()),
-        ],
-        0,
-    )
+    let error = CompiledProgram::from_packs([
+        Pack::memory([function("example:broken", "return 1\n")]),
+        Pack::directory(directory.root()),
+    ])
+    .map(|program| program.create_vm(0))
     .unwrap_err();
     assert!(matches!(
         error,
@@ -256,7 +258,9 @@ fn function_tags_append_replace_and_resolve_after_all_packs_are_composed() {
         ),
     ]);
 
-    let mut vm = Vm::from_packs([low, high], 0).unwrap();
+    let mut vm = CompiledProgram::from_packs([low, high])
+        .map(|program| program.create_vm(0))
+        .unwrap();
     assert_function(&mut vm, "example:setup", ExecutionOutcome::NoResult);
     assert_function(&mut vm, "example:run_append", returned(123));
     assert_function(&mut vm, "example:reset", ExecutionOutcome::NoResult);
@@ -302,20 +306,20 @@ fn registry_resource_tags_are_composed_before_their_consumers_are_resolved() {
         ),
     ]);
 
-    let mut vm = Vm::from_packs([low, high], 0).unwrap();
+    let mut vm = CompiledProgram::from_packs([low, high])
+        .map(|program| program.create_vm(0))
+        .unwrap();
     assert_function(&mut vm, "example:provider_result", returned(3));
     assert_function(&mut vm, "example:predicate_result", returned(7));
 }
 
 #[test]
 fn duplicate_normalized_ids_are_rejected_within_one_pack_but_legal_across_packs() {
-    let error = Vm::from_packs(
-        [Pack::memory([
-            function("value", "return 1\n"),
-            function("minecraft:value", "return 2\n"),
-        ])],
-        0,
-    )
+    let error = CompiledProgram::from_packs([Pack::memory([
+        function("value", "return 1\n"),
+        function("minecraft:value", "return 2\n"),
+    ])])
+    .map(|program| program.create_vm(0))
     .unwrap_err();
     assert!(matches!(
         error,
@@ -326,13 +330,11 @@ fn duplicate_normalized_ids_are_rejected_within_one_pack_but_legal_across_packs(
         } if id == "minecraft:value"
     ));
 
-    let mut vm = Vm::from_packs(
-        [
-            Pack::memory([function("value", "return 1\n")]),
-            Pack::memory([function("minecraft:value", "return 2\n")]),
-        ],
-        0,
-    )
+    let mut vm = CompiledProgram::from_packs([
+        Pack::memory([function("value", "return 1\n")]),
+        Pack::memory([function("minecraft:value", "return 2\n")]),
+    ])
+    .map(|program| program.create_vm(0))
     .unwrap();
     assert_function(&mut vm, "minecraft:value", returned(2));
 }
@@ -346,33 +348,32 @@ fn directory_and_memory_packs_share_the_same_priority_order() {
         "return 3\n",
     );
 
-    let mut memory_wins = Vm::from_packs(
-        [
-            Pack::directory(directory.root()),
-            Pack::memory([function("example:winner", "return 2\n")]),
-        ],
-        0,
-    )
+    let mut memory_wins = CompiledProgram::from_packs([
+        Pack::directory(directory.root()),
+        Pack::memory([function("example:winner", "return 2\n")]),
+    ])
+    .map(|program| program.create_vm(0))
     .unwrap();
     assert_function(&mut memory_wins, "example:winner", returned(2));
     assert_function(&mut memory_wins, "example:directory_only", returned(3));
 
-    let mut directory_wins = Vm::from_packs(
-        [
-            Pack::memory([function("example:winner", "return 2\n")]),
-            Pack::directory(directory.root()),
-        ],
-        0,
-    )
+    let mut directory_wins = CompiledProgram::from_packs([
+        Pack::memory([function("example:winner", "return 2\n")]),
+        Pack::directory(directory.root()),
+    ])
+    .map(|program| program.create_vm(0))
     .unwrap();
     assert_function(&mut directory_wins, "example:winner", returned(1));
 }
 
 #[test]
 fn an_empty_pack_stack_builds_an_empty_vm() {
-    let mut vm = Vm::from_packs(std::iter::empty::<Pack>(), 0).unwrap();
+    let mut vm = CompiledProgram::from_packs(std::iter::empty::<Pack>())
+        .map(|program| program.create_vm(0))
+        .unwrap();
     assert_eq!(
         vm.execute_function("example:missing", None, context(), LIMIT, drop)
+            .into_result()
             .unwrap(),
         ExecutionOutcome::Result {
             success: false,
@@ -396,7 +397,9 @@ fn filters_and_overlays_remain_explicitly_unsupported() {
         )
         .unwrap();
 
-        let error = Vm::from_packs([Pack::directory(directory.root())], 0).unwrap_err();
+        let error = CompiledProgram::from_packs([Pack::directory(directory.root())])
+            .map(|program| program.create_vm(0))
+            .unwrap_err();
         assert!(matches!(
             error,
             LoadError::UnsupportedPack {
