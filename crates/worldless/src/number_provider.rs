@@ -67,6 +67,35 @@ pub(crate) enum NumberProviderSet {
     Tag(Identifier),
 }
 
+enum NumberProviderValues<'a> {
+    Direct {
+        registry: &'a LootRegistry,
+        values: std::slice::Iter<'a, NumberProviderReference>,
+    },
+    Tag {
+        registry: &'a LootRegistry,
+        values: std::slice::Iter<'a, Identifier>,
+    },
+}
+
+impl<'a> Iterator for NumberProviderValues<'a> {
+    type Item = &'a NumberProvider;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Direct { registry, values } => values
+                .next()
+                .map(|value| registry.resolve_number_provider(value)),
+            Self::Tag { registry, values } => values.next().map(|id| {
+                registry
+                    .providers
+                    .get(id)
+                    .expect("number provider tags contain validated providers")
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WeightedProvider {
     pub(crate) provider: NumberProviderReference,
@@ -206,24 +235,20 @@ impl LootRegistry {
     fn number_provider_values<'a>(
         &'a self,
         providers: &'a NumberProviderSet,
-    ) -> Box<dyn Iterator<Item = &'a NumberProvider> + 'a> {
+    ) -> NumberProviderValues<'a> {
         match providers {
-            NumberProviderSet::Direct(providers) => Box::new(
-                providers
-                    .iter()
-                    .map(|provider| self.resolve_number_provider(provider)),
-            ),
-            NumberProviderSet::Tag(tag) => Box::new(
-                self.provider_tags
+            NumberProviderSet::Direct(values) => NumberProviderValues::Direct {
+                registry: self,
+                values: values.iter(),
+            },
+            NumberProviderSet::Tag(tag) => NumberProviderValues::Tag {
+                registry: self,
+                values: self
+                    .provider_tags
                     .get(tag)
                     .expect("number provider tags are validated before execution")
-                    .iter()
-                    .map(|id| {
-                        self.providers
-                            .get(id)
-                            .expect("number provider tags contain validated providers")
-                    }),
-            ),
+                    .iter(),
+            },
         }
     }
 
@@ -1545,11 +1570,7 @@ fn storage_number<'a>(
     path: &NbtPath,
 ) -> Option<NbtSelection<'a>> {
     let root = command_storage.get_ref(storage)?;
-    let mut values = path.select(root).ok()?;
-    if values.len() != 1 {
-        return None;
-    }
-    values.pop()
+    path.select_single(root)
 }
 
 fn tag_float_value(value: &Tag) -> Option<f32> {

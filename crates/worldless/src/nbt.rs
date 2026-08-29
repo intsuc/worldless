@@ -17,6 +17,23 @@ use crate::resource::{Identifier, IdentifierPart};
 
 const MAX_DEPTH: usize = 512;
 
+#[derive(Default)]
+struct CachedHashHasher(u64);
+
+impl Hasher for CachedHashHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("cached-hash map keys write one u64 hash")
+    }
+
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct JavaString {
     units: Arc<[u16]>,
@@ -142,7 +159,7 @@ impl fmt::Display for JavaString {
     }
 }
 
-type CompoundMap = HashMap<JavaString, Tag, BuildHasherDefault<DefaultHasher>>;
+type CompoundMap = HashMap<JavaString, Tag, BuildHasherDefault<CachedHashHasher>>;
 
 #[derive(Debug)]
 pub struct CompoundTag(CompoundMap);
@@ -254,7 +271,7 @@ impl Clone for CompoundTag {
     fn clone(&self) -> Self {
         let mut values = CompoundMap::with_capacity_and_hasher(
             self.0.len(),
-            BuildHasherDefault::<DefaultHasher>::default(),
+            BuildHasherDefault::<CachedHashHasher>::default(),
         );
         values.extend(
             self.0
@@ -2259,6 +2276,21 @@ impl NbtPath {
         Ok(current)
     }
 
+    pub(crate) fn select_single<'a>(&self, root: &'a CompoundTag) -> Option<NbtSelection<'a>> {
+        let mut selected = NbtSelection::Root(root);
+        for node in self.nodes.iter() {
+            match node.select_one(selected) {
+                Ok(Some(next)) => selected = next,
+                Ok(None) => return None,
+                Err(()) => {
+                    let mut selected = self.select(root).ok()?;
+                    return (selected.len() == 1).then(|| selected.pop().unwrap());
+                }
+            }
+        }
+        Some(selected)
+    }
+
     pub(crate) fn count_matching(&self, root: &CompoundTag) -> usize {
         self.select(root).map_or(0, |tags| tags.len())
     }
@@ -2477,6 +2509,61 @@ enum PathNode {
 }
 
 impl PathNode {
+    fn select_one<'a>(&self, parent: NbtSelection<'a>) -> Result<Option<NbtSelection<'a>>, ()> {
+        Ok(match parent {
+            NbtSelection::Root(parent) => match self {
+                Self::CompoundChild(name) => parent.get(name).map(NbtSelection::Tag),
+                Self::MatchObject(name, pattern) => parent
+                    .get(name)
+                    .filter(|value| partial_matches_compound(pattern, value))
+                    .map(NbtSelection::Tag),
+                Self::MatchRoot(pattern) if compound_partial_matches(pattern, parent) => {
+                    Some(NbtSelection::Root(parent))
+                }
+                Self::AllElements | Self::MatchElement(_) => return Err(()),
+                Self::Indexed(_) | Self::MatchRoot(_) => None,
+            },
+            NbtSelection::Tag(parent) => match self {
+                Self::CompoundChild(name) => parent
+                    .as_compound()
+                    .and_then(|parent| parent.get(name))
+                    .map(NbtSelection::Tag),
+                Self::Indexed(index) => {
+                    let Some(index) = actual_index(*index, parent.collection_len()) else {
+                        return Ok(None);
+                    };
+                    match parent {
+                        Tag::ByteArray(values) => {
+                            Some(NbtSelection::ArrayElement(Tag::Byte(values[index])))
+                        }
+                        Tag::List(values) => Some(NbtSelection::Tag(&values[index])),
+                        Tag::IntArray(values) => {
+                            Some(NbtSelection::ArrayElement(Tag::Int(values[index])))
+                        }
+                        Tag::LongArray(values) => {
+                            Some(NbtSelection::ArrayElement(Tag::Long(values[index])))
+                        }
+                        _ => None,
+                    }
+                }
+                Self::MatchObject(name, pattern) => parent
+                    .as_compound()
+                    .and_then(|parent| parent.get(name))
+                    .filter(|value| partial_matches_compound(pattern, value))
+                    .map(NbtSelection::Tag),
+                Self::MatchRoot(pattern)
+                    if matches!(parent, Tag::Compound(_))
+                        && partial_matches_compound(pattern, parent) =>
+                {
+                    Some(NbtSelection::Tag(parent))
+                }
+                Self::AllElements | Self::MatchElement(_) => return Err(()),
+                Self::MatchRoot(_) => None,
+            },
+            NbtSelection::ArrayElement(_) => None,
+        })
+    }
+
     fn preferred_parent(&self) -> Tag {
         match self {
             Self::AllElements | Self::Indexed(_) | Self::MatchElement(_) => Tag::List(Vec::new()),
@@ -2613,110 +2700,56 @@ impl PathNode {
 
     fn collect_selection<'a>(&self, parent: &NbtSelection<'a>, output: &mut Vec<NbtSelection<'a>>) {
         match parent {
-            NbtSelection::Root(parent) => self.collect_root_selection(parent, output),
-            NbtSelection::Tag(parent) => self.collect_tag_selection(parent, output),
-            NbtSelection::ArrayElement(_) => {}
-        }
-    }
-
-    fn collect_root_selection<'a>(
-        &self,
-        parent: &'a CompoundTag,
-        output: &mut Vec<NbtSelection<'a>>,
-    ) {
-        match self {
-            Self::CompoundChild(name) => {
-                if let Some(tag) = parent.get(name) {
-                    output.push(NbtSelection::Tag(tag));
+            NbtSelection::Root(parent) => {
+                if let Ok(Some(selected)) = self.select_one(NbtSelection::Root(parent)) {
+                    output.push(selected);
                 }
             }
-            Self::MatchObject(name, pattern) => {
-                if let Some(value) = parent.get(name)
-                    && partial_matches_compound(pattern, value)
-                {
-                    output.push(NbtSelection::Tag(value));
-                }
-            }
-            Self::MatchRoot(pattern) if compound_partial_matches(pattern, parent) => {
-                output.push(NbtSelection::Root(parent));
-            }
-            Self::AllElements | Self::Indexed(_) | Self::MatchElement(_) | Self::MatchRoot(_) => {}
-        }
-    }
-
-    fn collect_tag_selection<'a>(&self, parent: &'a Tag, output: &mut Vec<NbtSelection<'a>>) {
-        match self {
-            Self::AllElements => match parent {
-                Tag::ByteArray(values) => output.extend(
-                    values
-                        .iter()
-                        .copied()
-                        .map(Tag::Byte)
-                        .map(NbtSelection::ArrayElement),
-                ),
-                Tag::List(values) => {
-                    output.extend(values.iter().map(NbtSelection::Tag));
-                }
-                Tag::IntArray(values) => output.extend(
-                    values
-                        .iter()
-                        .copied()
-                        .map(Tag::Int)
-                        .map(NbtSelection::ArrayElement),
-                ),
-                Tag::LongArray(values) => output.extend(
-                    values
-                        .iter()
-                        .copied()
-                        .map(Tag::Long)
-                        .map(NbtSelection::ArrayElement),
-                ),
-                _ => {}
-            },
-            Self::CompoundChild(name) => {
-                if let Some(tag) = parent.as_compound().and_then(|parent| parent.get(name)) {
-                    output.push(NbtSelection::Tag(tag));
-                }
-            }
-            Self::Indexed(index) => {
-                if let Some(index) = actual_index(*index, parent.collection_len()) {
-                    match parent {
-                        Tag::ByteArray(values) => {
-                            output.push(NbtSelection::ArrayElement(Tag::Byte(values[index])))
-                        }
-                        Tag::List(values) => output.push(NbtSelection::Tag(&values[index])),
-                        Tag::IntArray(values) => {
-                            output.push(NbtSelection::ArrayElement(Tag::Int(values[index])))
-                        }
-                        Tag::LongArray(values) => {
-                            output.push(NbtSelection::ArrayElement(Tag::Long(values[index])))
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Self::MatchElement(pattern) => {
-                if let Tag::List(values) = parent {
-                    output.extend(
+            NbtSelection::Tag(parent) => match self {
+                Self::AllElements => match parent {
+                    Tag::ByteArray(values) => output.extend(
                         values
                             .iter()
-                            .filter(|value| partial_matches_compound(pattern, value))
-                            .map(NbtSelection::Tag),
-                    );
+                            .copied()
+                            .map(Tag::Byte)
+                            .map(NbtSelection::ArrayElement),
+                    ),
+                    Tag::List(values) => {
+                        output.extend(values.iter().map(NbtSelection::Tag));
+                    }
+                    Tag::IntArray(values) => output.extend(
+                        values
+                            .iter()
+                            .copied()
+                            .map(Tag::Int)
+                            .map(NbtSelection::ArrayElement),
+                    ),
+                    Tag::LongArray(values) => output.extend(
+                        values
+                            .iter()
+                            .copied()
+                            .map(Tag::Long)
+                            .map(NbtSelection::ArrayElement),
+                    ),
+                    _ => {}
+                },
+                Self::MatchElement(pattern) => {
+                    if let Tag::List(values) = parent {
+                        output.extend(
+                            values
+                                .iter()
+                                .filter(|value| partial_matches_compound(pattern, value))
+                                .map(NbtSelection::Tag),
+                        );
+                    }
                 }
-            }
-            Self::MatchObject(name, pattern) => {
-                if let Some(value) = parent.as_compound().and_then(|parent| parent.get(name))
-                    && partial_matches_compound(pattern, value)
-                {
-                    output.push(NbtSelection::Tag(value));
+                _ => {
+                    if let Ok(Some(selected)) = self.select_one(NbtSelection::Tag(parent)) {
+                        output.push(selected);
+                    }
                 }
-            }
-            Self::MatchRoot(pattern) => {
-                if matches!(parent, Tag::Compound(_)) && partial_matches_compound(pattern, parent) {
-                    output.push(NbtSelection::Tag(parent));
-                }
-            }
+            },
+            NbtSelection::ArrayElement(_) => {}
         }
     }
 
@@ -2960,8 +2993,9 @@ pub(crate) struct CommandStorage {
     values: StorageNamespaces,
 }
 
-type StorageNamespaces = HashMap<IdentifierPart, StorageValues, BuildHasherDefault<DefaultHasher>>;
-type StorageValues = HashMap<IdentifierPart, CompoundTag, BuildHasherDefault<DefaultHasher>>;
+type StorageNamespaces =
+    HashMap<IdentifierPart, StorageValues, BuildHasherDefault<CachedHashHasher>>;
+type StorageValues = HashMap<IdentifierPart, CompoundTag, BuildHasherDefault<CachedHashHasher>>;
 
 impl CommandStorage {
     pub(crate) fn get_ref(&self, id: &Identifier) -> Option<&CompoundTag> {

@@ -468,7 +468,7 @@ fn compound_data_get_feedback_uses_deterministic_pretty_snbt() {
     assert_eq!(
         feedback,
         [RenderedFeedback::Success(
-            "Storage example:state has the following contents: {true: [I; 1, 2], 1: 2}".to_owned()
+            "Storage example:state has the following contents: {1: 2, true: [I; 1, 2]}".to_owned()
         )]
     );
 }
