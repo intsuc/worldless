@@ -1,5 +1,10 @@
 function transformer:setup
 function transformer:fixture/load_model
+execute store success score #activate_result transformer run function transformer:model/activate
+execute unless score #activate_result transformer matches 1 run return fail
+data modify storage transformer:model abi.schema set value 0
+execute store success score #activate_result transformer run function transformer:model/activate
+execute unless score #activate_result transformer matches 0 run return fail
 data remove storage transformer:request prefix
 data remove storage transformer:request prefix_tokens
 data remove storage transformer:request tokenizer_id

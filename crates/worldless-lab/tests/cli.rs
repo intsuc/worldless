@@ -31,6 +31,7 @@ fn usage_errors_are_rejected_before_loading_a_suite() {
         &["check", "--format", "yaml"][..],
         &["check", "--samples", "1"][..],
         &["compare", "--samples", "0"][..],
+        &["benchmark", "--request", "not-snbt"][..],
     ] {
         let output = run(arguments);
         assert_eq!(output.status.code(), Some(2), "{arguments:?}");
@@ -40,6 +41,32 @@ fn usage_errors_are_rejected_before_loading_a_suite() {
             "{arguments:?}"
         );
     }
+}
+
+#[test]
+fn production_benchmark_requires_a_release_binary_before_loading_inputs() {
+    let output = run(&[
+        "benchmark",
+        "--pack",
+        "missing-pack",
+        "--model-storage",
+        "missing-model.dat",
+        "--entry",
+        "text",
+        "--request",
+        r#"{prefix:"Once",max_new_tokens:1}"#,
+        "--warmup",
+        "20",
+        "--samples",
+        "30",
+        "--quota",
+        "1000000",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires a release build"));
 }
 
 #[test]

@@ -11,11 +11,11 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Final
 
-from .spec import ARCHITECTURE_ID, MODEL_SPEC, SCHEMA_VERSION
+from .spec import DATA_ABI_ID, DATA_SCHEMA_VERSION, DATA_SPEC
 
 TOKENIZER_KIND: Final = "greedy_string_piece"
 _ARTIFACT_KEYS: Final = {
-    "architecture_id",
+    "data_abi_id",
     "bos_token_id",
     "eos_token_id",
     "kind",
@@ -89,7 +89,7 @@ class GreedyStringPieceTokenizer:
     """
 
     def __init__(self, pieces: Sequence[str]) -> None:
-        expected = MODEL_SPEC.regular_piece_count
+        expected = DATA_SPEC.regular_piece_count
         if len(pieces) != expected:
             raise ValueError(f"expected exactly {expected} regular pieces")
         if len(set(pieces)) != len(pieces):
@@ -142,13 +142,13 @@ class GreedyStringPieceTokenizer:
 
     def _payload(self) -> dict[str, object]:
         return {
-            "architecture_id": ARCHITECTURE_ID,
-            "bos_token_id": MODEL_SPEC.bos_token_id,
-            "eos_token_id": MODEL_SPEC.eos_token_id,
+            "data_abi_id": DATA_ABI_ID,
+            "bos_token_id": DATA_SPEC.bos_token_id,
+            "eos_token_id": DATA_SPEC.eos_token_id,
             "kind": TOKENIZER_KIND,
             "pieces": list(self._pieces),
-            "schema_version": SCHEMA_VERSION,
-            "vocab_size": MODEL_SPEC.vocab_size,
+            "schema_version": DATA_SCHEMA_VERSION,
+            "vocab_size": DATA_SPEC.vocab_size,
         }
 
     def to_dict(self) -> dict[str, object]:
@@ -185,12 +185,12 @@ class GreedyStringPieceTokenizer:
                 f"invalid tokenizer artifact fields: missing={missing}, unknown={unknown}"
             )
         expected_scalars = {
-            "architecture_id": ARCHITECTURE_ID,
-            "bos_token_id": MODEL_SPEC.bos_token_id,
-            "eos_token_id": MODEL_SPEC.eos_token_id,
+            "data_abi_id": DATA_ABI_ID,
+            "bos_token_id": DATA_SPEC.bos_token_id,
+            "eos_token_id": DATA_SPEC.eos_token_id,
             "kind": TOKENIZER_KIND,
-            "schema_version": SCHEMA_VERSION,
-            "vocab_size": MODEL_SPEC.vocab_size,
+            "schema_version": DATA_SCHEMA_VERSION,
+            "vocab_size": DATA_SPEC.vocab_size,
         }
         for field, expected in expected_scalars.items():
             if value[field] != expected:
@@ -238,14 +238,14 @@ class GreedyStringPieceTokenizer:
         return token_ids
 
     def encode_story(self, text: str) -> list[int]:
-        return [MODEL_SPEC.bos_token_id, *self.encode(text), MODEL_SPEC.eos_token_id]
+        return [DATA_SPEC.bos_token_id, *self.encode(text), DATA_SPEC.eos_token_id]
 
     def decode_text(self, token_ids: Iterable[int]) -> str:
         pieces: list[str] = []
         for position, token_id in enumerate(token_ids):
             if not isinstance(token_id, int) or isinstance(token_id, bool):
                 raise TypeError(f"token ID at position {position} must be an integer")
-            if not 0 <= token_id < MODEL_SPEC.regular_piece_count:
+            if not 0 <= token_id < DATA_SPEC.regular_piece_count:
                 raise ValueError(
                     f"token ID at position {position} is not a regular piece: {token_id}"
                 )
@@ -260,13 +260,13 @@ class GreedyStringPieceTokenizer:
                 raise TypeError(f"token ID at position {position} must be an integer")
             if ended:
                 raise ValueError(f"token found after EOS at position {position}")
-            if token_id == MODEL_SPEC.eos_token_id:
+            if token_id == DATA_SPEC.eos_token_id:
                 ended = True
-            elif token_id == MODEL_SPEC.bos_token_id:
+            elif token_id == DATA_SPEC.bos_token_id:
                 raise ValueError(
                     f"BOS is not valid in a completion at position {position}"
                 )
-            elif 0 <= token_id < MODEL_SPEC.regular_piece_count:
+            elif 0 <= token_id < DATA_SPEC.regular_piece_count:
                 pieces.append(self._pieces[token_id])
             else:
                 raise ValueError(
@@ -296,7 +296,7 @@ def train_tokenizer(texts: Iterable[str]) -> GreedyStringPieceTokenizer:
         raise ValueError("cannot train a tokenizer from an empty corpus")
     if not scalars:
         raise ValueError("cannot train a tokenizer from only empty strings")
-    target = MODEL_SPEC.regular_piece_count
+    target = DATA_SPEC.regular_piece_count
     if len(scalars) > target:
         raise ValueError(
             f"corpus has {len(scalars)} distinct scalars but only {target} regular IDs"

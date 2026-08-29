@@ -3,15 +3,15 @@ data remove storage transformer:response error
 data remove storage transformer:response generated
 data remove storage transformer:response final_hidden
 data modify storage transformer:response ok set value 0b
-function transformer:model/validate
-execute unless score #valid transformer matches 1 run data modify storage transformer:response error set value 1
-execute unless score #valid transformer matches 1 run return fail
+execute unless data storage transformer:runtime {active_bank:0} unless data storage transformer:runtime {active_bank:1} run data modify storage transformer:response error set value 1
+execute unless data storage transformer:runtime {active_bank:0} unless data storage transformer:runtime {active_bank:1} run return fail
+data modify storage transformer:validation macro.bank set from storage transformer:runtime active_bank
 function transformer:infer/validate_tokens_request
 execute unless score #request_valid transformer matches 1 run data modify storage transformer:response error set value 3
 execute unless score #request_valid transformer matches 1 run return fail
 
 data modify storage transformer:validation tokenizer_left set from storage transformer:request tokenizer_id
-data modify storage transformer:validation tokenizer_right set from storage transformer:model abi.tokenizer_id
+function transformer:infer/load_active_tokenizer.macro with storage transformer:validation macro
 function transformer:infer/validate_tokenizer_id
 execute unless score #tokenizer_match transformer matches 1 run data modify storage transformer:response error set value 3
 execute unless score #tokenizer_match transformer matches 1 run return fail
@@ -28,7 +28,8 @@ execute unless score #request_valid transformer matches 1 run return fail
 
 data remove storage transformer:runtime state
 data modify storage transformer:runtime state set value {tokens:[I;],generated:[I;],cache:[],macro:{}}
-data modify storage transformer:runtime state.tokens append from storage transformer:model abi.bos_id
+data modify storage transformer:runtime state.macro.bank set from storage transformer:runtime active_bank
+function transformer:infer/load_active_bos.macro with storage transformer:runtime state.macro
 execute if score #prefix_len transformer matches 1.. run data modify storage transformer:runtime state.tokens append from storage transformer:request prefix_tokens[]
 function transformer:infer/prepare
 data modify storage transformer:response generated set from storage transformer:runtime state.generated

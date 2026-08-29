@@ -1,0 +1,1 @@
+data modify storage transformer:validation rq set value "{\"type\":\"maximum\",\"operands\":[-127,{\"type\":\"minimum\",\"operands\":[127,{\"type\":\"storage\",\"storage\":\"transformer:runtime\",\"path\":\"state.acc\"}]}]}"

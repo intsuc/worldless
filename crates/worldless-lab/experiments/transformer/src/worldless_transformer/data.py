@@ -13,7 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from huggingface_hub import HfFileSystem
 
-from .spec import ARCHITECTURE_ID, MODEL_SPEC, SCHEMA_VERSION
+from .spec import DATA_ABI_ID, DATA_SCHEMA_VERSION, DATA_SPEC
 from .tokenizer import GreedyStringPieceTokenizer
 
 DATASET_ID: Final = "roneneldan/TinyStories"
@@ -29,9 +29,9 @@ WINDOW_DTYPE: Final = np.dtype(
 WINDOW_DTYPE_NAME: Final = (
     "struct<uint64-le:start:uint16-le:loss_start:uint16-le:loss_end>"
 )
-WINDOW_STRIDE: Final = MODEL_SPEC.context_length - MODEL_SPEC.attention_window
+WINDOW_STRIDE: Final = DATA_SPEC.context_length - DATA_SPEC.attention_window
 _STREAM_METADATA_KEYS: Final = {
-    "architecture_id",
+    "data_abi_id",
     "dataset_id",
     "dataset_revision",
     "dtype",
@@ -199,8 +199,8 @@ def write_token_stream(
             offset_digest.update(encoded_offset)
             local_start = 0
             while local_start < len(tokens) - 1:
-                loss_start = 0 if local_start == 0 else MODEL_SPEC.attention_window
-                loss_end = min(MODEL_SPEC.context_length, len(tokens) - 1 - local_start)
+                loss_start = 0 if local_start == 0 else DATA_SPEC.attention_window
+                loss_end = min(DATA_SPEC.context_length, len(tokens) - 1 - local_start)
                 if loss_start < loss_end:
                     window = np.asarray(
                         [(story_start + local_start, loss_start, loss_end)],
@@ -237,7 +237,7 @@ def write_token_stream(
             f"TinyStories {split} yielded {story_count} rows, expected {expected_story_count}"
         )
     metadata: dict[str, object] = {
-        "architecture_id": ARCHITECTURE_ID,
+        "data_abi_id": DATA_ABI_ID,
         "dataset_id": DATASET_ID,
         "dataset_revision": DATASET_REVISION,
         "dtype": "uint16-le",
@@ -246,7 +246,7 @@ def write_token_stream(
         "offset_sha256": offset_digest.hexdigest(),
         "prediction_count": prediction_count,
         "raw_utf8_byte_count": raw_utf8_byte_count,
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": DATA_SCHEMA_VERSION,
         "sha256": digest.hexdigest(),
         "split": split,
         "story_count": story_count,
@@ -292,12 +292,12 @@ def load_token_stream(
     if not isinstance(value, dict) or set(value) != _STREAM_METADATA_KEYS:
         raise ValueError("token stream metadata has an invalid schema")
     expected = {
-        "architecture_id": ARCHITECTURE_ID,
+        "data_abi_id": DATA_ABI_ID,
         "dataset_id": DATASET_ID,
         "dataset_revision": DATASET_REVISION,
         "dtype": "uint16-le",
         "offset_dtype": "uint64-le",
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": DATA_SCHEMA_VERSION,
         "split": expected_split,
         "tokenizer_id": expected_tokenizer_id,
     }
@@ -379,9 +379,9 @@ def load_token_stream(
         raise ValueError("window starts must be strictly increasing")
     if np.any((loss_starts < 0) | (loss_starts >= loss_ends)):
         raise ValueError("every window must contain at least one loss position")
-    if np.any(loss_ends > MODEL_SPEC.context_length):
+    if np.any(loss_ends > DATA_SPEC.context_length):
         raise ValueError("window loss_end exceeds context length")
-    if np.any((loss_starts != 0) & (loss_starts != MODEL_SPEC.attention_window)):
+    if np.any((loss_starts != 0) & (loss_starts != DATA_SPEC.attention_window)):
         raise ValueError("window loss_start must be zero or the attention window")
     story_indices = np.searchsorted(offsets, starts, side="right") - 1
     if np.any(story_indices < 0) or np.any(story_indices >= story_count):
@@ -403,10 +403,10 @@ def load_token_stream(
         starts[continuation_indices] - starts[continuation_indices - 1] != WINDOW_STRIDE
     ):
         raise ValueError(f"continuation windows must use stride {WINDOW_STRIDE}")
-    expected_loss_starts = np.where(first_in_story, 0, MODEL_SPEC.attention_window)
+    expected_loss_starts = np.where(first_in_story, 0, DATA_SPEC.attention_window)
     if not np.array_equal(loss_starts, expected_loss_starts):
         raise ValueError("window loss_start does not match its canonical position")
-    expected_loss_ends = np.minimum(MODEL_SPEC.context_length, story_ends - starts - 1)
+    expected_loss_ends = np.minimum(DATA_SPEC.context_length, story_ends - starts - 1)
     if not np.array_equal(loss_ends, expected_loss_ends):
         raise ValueError("window loss_end does not match its story boundary")
     last_in_story = np.empty(window_count, dtype=np.bool_)
@@ -436,10 +436,10 @@ def _validate_tokens(tokens: np.memmap, offsets: np.memmap) -> None:
     for start in range(0, len(tokens), chunk_size):
         end = min(start + chunk_size, len(tokens))
         chunk = np.asarray(tokens[start:end])
-        if np.any(chunk >= MODEL_SPEC.vocab_size):
-            raise ValueError(f"token IDs must be in 0..{MODEL_SPEC.vocab_size - 1}")
-        bos_positions = np.flatnonzero(chunk == MODEL_SPEC.bos_token_id) + start
-        eos_positions = np.flatnonzero(chunk == MODEL_SPEC.eos_token_id) + start
+        if np.any(chunk >= DATA_SPEC.vocab_size):
+            raise ValueError(f"token IDs must be in 0..{DATA_SPEC.vocab_size - 1}")
+        bos_positions = np.flatnonzero(chunk == DATA_SPEC.bos_token_id) + start
+        eos_positions = np.flatnonzero(chunk == DATA_SPEC.eos_token_id) + start
         if not np.array_equal(
             bos_positions,
             expected_bos[bos_cursor : bos_cursor + len(bos_positions)],
@@ -494,11 +494,11 @@ def batch_from_window_indices(
     if np.any(window_indices < 0) or np.any(window_indices >= len(stream.windows)):
         raise ValueError(f"window_indices must be in 0..{len(stream.windows) - 1}")
     batch_size = len(window_indices)
-    sequence_length = MODEL_SPEC.context_length
+    sequence_length = DATA_SPEC.context_length
     inputs = np.full(
-        (batch_size, sequence_length), MODEL_SPEC.eos_token_id, dtype=np.int64
+        (batch_size, sequence_length), DATA_SPEC.eos_token_id, dtype=np.int64
     )
-    targets = np.full_like(inputs, MODEL_SPEC.eos_token_id)
+    targets = np.full_like(inputs, DATA_SPEC.eos_token_id)
     loss_mask = np.zeros_like(inputs, dtype=np.bool_)
     for row, window_index in enumerate(window_indices):
         window = stream.windows[window_index]

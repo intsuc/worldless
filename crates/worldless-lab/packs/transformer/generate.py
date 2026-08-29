@@ -7,13 +7,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from worldless_transformer.spec import (
-    ALIBI_SLOPES,
+    ARCHITECTURE_CHOICES,
     ATTENTION_SCORE_SHIFT,
-    EXP_Q15_TABLE,
-    MODEL_SPEC,
     RMS_GAIN_FRACTION_BITS,
     RMS_GAIN_TABLE,
+    SOFTMAX_MIN_DIFFERENCE,
+    ModelSpec,
+    exp_q15_table,
     expected_weight_shapes,
+    spec_for_architecture,
+    zero_shift_weight_names,
 )
 from worldless_transformer.tokenizer import (
     GreedyStringPieceTokenizer,
@@ -22,6 +25,69 @@ from worldless_transformer.tokenizer import (
 
 PACK_ROOT = Path(__file__).resolve().parent
 FUNCTION_ROOT = Path("data/transformer/function")
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectionSpec:
+    code: str
+    weight_suffix: str
+    output_width: int
+    input_width: int
+    source_path: str
+    output_path: str
+
+
+def _projections(spec: ModelSpec) -> tuple[_ProjectionSpec, ...]:
+    return (
+        _ProjectionSpec(
+            "q",
+            "attention.q_proj.weight",
+            spec.q_heads * spec.head_dim,
+            spec.d_model,
+            "state.norm",
+            "state.q",
+        ),
+        _ProjectionSpec(
+            "k",
+            "attention.k_proj.weight",
+            spec.kv_heads * spec.head_dim,
+            spec.d_model,
+            "state.norm",
+            "state.k",
+        ),
+        _ProjectionSpec(
+            "v",
+            "attention.v_proj.weight",
+            spec.kv_heads * spec.head_dim,
+            spec.d_model,
+            "state.norm",
+            "state.v",
+        ),
+        _ProjectionSpec(
+            "o",
+            "attention.out_proj.weight",
+            spec.d_model,
+            spec.q_heads * spec.head_dim,
+            "state.attention",
+            "state.attention_projection",
+        ),
+        _ProjectionSpec(
+            "u",
+            "ffn.up_proj.weight",
+            spec.d_ff,
+            spec.d_model,
+            "state.norm",
+            "state.up",
+        ),
+        _ProjectionSpec(
+            "d",
+            "ffn.down_proj.weight",
+            spec.d_model,
+            spec.d_ff,
+            "state.up_squared",
+            "state.ffn_projection",
+        ),
+    )
 
 
 def _json(value: object) -> str:
@@ -117,80 +183,157 @@ def _append_clamped(path: str) -> str:
     )
 
 
-def _generate_constants(root: Path, tokenizer: GreedyStringPieceTokenizer) -> None:
-    if any(numerator != 1 for numerator, _ in ALIBI_SLOPES):
+def _generate_constants(
+    root: Path, tokenizer: GreedyStringPieceTokenizer, spec: ModelSpec
+) -> None:
+    if any(numerator != 1 for numerator, _ in spec.alibi_slopes):
         raise RuntimeError("the data-pack ALiBi generator requires unit numerators")
     lines = [
         "data modify storage transformer:constants tokenizer_id set value "
         + _snbt_int_array(tokenizer.tokenizer_id_int_array),
         "data modify storage transformer:constants zero64 set value "
-        + _snbt_int_array([0] * MODEL_SPEC.attention_window),
+        + _snbt_int_array([0] * spec.attention_window),
         "data modify storage transformer:constants zero_kv set value ["
-        + ",".join(_snbt_int_array([0] * MODEL_SPEC.head_dim) for _ in range(64))
+        + ",".join(
+            _snbt_int_array([0] * spec.head_dim) for _ in range(spec.attention_window)
+        )
         + "]",
         "data modify storage transformer:constants rms_gain set value "
         + _snbt_int_array(RMS_GAIN_TABLE),
         "data modify storage transformer:constants softmax set value "
-        + _snbt_int_array(EXP_Q15_TABLE),
+        + _snbt_int_array(exp_q15_table(spec.runtime_attention_logit_denominator)),
     ]
     _write(root, FUNCTION_ROOT / "constants/load.mcfunction", lines)
+
+
+def _generate_setup(root: Path, spec: ModelSpec) -> None:
+    lines = [
+        "scoreboard objectives add transformer dummy",
+        "scoreboard players set #zero transformer 0",
+        "scoreboard players set #one transformer 1",
+        "scoreboard players set #two transformer 2",
+        "scoreboard players set #-one transformer -1",
+        f"scoreboard players set #vocab transformer {spec.vocab_size}",
+        f"scoreboard players set #bos transformer {spec.bos_token_id}",
+        f"scoreboard players set #eos transformer {spec.eos_token_id}",
+        f"scoreboard players set #layers transformer {spec.layers}",
+        f"scoreboard players set #d_model transformer {spec.d_model}",
+        f"scoreboard players set #q_heads transformer {spec.q_heads}",
+        f"scoreboard players set #head_dim transformer {spec.head_dim}",
+        f"scoreboard players set #d_ff transformer {spec.d_ff}",
+        f"scoreboard players set #context transformer {spec.context_length}",
+        f"scoreboard players set #window transformer {spec.attention_window}",
+        f"scoreboard players set #cache_last transformer {spec.attention_window - 1}",
+        f"scoreboard players set #softmax_min transformer {SOFTMAX_MIN_DIFFERENCE}",
+        "data modify storage transformer:runtime active_bank set value -1",
+        "function transformer:constants/load",
+    ]
+    _write(root, FUNCTION_ROOT / "setup.mcfunction", lines)
+
+
+def _generate_layer(root: Path, spec: ModelSpec) -> None:
+    lines = [
+        "function transformer:core/rms/run",
+        "function transformer:core/project/q",
+        "function transformer:core/project/k",
+        "function transformer:core/project/v",
+        "execute store result storage transformer:runtime state.macro.layer int 1 run scoreboard players get #layer transformer",
+    ]
+    lines.extend(
+        f"execute if score #layer transformer matches {layer} run function transformer:core/value_embedding/run"
+        for layer in spec.value_embedding_layers
+    )
+    lines.extend(
+        (
+            "function transformer:core/load_layer_cache.macro with storage transformer:runtime state.macro",
+            "data remove storage transformer:runtime state.layer_cache.k[0]",
+            "data remove storage transformer:runtime state.layer_cache.v[0]",
+            "data modify storage transformer:runtime state.layer_cache.k append from storage transformer:runtime state.k",
+            "data modify storage transformer:runtime state.layer_cache.v append from storage transformer:runtime state.v",
+            "function transformer:core/attention/run",
+            "function transformer:core/save_layer_cache.macro with storage transformer:runtime state.macro",
+            "function transformer:core/project/o",
+            "data modify storage transformer:runtime state.delta set from storage transformer:runtime state.attention_projection",
+            "function transformer:core/residual",
+            "",
+            "function transformer:core/rms/run",
+            "function transformer:core/project/up",
+            "function transformer:core/project/down",
+            "data modify storage transformer:runtime state.delta set from storage transformer:runtime state.ffn_projection",
+            "function transformer:core/residual",
+            "",
+            "scoreboard players add #layer transformer 1",
+            "execute if score #layer transformer < #layers transformer run function transformer:core/layer",
+        )
+    )
+    _write(root, FUNCTION_ROOT / "core/layer.mcfunction", lines)
 
 
 def _dense_row(
     *,
     source_path: str,
+    matrix_storage: str,
     matrix_path: str,
     row: int,
     input_width: int,
-    relu_squared: bool,
 ) -> object:
     terms: list[object] = []
     for column in range(input_width):
         source = _storage("transformer:runtime", f"{source_path}[{column}]")
         weight = _storage(
-            "transformer:runtime", f"{matrix_path}[{row * input_width + column}]"
+            matrix_storage, f"{matrix_path}[{row * input_width + column}]"
         )
-        if relu_squared:
-            positive = {"type": "maximum", "operands": [0, source]}
-            terms.append(_product(positive, positive, weight))
-        else:
-            terms.append(_product(source, weight))
+        terms.append(_product(source, weight))
     return _sum(terms)
 
 
 def _generate_projection(
     root: Path,
-    name: str,
-    output_width: int,
-    input_width: int,
-    *,
-    relu_squared: bool = False,
+    projection: _ProjectionSpec,
 ) -> None:
-    source_path = "state.up" if relu_squared else "state.source"
-    lines = ["data modify storage transformer:runtime state.projected set value [I;]"]
-    for row in range(output_width):
+    lines = [
+        f"data modify storage transformer:runtime {projection.output_path} set value [I;]"
+    ]
+    for row in range(projection.output_width):
         lines.extend(
             (
-                "data modify storage transformer:runtime state.acc set compute default "
+                "$data modify storage transformer:runtime state.acc set compute default "
                 + _json(
                     _dense_row(
-                        source_path=source_path,
-                        matrix_path="state.matrix",
+                        source_path=projection.source_path,
+                        matrix_storage="$(s)",
+                        matrix_path="$(w)",
                         row=row,
-                        input_width=input_width,
-                        relu_squared=relu_squared,
+                        input_width=projection.input_width,
                     )
                 )
                 + " integer",
-                "function transformer:core/generated/requant/append_projected.macro with storage transformer:runtime state.macro",
+                f"$data modify storage transformer:runtime {projection.output_path} append compute default $(rq) integer",
             )
         )
-    _write(root, FUNCTION_ROOT / f"core/generated/project/{name}.mcfunction", lines)
+    _write(
+        root,
+        FUNCTION_ROOT / f"core/generated/project/{projection.code}.mcfunction",
+        lines,
+    )
 
 
-def _generate_rms(root: Path) -> None:
+def _generate_relu_squared(root: Path, spec: ModelSpec) -> None:
+    lines = ["data modify storage transformer:runtime state.up_squared set value [I;]"]
+    for index in range(spec.d_ff):
+        source = _storage("transformer:runtime", f"state.up[{index}]")
+        positive = {"type": "maximum", "operands": [0, source]}
+        lines.append(
+            "data modify storage transformer:runtime state.up_squared append compute default "
+            + _json(_product(positive, positive))
+            + " integer"
+        )
+    _write(root, FUNCTION_ROOT / "core/generated/relu_squared/run.mcfunction", lines)
+
+
+def _generate_rms(root: Path, spec: ModelSpec) -> None:
     squares = []
-    for index in range(MODEL_SPEC.d_model):
+    for index in range(spec.d_model):
         value = _storage("transformer:runtime", f"state.hidden[{index}]")
         squares.append(_product(value, value))
     _write(
@@ -199,7 +342,7 @@ def _generate_rms(root: Path) -> None:
         [_compute_to_score("#sum_square", _sum(squares))],
     )
     lines = ["data modify storage transformer:runtime state.norm set value [I;]"]
-    for index in range(MODEL_SPEC.d_model):
+    for index in range(spec.d_model):
         product = _product(
             _storage("transformer:runtime", f"state.hidden[{index}]"),
             _score("#gain"),
@@ -222,9 +365,9 @@ def _generate_rms(root: Path) -> None:
     _write(root, FUNCTION_ROOT / "core/generated/rms/normalize.mcfunction", lines)
 
 
-def _generate_residual(root: Path) -> None:
+def _generate_residual(root: Path, spec: ModelSpec) -> None:
     lines = ["data modify storage transformer:runtime state.hidden set value [I;]"]
-    for index in range(MODEL_SPEC.d_model):
+    for index in range(spec.d_model):
         provider = {
             "type": "maximum",
             "operands": [
@@ -255,17 +398,17 @@ def _generate_residual(root: Path) -> None:
     _write(root, FUNCTION_ROOT / "core/generated/residual/run.mcfunction", lines)
 
 
-def _generate_attention(root: Path) -> None:
+def _generate_attention(root: Path, spec: ModelSpec) -> None:
     _write(
         root,
         FUNCTION_ROOT / "core/generated/attention/qk_dispatch.macro.mcfunction",
         ["$function transformer:core/generated/attention/qk_$(head)_$(key)"],
     )
-    for head in range(MODEL_SPEC.q_heads):
-        q_base = head * MODEL_SPEC.head_dim
-        for key in range(MODEL_SPEC.attention_window):
+    for head in range(spec.q_heads):
+        q_base = head * spec.head_dim
+        for key in range(spec.attention_window):
             terms = []
-            for dimension in range(MODEL_SPEC.head_dim):
+            for dimension in range(spec.head_dim):
                 terms.append(
                     _product(
                         _storage(
@@ -278,8 +421,10 @@ def _generate_attention(root: Path) -> None:
                     )
                 )
             bias = _round_half_away_ratio(
-                -16 * ALIBI_SLOPES[head][0] * (MODEL_SPEC.attention_window - 1 - key),
-                ALIBI_SLOPES[head][1],
+                -spec.runtime_attention_logit_denominator
+                * spec.alibi_slopes[head][0]
+                * (spec.attention_window - 1 - key),
+                spec.alibi_slopes[head][1],
             )
             lines = [
                 "data modify storage transformer:runtime state.acc set compute default "
@@ -305,9 +450,9 @@ def _generate_attention(root: Path) -> None:
             )
 
     lines: list[str] = []
-    for dimension in range(MODEL_SPEC.head_dim):
+    for dimension in range(spec.head_dim):
         terms = []
-        for key in range(MODEL_SPEC.attention_window):
+        for key in range(spec.attention_window):
             terms.append(
                 _product(
                     _storage("transformer:runtime", f"state.weights[{key}]"),
@@ -327,51 +472,91 @@ def _generate_attention(root: Path) -> None:
     _write(root, FUNCTION_ROOT / "core/generated/attention/value.mcfunction", lines)
 
 
-def _generate_requantizers(root: Path) -> None:
+def _generate_value_embedding(root: Path, spec: ModelSpec) -> None:
+    runtime_directory = root / FUNCTION_ROOT / "core/value_embedding"
+    if runtime_directory.exists():
+        shutil.rmtree(runtime_directory)
+    if not spec.value_embedding_layers:
+        return
+
     _write(
         root,
-        FUNCTION_ROOT / "core/generated/requant/append_projected.macro.mcfunction",
-        ["$function transformer:core/generated/requant/projected_s$(shift)"],
+        FUNCTION_ROOT / "core/value_embedding/run.mcfunction",
+        [
+            "execute store result storage transformer:runtime state.macro.token int 1 run scoreboard players get #token transformer",
+            "function transformer:core/generated/value_embedding/dispatch.macro with storage transformer:runtime state.macro",
+        ],
     )
-    source = _storage("transformer:runtime", "state.acc")
-    for shift in range(31):
+    _write(
+        root,
+        FUNCTION_ROOT / "core/generated/value_embedding/dispatch.macro.mcfunction",
+        [
+            "$function transformer:core/generated/value_embedding/token_$(token).macro with storage transformer:runtime state.macro"
+        ],
+    )
+    width = spec.kv_heads * spec.head_dim
+    for token in range(spec.vocab_size):
+        base = token * width
+        lines = []
+        for dimension in range(width):
+            source = _sum(
+                [
+                    _storage("transformer:runtime", f"state.v[{dimension}]"),
+                    _storage(
+                        "transformer:a$(bank)",
+                        f"ve$(layer)[{base + dimension}]",
+                    ),
+                ]
+            )
+            lines.append(
+                f"$data modify storage transformer:runtime state.v[{dimension}] set compute default "
+                + _json(_requantized_int8_provider(source, 0))
+                + " integer"
+            )
         _write(
             root,
-            FUNCTION_ROOT / f"core/generated/requant/projected_s{shift}.mcfunction",
-            [
-                "data modify storage transformer:runtime state.projected append compute default "
-                + _json(_requantized_int8_provider(source, shift))
-                + " integer"
-            ],
+            FUNCTION_ROOT
+            / f"core/generated/value_embedding/token_{token}.macro.mcfunction",
+            lines,
         )
 
 
-def _generate_logits(root: Path) -> None:
-    lines = [
-        "scoreboard players set #logit_max transformer -2147483648",
-        "scoreboard players set #next_token transformer 0",
-    ]
-    for token in range(MODEL_SPEC.vocab_size):
-        terms = []
-        base = token * MODEL_SPEC.d_model
-        for dimension in range(MODEL_SPEC.d_model):
-            terms.append(
+def _generate_logits(root: Path, spec: ModelSpec) -> None:
+    _write(
+        root,
+        FUNCTION_ROOT / "core/generated/logits/dispatch.macro.mcfunction",
+        ["$function transformer:core/generated/logits/run_a$(bank)"],
+    )
+    for bank in range(2):
+        lines = [
+            "scoreboard players set #logit_max transformer -2147483648",
+            "scoreboard players set #next_token transformer 0",
+        ]
+        weight_path = "e" if spec.tied_lm_head else "l"
+        for token in range(spec.vocab_size):
+            base = token * spec.d_model
+            terms = [
                 _product(
                     _storage("transformer:runtime", f"state.norm[{dimension}]"),
                     _storage(
-                        "transformer:model",
-                        f'weights."token_embedding.weight"[{base + dimension}]',
+                        f"transformer:a{bank}",
+                        f"{weight_path}[{base + dimension}]",
                     ),
                 )
+                for dimension in range(spec.d_model)
+            ]
+            lines.extend(
+                (
+                    _compute_to_score("#acc", _sum(terms)),
+                    f"execute if score #acc transformer > #logit_max transformer run scoreboard players set #next_token transformer {token}",
+                    "execute if score #acc transformer > #logit_max transformer run scoreboard players operation #logit_max transformer = #acc transformer",
+                )
             )
-        lines.extend(
-            (
-                _compute_to_score("#acc", _sum(terms)),
-                f"execute if score #acc transformer > #logit_max transformer run scoreboard players set #next_token transformer {token}",
-                "execute if score #acc transformer > #logit_max transformer run scoreboard players operation #logit_max transformer = #acc transformer",
-            )
+        _write(
+            root,
+            FUNCTION_ROOT / f"core/generated/logits/run_a{bank}.mcfunction",
+            lines,
         )
-    _write(root, FUNCTION_ROOT / "core/generated/logits/run.mcfunction", lines)
 
 
 def _empty_array_type_probe(path: str, tag: str) -> list[str]:
@@ -390,15 +575,17 @@ def _size_check(path: str, size: int) -> list[str]:
     ]
 
 
-def _generate_model_validator(root: Path) -> None:
-    shapes = expected_weight_shapes()
+def _generate_model_validator(root: Path, spec: ModelSpec) -> None:
+    shapes = expected_weight_shapes(spec)
     lines = [
         "scoreboard players set #valid transformer 1",
-        "execute unless data storage transformer:model {abi:{schema:1,architecture_id:"
-        + _json(MODEL_SPEC.architecture_id)
+        "execute unless data storage transformer:model {abi:{schema:"
+        + str(spec.schema_version)
+        + ",architecture_id:"
+        + _json(spec.architecture_id)
         + ",tokenizer_kind:"
-        + _json(MODEL_SPEC.tokenizer_kind)
-        + f",vocab_size:{MODEL_SPEC.vocab_size},bos_id:{MODEL_SPEC.bos_token_id},eos_id:{MODEL_SPEC.eos_token_id}"
+        + _json(spec.tokenizer_kind)
+        + f",vocab_size:{spec.vocab_size},bos_id:{spec.bos_token_id},eos_id:{spec.eos_token_id}"
         + "}} run scoreboard players set #valid transformer 0",
         "data modify storage transformer:validation root set from storage transformer:model",
         "data remove storage transformer:validation root.abi",
@@ -432,10 +619,16 @@ def _generate_model_validator(root: Path) -> None:
                 f"function transformer:model/generated/validate_range_{size}",
             )
         )
+    for name in sorted(zero_shift_weight_names(spec)):
+        quoted = _json(name)
+        lines.extend(
+            (
+                f"execute store result score #shift transformer run data get storage transformer:model shifts.{quoted}[0]",
+                "execute unless score #shift transformer matches 0 run scoreboard players set #valid transformer 0",
+            )
+        )
     lines.extend(
         (
-            'execute store result score #shift transformer run data get storage transformer:model shifts."token_embedding.weight"[0]',
-            "execute unless score #shift transformer matches 0 run scoreboard players set #valid transformer 0",
             "execute unless score #valid transformer matches 1 run return 0",
             "return run scoreboard players get #valid transformer",
         )
@@ -463,6 +656,120 @@ def _generate_model_validator(root: Path) -> None:
             FUNCTION_ROOT / f"model/generated/validate_range_{count}.mcfunction",
             range_lines,
         )
+
+
+def _projection_weight_name(layer: int, projection: _ProjectionSpec) -> str:
+    return f"blocks.{layer}.{projection.weight_suffix}"
+
+
+def _active_weight_name(layer: int, projection: _ProjectionSpec) -> str:
+    return f"w{layer}{projection.code}"
+
+
+def _active_arguments_name(layer: int, projection: _ProjectionSpec) -> str:
+    return f"a{layer}{projection.code}"
+
+
+def _value_embedding_weight_name(layer: int) -> str:
+    return f"blocks.{layer}.attention.value_embedding.weight"
+
+
+def _value_embedding_active_name(layer: int) -> str:
+    return f"ve{layer}"
+
+
+def _generate_model_activation(root: Path, spec: ModelSpec) -> None:
+    projections = _projections(spec)
+    expected_names = set(expected_weight_shapes(spec))
+    staged_names = {"token_embedding.weight"}
+    staged_names.update(
+        _projection_weight_name(layer, projection)
+        for layer in range(spec.layers)
+        for projection in projections
+    )
+    staged_names.update(
+        _value_embedding_weight_name(layer) for layer in spec.value_embedding_layers
+    )
+    if not spec.tied_lm_head:
+        staged_names.add("lm_head.weight")
+    if staged_names != expected_names:
+        raise RuntimeError("active model staging does not cover the model ABI")
+
+    source = _storage("transformer:runtime", "state.acc")
+    _write(
+        root,
+        FUNCTION_ROOT / "model/generated/stage_shift_dispatch.macro.mcfunction",
+        ["$function transformer:model/generated/stage_shift_$(shift)"],
+    )
+    for shift in range(31):
+        provider = _json(_requantized_int8_provider(source, shift))
+        _write(
+            root,
+            FUNCTION_ROOT / f"model/generated/stage_shift_{shift}.mcfunction",
+            [
+                "data modify storage transformer:validation rq set value "
+                + _json(provider)
+            ],
+        )
+
+    _write(
+        root,
+        FUNCTION_ROOT / "model/generated/stage_dispatch.macro.mcfunction",
+        ["$function transformer:model/generated/stage_a$(bank)"],
+    )
+    for bank in range(2):
+        storage = f"transformer:a{bank}"
+        lines = [
+            f'data modify storage {storage} e set from storage transformer:model weights."token_embedding.weight"',
+            f"data modify storage {storage} t set from storage transformer:model abi.tokenizer_id",
+            f"data modify storage {storage} b set from storage transformer:model abi.bos_id",
+        ]
+        if not spec.tied_lm_head:
+            lines.append(
+                f'data modify storage {storage} l set from storage transformer:model weights."lm_head.weight"'
+            )
+        for layer in spec.value_embedding_layers:
+            weight_name = _value_embedding_weight_name(layer)
+            lines.append(
+                f"data modify storage {storage} {_value_embedding_active_name(layer)} set from storage transformer:model weights.{_json(weight_name)}"
+            )
+        for layer in range(spec.layers):
+            for projection in projections:
+                weight_name = _projection_weight_name(layer, projection)
+                weight_path = _active_weight_name(layer, projection)
+                arguments_path = _active_arguments_name(layer, projection)
+                quoted_weight_name = _json(weight_name)
+                lines.extend(
+                    (
+                        f"data modify storage {storage} {weight_path} set from storage transformer:model weights.{quoted_weight_name}",
+                        f"data modify storage {storage} {arguments_path} set value "
+                        + _json({"s": storage, "w": weight_path}),
+                        (
+                            "data modify storage transformer:validation macro.shift set from storage transformer:model "
+                            f"shifts.{quoted_weight_name}[0]"
+                        ),
+                        "function transformer:model/generated/stage_shift_dispatch.macro with storage transformer:validation macro",
+                        f"data modify storage {storage} {arguments_path}.rq set from storage transformer:validation rq",
+                    )
+                )
+        _write(
+            root,
+            FUNCTION_ROOT / f"model/generated/stage_a{bank}.mcfunction",
+            lines,
+        )
+
+    _write(
+        root,
+        FUNCTION_ROOT / "model/activate.mcfunction",
+        [
+            "function transformer:model/validate",
+            "execute unless score #valid transformer matches 1 run return fail",
+            "data modify storage transformer:validation macro.bank set value 0",
+            "execute if data storage transformer:runtime {active_bank:0} run data modify storage transformer:validation macro.bank set value 1",
+            "function transformer:model/generated/stage_dispatch.macro with storage transformer:validation macro",
+            "return run data modify storage transformer:runtime active_bank set from storage transformer:validation macro.bank",
+        ],
+    )
 
 
 @dataclass
@@ -551,28 +858,35 @@ def _generate_tokenizer(root: Path, tokenizer: GreedyStringPieceTokenizer) -> No
     loop_path.write_text(loop_text, encoding="utf-8")
 
 
-def _generate_all(root: Path, tokenizer: GreedyStringPieceTokenizer) -> None:
+def _generate_all(
+    root: Path, tokenizer: GreedyStringPieceTokenizer, spec: ModelSpec
+) -> None:
     core_generated = root / FUNCTION_ROOT / "core/generated"
     if core_generated.exists():
         shutil.rmtree(core_generated)
     model_generated = root / FUNCTION_ROOT / "model/generated"
     if model_generated.exists():
         shutil.rmtree(model_generated)
-    _generate_constants(root, tokenizer)
-    _generate_projection(root, "p96x96", 96, 96)
-    _generate_projection(root, "p16x96", 16, 96)
-    _generate_projection(root, "p192x96", 192, 96)
-    _generate_projection(root, "p96x192_relu2", 96, 192, relu_squared=True)
-    _generate_rms(root)
-    _generate_residual(root)
-    _generate_attention(root)
-    _generate_requantizers(root)
-    _generate_logits(root)
-    _generate_model_validator(root)
+    _generate_setup(root, spec)
+    _generate_layer(root, spec)
+    _generate_constants(root, tokenizer, spec)
+    for projection in _projections(spec):
+        _generate_projection(root, projection)
+    _generate_relu_squared(root, spec)
+    _generate_rms(root, spec)
+    _generate_residual(root, spec)
+    _generate_attention(root, spec)
+    _generate_value_embedding(root, spec)
+    _generate_logits(root, spec)
+    _generate_model_validator(root, spec)
+    _generate_model_activation(root, spec)
     _generate_tokenizer(root, tokenizer)
 
 
-def generate(tokenizer_path: Path, output: Path) -> None:
+def generate(tokenizer_path: Path, output: Path, architecture: str) -> None:
+    if architecture not in ARCHITECTURE_CHOICES:
+        raise ValueError(f"architecture must be one of {ARCHITECTURE_CHOICES}")
+    spec = spec_for_architecture(architecture)
     tokenizer = GreedyStringPieceTokenizer.load(tokenizer_path)
     resolved_output = output.resolve()
     if output.exists():
@@ -586,7 +900,7 @@ def generate(tokenizer_path: Path, output: Path) -> None:
     )
     shutil.rmtree(output / FUNCTION_ROOT / "fixture")
     shutil.rmtree(output / "data/worldless_lab")
-    _generate_all(output, tokenizer)
+    _generate_all(output, tokenizer, spec)
     shutil.copyfile(tokenizer_path, output / "tokenizer.json")
     (output / "tokenizer.sha256").write_text(
         tokenizer.tokenizer_id + "\n", encoding="ascii"
@@ -595,12 +909,13 @@ def generate(tokenizer_path: Path, output: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compile a validated greedy StringPiece tokenizer into a transformer pack."
+        description="Compile a validated tokenizer and architecture into a transformer pack."
     )
+    parser.add_argument("--architecture", choices=ARCHITECTURE_CHOICES, required=True)
     parser.add_argument("tokenizer_json", type=Path)
     parser.add_argument("output_dir", type=Path)
     arguments = parser.parse_args()
-    generate(arguments.tokenizer_json, arguments.output_dir)
+    generate(arguments.tokenizer_json, arguments.output_dir, arguments.architecture)
 
 
 if __name__ == "__main__":

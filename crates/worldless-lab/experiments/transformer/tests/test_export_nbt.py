@@ -16,11 +16,18 @@ from worldless_transformer.export_nbt import (
     encode_command_storage,
     write_command_storage,
 )
-from worldless_transformer.spec import MODEL_SPEC, expected_weight_shapes
+from worldless_transformer.spec import (
+    BASELINE_SPEC,
+    EFFICIENT_Q4_SPEC,
+    EFFICIENT_SPEC,
+    ModelSpec,
+    expected_weight_shapes,
+    zero_shift_weight_names,
+)
 
 
 def _artifact() -> ModelArtifact:
-    shapes = expected_weight_shapes()
+    shapes = expected_weight_shapes(BASELINE_SPEC)
     weights = {name: bytes(math.prod(shape)) for name, shape in shapes.items()}
     embedding = bytearray(weights["token_embedding.weight"])
     embedding[:4] = b"\x81\xff\x00\x7f"
@@ -28,6 +35,7 @@ def _artifact() -> ModelArtifact:
     shifts = {name: index % 31 for index, name in enumerate(shapes)}
     shifts["token_embedding.weight"] = 0
     return ModelArtifact.create(
+        spec=BASELINE_SPEC,
         tokenizer_id=hashlib.sha256(b"canonical tokenizer json").digest(),
         weights=weights,
         shifts=shifts,
@@ -108,8 +116,8 @@ def test_export_matches_worldless_command_storage_envelope_and_abi() -> None:
     bundle = root["data"]["contents"]["model"]
     assert set(bundle) == {"abi", "weights", "biases", "shifts"}
     assert bundle["biases"] == {}
-    assert set(bundle["weights"]) == set(expected_weight_shapes())
-    assert set(bundle["shifts"]) == set(expected_weight_shapes())
+    assert set(bundle["weights"]) == set(expected_weight_shapes(BASELINE_SPEC))
+    assert set(bundle["shifts"]) == set(expected_weight_shapes(BASELINE_SPEC))
     assert struct.unpack(">4b", bundle["weights"]["token_embedding.weight"][:4]) == (
         -127,
         -1,
@@ -128,15 +136,37 @@ def test_export_matches_worldless_command_storage_envelope_and_abi() -> None:
         "eos_id",
     }
     assert abi == {
-        "schema": MODEL_SPEC.schema_version,
-        "architecture_id": MODEL_SPEC.architecture_id,
+        "schema": BASELINE_SPEC.schema_version,
+        "architecture_id": BASELINE_SPEC.architecture_id,
         "tokenizer_id": artifact.tokenizer_id,
-        "tokenizer_kind": MODEL_SPEC.tokenizer_kind,
+        "tokenizer_kind": BASELINE_SPEC.tokenizer_kind,
         "vocab_size": 512,
         "bos_id": 510,
         "eos_id": 511,
     }
     assert bundle["shifts"]["blocks.0.attention.q_proj.weight"] == (1,)
+
+
+@pytest.mark.parametrize("spec", [BASELINE_SPEC, EFFICIENT_SPEC, EFFICIENT_Q4_SPEC])
+def test_export_uses_selected_architecture_contract(spec: ModelSpec) -> None:
+    shapes = expected_weight_shapes(spec)
+    weights = {name: bytes(math.prod(shape)) for name, shape in shapes.items()}
+    shifts = {name: 1 for name in shapes}
+    for name in zero_shift_weight_names(spec):
+        shifts[name] = 0
+    artifact = ModelArtifact.create(
+        spec=spec,
+        tokenizer_id=bytes(32),
+        weights=weights,
+        shifts=shifts,
+    )
+
+    bundle = _decode(encode_command_storage(artifact))["data"]["contents"]["model"]
+
+    assert bundle["abi"]["architecture_id"] == spec.architecture_id
+    assert "attention_logit_denominator" not in bundle["abi"]
+    assert set(bundle["weights"]) == set(shapes)
+    assert set(bundle["shifts"]) == set(shapes)
 
 
 def test_gzip_and_uncompressed_encodings_are_deterministic() -> None:

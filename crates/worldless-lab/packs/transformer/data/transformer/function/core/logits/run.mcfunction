@@ -1,1 +1,1 @@
-function transformer:core/generated/logits/run
+function transformer:core/generated/logits/dispatch.macro with storage transformer:runtime state.macro

@@ -10,9 +10,20 @@ from .data import iter_tinystories, write_token_stream
 from .export_nbt import write_command_storage
 from .model import Transformer
 from .reference import ExactRuntimeReference
-from .spec import MODEL_SPEC
+from .spec import (
+    ARCHITECTURE_CHOICES,
+    ATTENTION_LOGIT_DENOMINATOR_CANDIDATES,
+    DATA_SPEC,
+    spec_for_architecture,
+)
 from .tokenizer import GreedyStringPieceTokenizer, train_tokenizer
-from .training import TrainConfig, evaluate_checkpoint, train
+from .training import (
+    TrainConfig,
+    evaluate_all_training_run_checkpoint,
+    evaluate_checkpoint,
+    evaluate_training_run_checkpoint,
+    train,
+)
 
 
 def _positive_integer(value: str) -> int:
@@ -20,6 +31,19 @@ def _positive_integer(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+def _add_evaluation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--tokenizer", type=Path, required=True)
+    parser.add_argument("--validation-tokens", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--batch-size", type=_positive_integer, required=True)
+    parser.add_argument("--batches", type=_positive_integer, required=True)
+    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--device", required=True)
+    parser.add_argument(
+        "--mode", choices=("float", "fake_runtime"), default="fake_runtime"
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -38,6 +62,9 @@ def _parser() -> argparse.ArgumentParser:
 
     train_parser = commands.add_parser("train")
     train_parser.add_argument("--tokenizer", type=Path, required=True)
+    train_parser.add_argument(
+        "--architecture", choices=ARCHITECTURE_CHOICES, required=True
+    )
     train_parser.add_argument("--train-tokens", type=Path, required=True)
     train_parser.add_argument("--validation-tokens", type=Path, required=True)
     train_parser.add_argument("--output", type=Path, required=True)
@@ -51,16 +78,36 @@ def _parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--validation-batches", type=_positive_integer, required=True
     )
+    train_parser.add_argument(
+        "--attention-logit-denominator",
+        type=int,
+        choices=ATTENTION_LOGIT_DENOMINATOR_CANDIDATES,
+    )
+    train_parser.add_argument("--logit-softcap", type=float)
+    warmup = train_parser.add_mutually_exclusive_group()
+    warmup.add_argument("--warmup-ratio", type=float)
+    warmup.add_argument("--warmup-steps", type=int)
+    train_parser.add_argument("--warmdown-ratio", type=float)
+    train_parser.add_argument("--final-learning-rate-fraction", type=float)
+    train_parser.add_argument("--learning-rate-decay", choices=("cosine", "linear"))
+    train_parser.add_argument("--adamw-beta1", type=float)
+    train_parser.add_argument("--adamw-beta2", type=float)
+    train_parser.add_argument("--adamw-epsilon", type=float)
+    train_parser.add_argument("--adamw-weight-decay", type=float)
 
     evaluate = commands.add_parser("evaluate")
-    evaluate.add_argument("--tokenizer", type=Path, required=True)
-    evaluate.add_argument("--validation-tokens", type=Path, required=True)
-    evaluate.add_argument("--checkpoint", type=Path, required=True)
-    evaluate.add_argument("--batch-size", type=_positive_integer, required=True)
-    evaluate.add_argument("--batches", type=_positive_integer, required=True)
-    evaluate.add_argument("--seed", type=int, required=True)
-    evaluate.add_argument("--device", required=True)
-    evaluate.add_argument(
+    _add_evaluation_arguments(evaluate)
+
+    evaluate_run = commands.add_parser("evaluate-run")
+    _add_evaluation_arguments(evaluate_run)
+
+    evaluate_all_run = commands.add_parser("evaluate-all-run")
+    evaluate_all_run.add_argument("--tokenizer", type=Path, required=True)
+    evaluate_all_run.add_argument("--validation-tokens", type=Path, required=True)
+    evaluate_all_run.add_argument("--checkpoint", type=Path, required=True)
+    evaluate_all_run.add_argument("--batch-size", type=_positive_integer, required=True)
+    evaluate_all_run.add_argument("--device", required=True)
+    evaluate_all_run.add_argument(
         "--mode", choices=("float", "fake_runtime"), default="fake_runtime"
     )
 
@@ -83,7 +130,8 @@ def _parser() -> argparse.ArgumentParser:
     export.add_argument("--storage-path", default="model")
     export.add_argument("--uncompressed", action="store_true")
 
-    commands.add_parser("spec")
+    spec = commands.add_parser("spec")
+    spec.add_argument("--architecture", choices=ARCHITECTURE_CHOICES, required=True)
     return parser
 
 
@@ -99,10 +147,10 @@ def _load_model_and_tokenizer(
 
 
 def _prefix_tokens(tokenizer: GreedyStringPieceTokenizer, prefix: str) -> list[int]:
-    tokens = [MODEL_SPEC.bos_token_id, *tokenizer.encode(prefix)]
-    if len(tokens) > MODEL_SPEC.context_length:
+    tokens = [DATA_SPEC.bos_token_id, *tokenizer.encode(prefix)]
+    if len(tokens) > DATA_SPEC.context_length:
         raise ValueError(
-            f"prefix encodes to {len(tokens)} tokens; maximum is {MODEL_SPEC.context_length}"
+            f"prefix encodes to {len(tokens)} tokens; maximum is {DATA_SPEC.context_length}"
         )
     return tokens
 
@@ -123,18 +171,40 @@ def main() -> None:
         )
         print(json.dumps(metadata, sort_keys=True))
     elif arguments.command == "train":
+        optional_config = {
+            field: getattr(arguments, field)
+            for field in (
+                "adamw_beta1",
+                "adamw_beta2",
+                "adamw_epsilon",
+                "adamw_weight_decay",
+                "attention_logit_denominator",
+                "final_learning_rate_fraction",
+                "learning_rate_decay",
+                "logit_softcap",
+                "warmdown_ratio",
+            )
+            if getattr(arguments, field) is not None
+        }
+        if arguments.warmup_ratio is not None:
+            optional_config["warmup_ratio"] = arguments.warmup_ratio
+        elif arguments.warmup_steps is not None:
+            optional_config["warmup_ratio"] = None
+            optional_config["warmup_steps"] = arguments.warmup_steps
         train(
             tokenizer_path=arguments.tokenizer,
             train_tokens=arguments.train_tokens,
             validation_tokens=arguments.validation_tokens,
             output_checkpoint=arguments.output,
             config=TrainConfig(
+                architecture=arguments.architecture,
                 batch_size=arguments.batch_size,
                 learning_rate=arguments.learning_rate,
                 seed=arguments.seed,
                 device=arguments.device,
                 mode=arguments.mode,
                 validation_batches=arguments.validation_batches,
+                **optional_config,
             ),
         )
     elif arguments.command == "evaluate":
@@ -149,12 +219,39 @@ def main() -> None:
             mode=arguments.mode,
         )
         print(json.dumps(result, sort_keys=True))
+    elif arguments.command == "evaluate-run":
+        result = evaluate_training_run_checkpoint(
+            tokenizer_path=arguments.tokenizer,
+            validation_tokens=arguments.validation_tokens,
+            checkpoint_path=arguments.checkpoint,
+            batch_size=arguments.batch_size,
+            batches=arguments.batches,
+            seed=arguments.seed,
+            device_name=arguments.device,
+            mode=arguments.mode,
+        )
+        print(json.dumps(result, sort_keys=True))
+    elif arguments.command == "evaluate-all-run":
+        result = evaluate_all_training_run_checkpoint(
+            tokenizer_path=arguments.tokenizer,
+            validation_tokens=arguments.validation_tokens,
+            checkpoint_path=arguments.checkpoint,
+            batch_size=arguments.batch_size,
+            device_name=arguments.device,
+            mode=arguments.mode,
+        )
+        print(json.dumps(result, sort_keys=True))
     elif arguments.command == "trace":
         tokenizer, model = _load_model_and_tokenizer(
             arguments.tokenizer, arguments.checkpoint
         )
+        model.require_runtime_compatible()
         tokens = _prefix_tokens(tokenizer, arguments.prefix)
-        trace = ExactRuntimeReference(model.runtime_state()).golden_trace(tokens)
+        trace = ExactRuntimeReference(
+            model.runtime_state(),
+            model.spec,
+            attention_logit_denominator=model.attention_logit_denominator,
+        ).golden_trace(tokens)
         if arguments.output.exists():
             raise FileExistsError(f"refusing to replace trace: {arguments.output}")
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
@@ -164,10 +261,13 @@ def main() -> None:
         tokenizer, model = _load_model_and_tokenizer(
             arguments.tokenizer, arguments.checkpoint
         )
+        model.require_runtime_compatible()
         prefix_tokens = _prefix_tokens(tokenizer, arguments.prefix)
-        generated = ExactRuntimeReference(model.runtime_state()).generate(
-            prefix_tokens, max_new_tokens=arguments.max_new_tokens
-        )
+        generated = ExactRuntimeReference(
+            model.runtime_state(),
+            model.spec,
+            attention_logit_denominator=model.attention_logit_denominator,
+        ).generate(prefix_tokens, max_new_tokens=arguments.max_new_tokens)
         completion = tokenizer.decode_completion(generated[len(prefix_tokens) :])
         print(
             json.dumps(
@@ -180,8 +280,10 @@ def main() -> None:
         tokenizer, model = _load_model_and_tokenizer(
             arguments.tokenizer, arguments.checkpoint
         )
+        model.require_runtime_compatible()
         runtime_state = model.runtime_state()
         artifact = ModelArtifact.create(
+            spec=model.spec,
             tokenizer_id=tokenizer.tokenizer_id,
             weights=runtime_state.weights,
             shifts=runtime_state.shifts,
@@ -194,10 +296,14 @@ def main() -> None:
             compressed=not arguments.uncompressed,
         )
     elif arguments.command == "spec":
-        model = Transformer()
+        selected_spec = spec_for_architecture(arguments.architecture)
+        model = Transformer(selected_spec)
         print(
             json.dumps(
-                {**MODEL_SPEC.to_dict(), "parameter_count": model.parameter_count()},
+                {
+                    **selected_spec.to_dict(),
+                    "parameter_count": model.parameter_count(),
+                },
                 sort_keys=True,
             )
         )

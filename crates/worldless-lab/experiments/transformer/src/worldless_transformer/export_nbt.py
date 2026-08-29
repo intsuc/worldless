@@ -9,7 +9,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from .artifact import ArtifactValidationError, ModelArtifact
-from .spec import MODEL_SPEC, expected_weight_shapes
+from .spec import ModelSpec, expected_weight_shapes, spec_for_architecture_id
 
 # This is the command-storage data version accepted by the target Minecraft
 # version and by worldless::command_storage_file.
@@ -47,14 +47,15 @@ def encode_command_storage(
     if not isinstance(compressed, bool):
         raise NbtExportError("compressed must be a boolean")
     artifact.validate()
+    spec = spec_for_architecture_id(artifact.architecture_id)
     _validate_storage_path(storage_path)
 
     bundle = _compound_payload(
         (
-            ("abi", _TAG_COMPOUND, _abi_payload(artifact)),
-            ("weights", _TAG_COMPOUND, _weights_payload(artifact)),
+            ("abi", _TAG_COMPOUND, _abi_payload(artifact, spec)),
+            ("weights", _TAG_COMPOUND, _weights_payload(artifact, spec)),
             ("biases", _TAG_COMPOUND, _compound_payload(())),
-            ("shifts", _TAG_COMPOUND, _shifts_payload(artifact)),
+            ("shifts", _TAG_COMPOUND, _shifts_payload(artifact, spec)),
         )
     )
     contents = _compound_payload(((storage_path, _TAG_COMPOUND, bundle),))
@@ -95,8 +96,7 @@ def write_command_storage(
             )
 
 
-def _abi_payload(artifact: ModelArtifact) -> bytes:
-    spec = MODEL_SPEC
+def _abi_payload(artifact: ModelArtifact, spec: ModelSpec) -> bytes:
     return _compound_payload(
         (
             ("schema", _TAG_INT, _int_payload(spec.schema_version)),
@@ -122,25 +122,25 @@ def _abi_payload(artifact: ModelArtifact) -> bytes:
     )
 
 
-def _weights_payload(artifact: ModelArtifact) -> bytes:
+def _weights_payload(artifact: ModelArtifact, spec: ModelSpec) -> bytes:
     return _compound_payload(
         (
             name,
             _TAG_BYTE_ARRAY,
             _byte_array_payload(artifact.weights[name], name),
         )
-        for name in expected_weight_shapes()
+        for name in expected_weight_shapes(spec)
     )
 
 
-def _shifts_payload(artifact: ModelArtifact) -> bytes:
+def _shifts_payload(artifact: ModelArtifact, spec: ModelSpec) -> bytes:
     return _compound_payload(
         (
             name,
             _TAG_INT_ARRAY,
             _int_array_payload(artifact.shifts[name], f"shifts[{name!r}]"),
         )
-        for name in expected_weight_shapes()
+        for name in expected_weight_shapes(spec)
     )
 
 

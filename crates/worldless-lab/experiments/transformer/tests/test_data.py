@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from worldless_transformer import data
+from worldless_transformer.spec import DATA_ABI_ID
 
 
 def test_preprocessing_keeps_short_stories_and_never_crosses_boundaries(
@@ -27,6 +28,7 @@ def test_preprocessing_keeps_short_stories_and_never_crosses_boundaries(
 
     assert metadata["raw_utf8_byte_count"] == 320
     assert metadata["prediction_count"] == 322
+    assert metadata["data_abi_id"] == DATA_ABI_ID
     stream = data.load_token_stream(
         path,
         expected_tokenizer_id=tokenizer.tokenizer_id,
@@ -51,6 +53,29 @@ def test_preprocessing_keeps_short_stories_and_never_crosses_boundaries(
     )
     assert inputs.shape == targets.shape == loss_mask.shape == (2, 256)
     assert loss_mask.sum(axis=1).tolist() == [21, 45]
+
+
+def test_loader_rejects_the_old_architecture_coupled_data_sidecar(
+    tmp_path, monkeypatch, tokenizer
+) -> None:
+    monkeypatch.setattr(
+        data,
+        "iter_tinystories",
+        lambda split, *, limit=None: iter(["ab"]),
+    )
+    path = tmp_path / "validation.bin"
+    data.write_token_stream(path, split="validation", tokenizer=tokenizer, limit=1)
+    sidecar = data.metadata_path(path)
+    metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+    metadata["architecture_id"] = metadata.pop("data_abi_id")
+    sidecar.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid schema"):
+        data.load_token_stream(
+            path,
+            expected_tokenizer_id=tokenizer.tokenizer_id,
+            expected_split="validation",
+        )
 
 
 @pytest.mark.parametrize(

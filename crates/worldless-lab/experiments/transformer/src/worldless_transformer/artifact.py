@@ -9,32 +9,17 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+
+from .spec import (
+    ModelSpec,
+    expected_weight_shapes,
+    spec_for_architecture_id,
+    zero_shift_weight_names,
+)
 
 
 class ArtifactValidationError(ValueError):
     """A model artifact does not satisfy the fixed Worldless runtime ABI."""
-
-
-def _model_spec() -> Any:
-    # Kept lazy so tooling which only inspects this module does not need to
-    # initialize PyTorch or the training package.
-    from .spec import MODEL_SPEC
-
-    return MODEL_SPEC
-
-
-def _architecture_id(spec: Any) -> str:
-    value = getattr(spec, "architecture_id", None)
-    if not isinstance(value, str) or not value:
-        raise RuntimeError("MODEL_SPEC.architecture_id must be a non-empty string")
-    return value
-
-
-def _expected_weight_shapes() -> Mapping[str, tuple[int, ...]]:
-    from .spec import expected_weight_shapes as spec_weight_shapes
-
-    return MappingProxyType(spec_weight_shapes())
 
 
 def _digest_to_int_array(digest: bytes | str) -> tuple[int, ...]:
@@ -82,23 +67,23 @@ class ModelArtifact:
     def create(
         cls,
         *,
+        spec: ModelSpec,
         tokenizer_id: bytes | str | Sequence[int],
         weights: Mapping[str, object],
         shifts: Mapping[str, Sequence[int] | int],
         biases: Mapping[str, Sequence[int]] | None = None,
-        architecture_id: str | None = None,
     ) -> ModelArtifact:
         """Validate and freeze values supplied by a quantization pipeline."""
 
-        spec = _model_spec()
-        expected_architecture_id = _architecture_id(spec)
-        selected_architecture_id = (
-            expected_architecture_id if architecture_id is None else architecture_id
-        )
-        if selected_architecture_id != expected_architecture_id:
+        try:
+            selected_spec = spec_for_architecture_id(spec.architecture_id)
+        except (AttributeError, ValueError) as error:
             raise ArtifactValidationError(
-                "architecture_id does not match MODEL_SPEC: "
-                f"expected {expected_architecture_id!r}, got {selected_architecture_id!r}"
+                "spec must identify a known architecture"
+            ) from error
+        if spec != selected_spec:
+            raise ArtifactValidationError(
+                "spec must exactly match a known architecture"
             )
 
         if isinstance(tokenizer_id, (bytes, str)):
@@ -108,7 +93,7 @@ class ModelArtifact:
                 tokenizer_id, "tokenizer_id", expected_length=8
             )
 
-        shapes = _expected_weight_shapes()
+        shapes = MappingProxyType(expected_weight_shapes(selected_spec))
         _require_exact_keys(weights, shapes, "weights")
         normalized_weights = {
             name: _int8_tensor_bytes(weights[name], shape, f"weights[{name!r}]")
@@ -138,14 +123,15 @@ class ModelArtifact:
                 )
             normalized_shifts[name] = normalized
 
-        embedding_shift = normalized_shifts["token_embedding.weight"][0]
-        if embedding_shift != 0:
-            raise ArtifactValidationError(
-                f"shifts['token_embedding.weight'][0] must be 0, got {embedding_shift}"
-            )
+        for name in zero_shift_weight_names(selected_spec):
+            shift = normalized_shifts[name][0]
+            if shift != 0:
+                raise ArtifactValidationError(
+                    f"shifts[{name!r}][0] must be 0, got {shift}"
+                )
 
         return cls(
-            architecture_id=selected_architecture_id,
+            architecture_id=selected_spec.architecture_id,
             tokenizer_id=normalized_tokenizer_id,
             weights=MappingProxyType(normalized_weights),
             biases=MappingProxyType({}),
@@ -167,18 +153,18 @@ class ModelArtifact:
     def validate(self) -> None:
         """Recheck the complete artifact, including externally supplied mappings."""
 
-        expected_architecture_id = _architecture_id(_model_spec())
-        if self.architecture_id != expected_architecture_id:
+        try:
+            spec = spec_for_architecture_id(self.architecture_id)
+        except ValueError as error:
             raise ArtifactValidationError(
-                "architecture_id does not match MODEL_SPEC: "
-                f"expected {expected_architecture_id!r}, got {self.architecture_id!r}"
-            )
+                "architecture_id must identify a known architecture"
+            ) from error
         if not isinstance(self.tokenizer_id, tuple):
             raise ArtifactValidationError(
                 "construct ModelArtifact with ModelArtifact.create()"
             )
         _int32_array(self.tokenizer_id, "tokenizer_id", expected_length=8)
-        shapes = _expected_weight_shapes()
+        shapes = MappingProxyType(expected_weight_shapes(spec))
         _require_exact_keys(self.weights, shapes, "weights")
         for name, shape in shapes.items():
             value = self.weights[name]
@@ -202,10 +188,9 @@ class ModelArtifact:
                     f"shifts[{name!r}][0] must be in {shift_min}..{shift_max}, "
                     f"got {normalized[0]}"
                 )
-        if self.shifts["token_embedding.weight"][0] != 0:
-            raise ArtifactValidationError(
-                "shifts['token_embedding.weight'][0] must be 0"
-            )
+        for name in zero_shift_weight_names(spec):
+            if self.shifts[name][0] != 0:
+                raise ArtifactValidationError(f"shifts[{name!r}][0] must be 0")
 
 
 def _require_exact_keys(
@@ -334,7 +319,7 @@ def _element_count(shape: tuple[int, ...]) -> int:
     count = 1
     for dimension in shape:
         if not _is_plain_int(dimension) or dimension <= 0:
-            raise RuntimeError(f"MODEL_SPEC produced invalid tensor shape {shape!r}")
+            raise RuntimeError(f"model spec produced invalid tensor shape {shape!r}")
         count *= dimension
     return count
 

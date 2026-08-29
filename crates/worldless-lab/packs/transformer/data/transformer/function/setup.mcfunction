@@ -15,4 +15,5 @@ scoreboard players set #context transformer 256
 scoreboard players set #window transformer 64
 scoreboard players set #cache_last transformer 63
 scoreboard players set #softmax_min transformer -255
+data modify storage transformer:runtime active_bank set value -1
 function transformer:constants/load

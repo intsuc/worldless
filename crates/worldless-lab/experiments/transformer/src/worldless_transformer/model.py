@@ -21,20 +21,21 @@ from .quantization import (
     ste,
 )
 from .spec import (
-    ALIBI_SLOPES,
     ATTENTION_SCORE_SHIFT,
+    BASELINE_SPEC,
     DEFAULT_DENSE_SHIFTS,
-    EXP_Q15_TABLE,
+    EFFICIENT_Q4_SPEC,
+    EFFICIENT_SPEC,
     INT32_MIN,
-    MODEL_SPEC,
     RMS_GAIN_FRACTION_BITS,
     RMS_GAIN_TABLE,
     RMS_TARGET,
-    SOFTMAX_LOGIT_DENOMINATOR,
     SOFTMAX_MIN_DIFFERENCE,
     TRAINING_LOGIT_SHIFT,
     ModelSpec,
+    exp_q15_table,
     expected_weight_shapes,
+    zero_shift_weight_names,
 )
 
 ExecutionMode = Literal["float", "fake_runtime"]
@@ -49,8 +50,8 @@ def _validate_mode(mode: str) -> ExecutionMode:
 class AffineFreeRMSNorm(nn.Module):
     def __init__(self, width: int) -> None:
         super().__init__()
-        if width != MODEL_SPEC.d_model:
-            raise ValueError(f"RMSNorm width must be {MODEL_SPEC.d_model}")
+        if width != BASELINE_SPEC.d_model:
+            raise ValueError(f"RMSNorm width must be {BASELINE_SPEC.d_model}")
         self.width = width
         self.register_buffer(
             "_gain_table",
@@ -137,21 +138,31 @@ def _valid_attention_mask(length: int, window: int, device: torch.device) -> Ten
     return (distances >= 0) & (distances < window)
 
 
-def _float_alibi_bias(length: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+def _float_alibi_bias(
+    length: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    slopes: tuple[tuple[int, int], ...],
+) -> Tensor:
     distance = _relative_distances(length, device).to(dtype)
     slopes = torch.tensor(
-        [numerator / denominator for numerator, denominator in ALIBI_SLOPES],
+        [numerator / denominator for numerator, denominator in slopes],
         device=device,
         dtype=dtype,
     )
     return -slopes[:, None, None] * distance[None, :, :]
 
 
-def _integer_alibi_bias(length: int, device: torch.device) -> Tensor:
+def _integer_alibi_bias(
+    length: int,
+    device: torch.device,
+    logit_denominator: int,
+    slopes: tuple[tuple[int, int], ...],
+) -> Tensor:
     distance = _relative_distances(length, device)
     per_head: list[Tensor] = []
-    for numerator, denominator in ALIBI_SLOPES:
-        bias_numerator = -16 * numerator * distance
+    for numerator, denominator in slopes:
+        bias_numerator = -logit_denominator * numerator * distance
         per_head.append(
             rounded_divide_int(
                 bias_numerator,
@@ -162,9 +173,16 @@ def _integer_alibi_bias(length: int, device: torch.device) -> Tensor:
 
 
 class MultiQueryAttention(nn.Module):
-    def __init__(self, spec: ModelSpec) -> None:
+    def __init__(
+        self,
+        spec: ModelSpec,
+        *,
+        layer_index: int,
+        logit_denominator: int,
+    ) -> None:
         super().__init__()
         self.spec = spec
+        self.logit_denominator = logit_denominator
         self.q_proj = RuntimeLinear(
             spec.d_model,
             spec.q_heads * spec.head_dim,
@@ -180,6 +198,14 @@ class MultiQueryAttention(nn.Module):
             spec.kv_heads * spec.head_dim,
             shift=DEFAULT_DENSE_SHIFTS["v_proj"],
         )
+        self.value_embedding: nn.Embedding | None
+        if layer_index in spec.value_embedding_layers:
+            self.value_embedding = nn.Embedding(
+                spec.vocab_size, spec.kv_heads * spec.head_dim
+            )
+            nn.init.normal_(self.value_embedding.weight, mean=0.0, std=1.0)
+        else:
+            self.value_embedding = None
         self.out_proj = RuntimeLinear(
             spec.q_heads * spec.head_dim,
             spec.d_model,
@@ -188,7 +214,7 @@ class MultiQueryAttention(nn.Module):
         )
         self.register_buffer(
             "_exp_table",
-            torch.tensor(EXP_Q15_TABLE, dtype=torch.int64),
+            torch.tensor(exp_q15_table(logit_denominator), dtype=torch.int64),
             persistent=False,
         )
 
@@ -211,10 +237,12 @@ class MultiQueryAttention(nn.Module):
         key_heads = self._expand_kv_heads(key).transpose(1, 2)
         value_heads = self._expand_kv_heads(value).transpose(1, 2)
         scores = torch.matmul(query_heads, key_heads.transpose(-1, -2))
-        scores = scores / ((2**ATTENTION_SCORE_SHIFT) * SOFTMAX_LOGIT_DENOMINATOR)
+        scores = scores / ((2**ATTENTION_SCORE_SHIFT) * self.logit_denominator)
         scores = (
             scores
-            + _float_alibi_bias(length, scores.device, scores.dtype)[None, :, :, :]
+            + _float_alibi_bias(
+                length, scores.device, scores.dtype, self.spec.alibi_slopes
+            )[None, :, :, :]
         )
         valid = _valid_attention_mask(length, self.spec.attention_window, scores.device)
         scores = scores.masked_fill(~valid[None, None, :, :], -torch.inf)
@@ -235,7 +263,15 @@ class MultiQueryAttention(nn.Module):
         )
         dots = exact_integer_matmul(query_heads, key_heads.transpose(-1, -2))
         scores = round_shift_int(saturate_int32(dots), ATTENTION_SCORE_SHIFT)
-        scores = scores + _integer_alibi_bias(length, scores.device)[None, :, :, :]
+        scores = (
+            scores
+            + _integer_alibi_bias(
+                length,
+                scores.device,
+                self.logit_denominator,
+                self.spec.alibi_slopes,
+            )[None, :, :, :]
+        )
         valid = _valid_attention_mask(
             length, self.spec.attention_window, scores.device
         )[None, None, :, :]
@@ -252,10 +288,31 @@ class MultiQueryAttention(nn.Module):
             query.shape[0], length, self.spec.q_heads * self.spec.head_dim
         )
 
-    def forward(self, inputs: Tensor, *, mode: ExecutionMode) -> Tensor:
+    def _project_value(
+        self, inputs: Tensor, token_ids: Tensor, *, mode: ExecutionMode
+    ) -> Tensor:
+        projected = self.v_proj(inputs, mode=mode)
+        if self.value_embedding is None:
+            return projected
+        if mode == "float":
+            return projected + self.value_embedding(token_ids)
+
+        quantized_embedding = quantize_int8(self.value_embedding.weight)
+        embedded = quantized_embedding[token_ids]
+        exact = clamp_int8(
+            quantize_int8(projected).to(torch.int32) + embedded.to(torch.int32)
+        ).to(torch.int8)
+        surrogate = (
+            projected + fake_quantize_int8(self.value_embedding.weight)[token_ids]
+        )
+        return ste(exact, surrogate)
+
+    def forward(
+        self, inputs: Tensor, token_ids: Tensor, *, mode: ExecutionMode
+    ) -> Tensor:
         query = self._reshape_queries(self.q_proj(inputs, mode=mode))
         key = self._reshape_kv(self.k_proj(inputs, mode=mode))
-        value = self._reshape_kv(self.v_proj(inputs, mode=mode))
+        value = self._reshape_kv(self._project_value(inputs, token_ids, mode=mode))
         if mode == "float":
             context = self._float_attention(query, key, value)
         else:
@@ -301,30 +358,83 @@ def _residual_add(residual: Tensor, update: Tensor, mode: ExecutionMode) -> Tens
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, spec: ModelSpec) -> None:
+    def __init__(
+        self,
+        spec: ModelSpec,
+        *,
+        layer_index: int,
+        attention_logit_denominator: int,
+    ) -> None:
         super().__init__()
         self.attn_norm = AffineFreeRMSNorm(spec.d_model)
-        self.attention = MultiQueryAttention(spec)
+        self.attention = MultiQueryAttention(
+            spec,
+            layer_index=layer_index,
+            logit_denominator=attention_logit_denominator,
+        )
         self.ffn_norm = AffineFreeRMSNorm(spec.d_model)
         self.ffn = ReluSquaredFFN(spec)
 
-    def forward(self, inputs: Tensor, *, mode: ExecutionMode) -> Tensor:
-        attention = self.attention(self.attn_norm(inputs, mode=mode), mode=mode)
+    def forward(
+        self, inputs: Tensor, token_ids: Tensor, *, mode: ExecutionMode
+    ) -> Tensor:
+        attention = self.attention(
+            self.attn_norm(inputs, mode=mode), token_ids, mode=mode
+        )
         hidden = _residual_add(inputs, attention, mode)
         feed_forward = self.ffn(self.ffn_norm(hidden, mode=mode), mode=mode)
         return _residual_add(hidden, feed_forward, mode)
 
 
 class Transformer(nn.Module):
-    def __init__(self, spec: ModelSpec = MODEL_SPEC) -> None:
+    def __init__(
+        self,
+        spec: ModelSpec,
+        *,
+        attention_logit_denominator: int | None = None,
+    ) -> None:
         super().__init__()
-        if spec != MODEL_SPEC:
-            raise ValueError("spec must match the fixed MODEL_SPEC")
+        if spec not in (BASELINE_SPEC, EFFICIENT_SPEC, EFFICIENT_Q4_SPEC):
+            raise ValueError("spec must match a known architecture")
+        resolved_logit_denominator = (
+            spec.runtime_attention_logit_denominator
+            if attention_logit_denominator is None
+            else attention_logit_denominator
+        )
+        exp_q15_table(resolved_logit_denominator)
         self.spec = spec
+        self.attention_logit_denominator = resolved_logit_denominator
         self.token_embedding = nn.Embedding(spec.vocab_size, spec.d_model)
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=2.0)
-        self.blocks = nn.ModuleList(TransformerBlock(spec) for _ in range(spec.layers))
+        self.blocks = nn.ModuleList(
+            TransformerBlock(
+                spec,
+                layer_index=layer_index,
+                attention_logit_denominator=resolved_logit_denominator,
+            )
+            for layer_index in range(spec.layers)
+        )
         self.final_norm = AffineFreeRMSNorm(spec.d_model)
+        self.lm_head: nn.Linear | None
+        if spec.tied_lm_head:
+            self.lm_head = None
+        else:
+            self.lm_head = nn.Linear(spec.d_model, spec.vocab_size, bias=False)
+            nn.init.normal_(self.lm_head.weight, mean=0.0, std=2.0)
+
+    def require_runtime_compatible(self) -> None:
+        if not self.spec.data_pack_runtime_compatible:
+            raise ValueError(
+                f"architecture {self.spec.architecture_id!r} is not supported by "
+                "the data-pack runtime"
+            )
+        required_denominator = self.spec.runtime_attention_logit_denominator
+        if self.attention_logit_denominator != required_denominator:
+            raise ValueError(
+                "checkpoint attention logit denominator "
+                f"{self.attention_logit_denominator} does not match architecture "
+                f"runtime denominator {required_denominator}"
+            )
 
     def _validate_tokens(self, token_ids: Tensor) -> None:
         if token_ids.dtype not in (torch.int32, torch.int64):
@@ -354,19 +464,29 @@ class Transformer(nn.Module):
             embedding_weight = fake_quantize_int8(self.token_embedding.weight)
             hidden = F.embedding(token_ids, embedding_weight)
         for block in self.blocks:
-            hidden = block(hidden, mode=mode)
+            hidden = block(hidden, token_ids, mode=mode)
         hidden = self.final_norm(hidden, mode=mode)
 
+        output_weight = (
+            embedding_weight
+            if self.lm_head is None
+            else (
+                self.lm_head.weight
+                if mode == "float"
+                else fake_quantize_int8(self.lm_head.weight)
+            )
+        )
+
         if mode == "float":
-            logits = F.linear(hidden, embedding_weight)
+            logits = F.linear(hidden, output_weight)
         else:
             exact = saturate_int32(
                 exact_integer_matmul(
                     quantize_int8(hidden),
-                    quantize_int8(embedding_weight).transpose(-1, -2),
+                    quantize_int8(output_weight).transpose(-1, -2),
                 )
             )
-            surrogate = F.linear(hidden, embedding_weight)
+            surrogate = F.linear(hidden, output_weight)
             logits = ste(exact, surrogate)
         if not raw_logits:
             logits = logits / (2**TRAINING_LOGIT_SHIFT)
@@ -413,6 +533,20 @@ class Transformer(nn.Module):
             .contiguous()
         }
         shifts: dict[str, int] = {"token_embedding.weight": 0}
+        for layer_index in self.spec.value_embedding_layers:
+            value_embedding = self.blocks[layer_index].attention.value_embedding
+            if value_embedding is None:
+                raise RuntimeError("architecture value embedding is missing")
+            key = f"blocks.{layer_index}.attention.value_embedding.weight"
+            weights[key] = (
+                quantize_int8(value_embedding.weight.detach()).cpu().contiguous()
+            )
+            shifts[key] = 0
+        if self.lm_head is not None:
+            weights["lm_head.weight"] = (
+                quantize_int8(self.lm_head.weight.detach()).cpu().contiguous()
+            )
+            shifts["lm_head.weight"] = 0
         for module_name, module in self.named_modules():
             if isinstance(module, RuntimeLinear):
                 key = f"{module_name}.weight"
@@ -429,6 +563,9 @@ class Transformer(nn.Module):
                     f"runtime tensor {key!r} has shape {tuple(weights[key].shape)}, "
                     f"expected {shape}"
                 )
+        for key in zero_shift_weight_names(self.spec):
+            if shifts[key] != 0:
+                raise RuntimeError(f"runtime tensor {key!r} must use shift zero")
         return RuntimeState(weights=weights, shifts=shifts)
 
     def parameter_count(self) -> int:

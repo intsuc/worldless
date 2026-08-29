@@ -15,17 +15,18 @@ from .quantization import (
     saturate_int32,
 )
 from .spec import (
-    ALIBI_SLOPES,
-    ARCHITECTURE_ID,
     ATTENTION_SCORE_SHIFT,
-    EXP_Q15_TABLE,
+    BASELINE_SPEC,
+    EFFICIENT_Q4_SPEC,
+    EFFICIENT_SPEC,
     INT32_MIN,
-    MODEL_SPEC,
     RMS_GAIN_FRACTION_BITS,
     RMS_GAIN_TABLE,
     SOFTMAX_MIN_DIFFERENCE,
     ModelSpec,
+    exp_q15_table,
     expected_weight_shapes,
+    zero_shift_weight_names,
 )
 
 
@@ -62,13 +63,25 @@ class GoldenTrace:
 
 
 class ExactRuntimeReference:
-    def __init__(self, state: RuntimeState, spec: ModelSpec = MODEL_SPEC) -> None:
-        if spec != MODEL_SPEC:
-            raise ValueError("spec must match the fixed MODEL_SPEC")
+    def __init__(
+        self,
+        state: RuntimeState,
+        spec: ModelSpec,
+        *,
+        attention_logit_denominator: int | None = None,
+    ) -> None:
+        if spec not in (BASELINE_SPEC, EFFICIENT_SPEC, EFFICIENT_Q4_SPEC):
+            raise ValueError("spec must match a known architecture")
         expected = expected_weight_shapes(spec)
         if set(state.weights) != set(expected):
             raise ValueError("runtime state keys do not match architecture schema")
+        resolved_logit_denominator = (
+            spec.runtime_attention_logit_denominator
+            if attention_logit_denominator is None
+            else attention_logit_denominator
+        )
         self.spec = spec
+        self.attention_logit_denominator = resolved_logit_denominator
         self.weights: dict[str, Tensor] = {}
         for key, shape in expected.items():
             weight = state.weights[key]
@@ -78,10 +91,13 @@ class ExactRuntimeReference:
                 )
             self.weights[key] = weight.detach().cpu().contiguous()
         self.shifts = dict(state.shifts)
-        if self.shifts["token_embedding.weight"] != 0:
-            raise ValueError("token_embedding.weight shift must be zero")
+        for key in zero_shift_weight_names(spec):
+            if self.shifts[key] != 0:
+                raise ValueError(f"{key} shift must be zero")
         self._rms_gain = torch.tensor(RMS_GAIN_TABLE, dtype=torch.int64)
-        self._exp = torch.tensor(EXP_Q15_TABLE, dtype=torch.int64)
+        self._exp = torch.tensor(
+            exp_q15_table(resolved_logit_denominator), dtype=torch.int64
+        )
 
     def _validate_tokens(self, token_ids: Sequence[int]) -> Tensor:
         if not 0 < len(token_ids) <= self.spec.context_length:
@@ -119,16 +135,23 @@ class ExactRuntimeReference:
         positions = torch.arange(length, dtype=torch.int64)
         distance = positions[:, None] - positions[None, :]
         heads: list[Tensor] = []
-        for numerator, denominator in ALIBI_SLOPES:
+        for numerator, denominator in self.spec.alibi_slopes:
             heads.append(
                 rounded_divide_int(
-                    -16 * numerator * distance,
+                    -self.attention_logit_denominator * numerator * distance,
                     torch.full_like(distance, denominator),
                 )
             )
         return torch.stack(heads)
 
-    def _attention(self, normalized: Tensor, prefix: str) -> Tensor:
+    def _attention(
+        self,
+        normalized: Tensor,
+        token_ids: Tensor,
+        prefix: str,
+        *,
+        value_embedding_key: str | None,
+    ) -> Tensor:
         length = normalized.shape[0]
         query = self._linear(normalized, f"{prefix}.q_proj.weight").view(
             length, self.spec.q_heads, self.spec.head_dim
@@ -136,9 +159,13 @@ class ExactRuntimeReference:
         key = self._linear(normalized, f"{prefix}.k_proj.weight").view(
             length, self.spec.kv_heads, self.spec.head_dim
         )
-        value = self._linear(normalized, f"{prefix}.v_proj.weight").view(
-            length, self.spec.kv_heads, self.spec.head_dim
-        )
+        value = self._linear(normalized, f"{prefix}.v_proj.weight")
+        if value_embedding_key is not None:
+            value = clamp_int8(
+                value.to(torch.int32)
+                + self.weights[value_embedding_key][token_ids].to(torch.int32)
+            ).to(torch.int8)
+        value = value.view(length, self.spec.kv_heads, self.spec.head_dim)
         key = key.repeat_interleave(self.spec.query_heads_per_kv_head, dim=1)
         value = value.repeat_interleave(self.spec.query_heads_per_kv_head, dim=1)
         query = query.transpose(0, 1).to(torch.int64)
@@ -185,7 +212,17 @@ class ExactRuntimeReference:
         layer_traces: list[LayerTrace] = []
         for layer in range(self.spec.layers):
             prefix = f"blocks.{layer}"
-            attention = self._attention(self._norm(hidden), f"{prefix}.attention")
+            value_embedding_key = (
+                f"{prefix}.attention.value_embedding.weight"
+                if layer in self.spec.value_embedding_layers
+                else None
+            )
+            attention = self._attention(
+                self._norm(hidden),
+                tokens,
+                f"{prefix}.attention",
+                value_embedding_key=value_embedding_key,
+            )
             hidden = self._residual(hidden, attention)
             after_attention = tuple(int(value) for value in hidden[-1])
             feed_forward = self._ffn(self._norm(hidden), f"{prefix}.ffn")
@@ -201,12 +238,13 @@ class ExactRuntimeReference:
 
     def logits(self, token_ids: Sequence[int]) -> Tensor:
         hidden, _ = self._forward_hidden(token_ids, collect_trace=False)
+        output_weight = self.weights[
+            "token_embedding.weight" if self.spec.tied_lm_head else "lm_head.weight"
+        ]
         return saturate_int32(
             torch.matmul(
                 hidden.to(torch.int64),
-                self.weights["token_embedding.weight"]
-                .to(torch.int64)
-                .transpose(-1, -2),
+                output_weight.to(torch.int64).transpose(-1, -2),
             )
         )
 
@@ -234,16 +272,17 @@ class ExactRuntimeReference:
 
     def golden_trace(self, token_ids: Sequence[int]) -> GoldenTrace:
         hidden, layers = self._forward_hidden(token_ids, collect_trace=True)
+        output_weight = self.weights[
+            "token_embedding.weight" if self.spec.tied_lm_head else "lm_head.weight"
+        ]
         logits = saturate_int32(
             torch.matmul(
                 hidden[-1].to(torch.int64),
-                self.weights["token_embedding.weight"]
-                .to(torch.int64)
-                .transpose(-1, -2),
+                output_weight.to(torch.int64).transpose(-1, -2),
             )
         )
         return GoldenTrace(
-            architecture_id=ARCHITECTURE_ID,
+            architecture_id=self.spec.architecture_id,
             input_tokens=tuple(token_ids),
             layers=layers,
             final_hidden=tuple(int(value) for value in hidden[-1]),

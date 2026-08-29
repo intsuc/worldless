@@ -5,6 +5,7 @@ import random
 
 import pytest
 
+from worldless_transformer.spec import DATA_ABI_ID
 from worldless_transformer.tokenizer import (
     GreedyStringPieceTokenizer,
     UnsupportedTextError,
@@ -54,9 +55,16 @@ def test_tokenizer_artifact_is_content_addressed_and_strict(
     )
 
     value = json.loads(path.read_text(encoding="utf-8"))
+    assert value["data_abi_id"] == DATA_ABI_ID
     value["unknown"] = 1
     path.write_text(json.dumps(value), encoding="utf-8")
     with pytest.raises(ValueError, match="unknown=.*unknown"):
+        GreedyStringPieceTokenizer.load(path)
+
+    value.pop("unknown")
+    value["architecture_id"] = value.pop("data_abi_id")
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"missing=.*data_abi_id"):
         GreedyStringPieceTokenizer.load(path)
 
 

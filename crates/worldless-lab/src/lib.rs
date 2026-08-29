@@ -13,6 +13,12 @@ mod suites;
 
 const POSITION: Position = Position::new(0.0, 0.0, 0.0);
 const ROTATION: Rotation = Rotation::new(0.0, 0.0);
+const TRANSFORMER_NAMESPACE: &str = "transformer";
+const TRANSFORMER_MODEL_STORAGE: &str = "transformer:model";
+const TRANSFORMER_REQUEST_STORAGE: &str = "transformer:request";
+const TRANSFORMER_RESPONSE_STORAGE: &str = "transformer:response";
+const TRANSFORMER_SETUP: &str = "transformer:setup";
+const TRANSFORMER_MODEL_ACTIVATE: &str = "transformer:model/activate";
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct LabError(String);
@@ -100,6 +106,68 @@ pub struct TimingMeasurement {
     pub durations_ns: Vec<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BenchmarkEntry {
+    Text,
+    Tokens,
+}
+
+impl BenchmarkEntry {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Tokens => "tokens",
+        }
+    }
+
+    const fn function(self) -> &'static str {
+        match self {
+            Self::Text => "transformer:infer/text",
+            Self::Tokens => "transformer:infer/tokens",
+        }
+    }
+}
+
+pub struct BenchmarkOptions<'a> {
+    pub pack: &'a Path,
+    pub model_storage: &'a Path,
+    pub entry: BenchmarkEntry,
+    pub request: &'a CompoundTag,
+    pub warmup: usize,
+    pub samples: usize,
+    pub command_limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkReport {
+    pub execution: ExecutionMode,
+    pub entry: BenchmarkEntry,
+    pub warmup_discarded: usize,
+    pub measured_samples: usize,
+    pub setup_quota: QuotaMeasurement,
+    pub activation_quota: QuotaMeasurement,
+    pub quota: QuotaMeasurement,
+    pub timing: BenchmarkTimingMeasurement,
+    pub response: ResponseVerification,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkTimingMeasurement {
+    pub durations_ns: Vec<u64>,
+    pub median_ns: f64,
+    pub p95_ns: u64,
+    pub min_ns: u64,
+    pub max_ns: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponseVerification {
+    pub verified_invocations: usize,
+    pub identical: bool,
+    pub escaped_snbt: String,
+}
+
 struct PreparedSuite {
     spec: &'static SuiteSpec,
     cases: Vec<Case>,
@@ -149,6 +217,288 @@ pub fn compare(selected_suite: &str, samples: usize) -> Result<ComparisonReport,
         execution: execution_mode(),
         rows,
     })
+}
+
+pub fn benchmark(options: BenchmarkOptions<'_>) -> Result<BenchmarkReport, LabError> {
+    if options.samples == 0 {
+        return Err(LabError::new("sample count must be greater than zero"));
+    }
+    if options.command_limit == 0 {
+        return Err(LabError::new("command limit must be greater than zero"));
+    }
+    let verified_invocations = options
+        .warmup
+        .checked_add(options.samples)
+        .ok_or_else(|| LabError::new("warm-up and sample counts overflow usize"))?;
+    let mut durations_ns = Vec::new();
+    durations_ns
+        .try_reserve_exact(options.samples)
+        .map_err(|error| {
+            LabError::new(format!(
+                "cannot allocate timing storage for {} samples: {error}",
+                options.samples
+            ))
+        })?;
+
+    let program =
+        CompiledProgram::from_packs([Pack::directory(options.pack)]).map_err(|error| {
+            LabError::new(format!(
+                "benchmark: failed to load data pack at {}: {error}",
+                options.pack.display()
+            ))
+        })?;
+    let mut vm = program.create_vm(0);
+    vm.load_command_storage_files([(TRANSFORMER_NAMESPACE, options.model_storage)])
+        .map_err(|error| {
+            LabError::new(format!(
+                "benchmark: failed to load model command storage {} as namespace `{TRANSFORMER_NAMESPACE}`: {error}",
+                options.model_storage.display()
+            ))
+        })?;
+    if vm
+        .storage(TRANSFORMER_MODEL_STORAGE)
+        .expect("the benchmark model storage identifier is valid")
+        .is_none()
+    {
+        return Err(LabError::new(format!(
+            "benchmark: command-storage file {} does not contain required storage `{TRANSFORMER_MODEL_STORAGE}`",
+            options.model_storage.display()
+        )));
+    }
+
+    let setup_report = vm.execute_function(
+        TRANSFORMER_SETUP,
+        None,
+        context(),
+        options.command_limit,
+        drop,
+    );
+    let setup_quota_used = setup_report.quota_used();
+    let setup_outcome = setup_report.into_result().map_err(|error| {
+        LabError::new(format!(
+            "benchmark: `{TRANSFORMER_SETUP}` failed after using quota {setup_quota_used}: {error}"
+        ))
+    })?;
+    if setup_quota_used == 0 {
+        return Err(LabError::new(format!(
+            "benchmark: `{TRANSFORMER_SETUP}` executed zero commands; the entry point is missing or empty"
+        )));
+    }
+    if matches!(
+        setup_outcome,
+        worldless::ExecutionOutcome::Result { success: false, .. }
+    ) {
+        return Err(LabError::new(format!(
+            "benchmark: `{TRANSFORMER_SETUP}` returned failure with outcome {setup_outcome:?}"
+        )));
+    }
+
+    let activation_report = vm.execute_function(
+        TRANSFORMER_MODEL_ACTIVATE,
+        None,
+        context(),
+        options.command_limit,
+        drop,
+    );
+    let activation_quota_used = activation_report.quota_used();
+    let activation_outcome = activation_report.into_result().map_err(|error| {
+        LabError::new(format!(
+            "benchmark: `{TRANSFORMER_MODEL_ACTIVATE}` failed after using quota {activation_quota_used}: {error}"
+        ))
+    })?;
+    let expected_activation_outcome = worldless::ExecutionOutcome::Result {
+        success: true,
+        value: 1,
+    };
+    if activation_outcome != expected_activation_outcome {
+        return Err(LabError::new(format!(
+            "benchmark: unexpected `{TRANSFORMER_MODEL_ACTIVATE}` outcome: expected {expected_activation_outcome:?}, actual {activation_outcome:?}"
+        )));
+    }
+
+    let mut expected_response = None;
+    let mut expected_quota = None;
+    for index in 0..options.warmup {
+        let measurement = invoke_benchmark(&mut vm, &options, "warm-up", index + 1, false)?;
+        verify_benchmark_invocation(
+            &mut expected_response,
+            &mut expected_quota,
+            &measurement,
+            "warm-up",
+            index + 1,
+        )?;
+    }
+
+    for index in 0..options.samples {
+        let measurement = invoke_benchmark(&mut vm, &options, "sample", index + 1, true)?;
+        verify_benchmark_invocation(
+            &mut expected_response,
+            &mut expected_quota,
+            &measurement,
+            "sample",
+            index + 1,
+        )?;
+        durations_ns.push(
+            measurement
+                .duration_ns
+                .expect("measured benchmark invocations record their duration"),
+        );
+    }
+
+    let response = expected_response.expect("a positive sample count records a response");
+    let quota_used = expected_quota.expect("a positive sample count records quota use");
+    Ok(BenchmarkReport {
+        execution: ExecutionMode {
+            vm_state: "persistent",
+            macro_cache: if options.warmup == 0 {
+                "not_pre_warmed"
+            } else {
+                "warm"
+            },
+        },
+        entry: options.entry,
+        warmup_discarded: options.warmup,
+        measured_samples: options.samples,
+        setup_quota: QuotaMeasurement {
+            limit: options.command_limit,
+            used: setup_quota_used,
+        },
+        activation_quota: QuotaMeasurement {
+            limit: options.command_limit,
+            used: activation_quota_used,
+        },
+        quota: QuotaMeasurement {
+            limit: options.command_limit,
+            used: quota_used,
+        },
+        timing: summarize_benchmark_timings(durations_ns),
+        response: ResponseVerification {
+            verified_invocations,
+            identical: true,
+            escaped_snbt: escaped_snbt(&response),
+        },
+    })
+}
+
+struct BenchmarkInvocation {
+    quota_used: usize,
+    duration_ns: Option<u64>,
+    response: CompoundTag,
+}
+
+fn invoke_benchmark(
+    vm: &mut worldless::Vm,
+    options: &BenchmarkOptions<'_>,
+    phase: &str,
+    index: usize,
+    timed: bool,
+) -> Result<BenchmarkInvocation, LabError> {
+    vm.set_storage(TRANSFORMER_REQUEST_STORAGE, options.request.clone())
+        .expect("the benchmark request storage identifier is valid");
+
+    let start = timed.then(Instant::now);
+    let report = vm.execute_function(
+        options.entry.function(),
+        None,
+        context(),
+        options.command_limit,
+        drop,
+    );
+    let duration_ns = start
+        .map(|start| {
+            u64::try_from(start.elapsed().as_nanos()).map_err(|_| {
+                LabError::new(format!(
+                    "benchmark: {phase} {index}: measured duration does not fit in a u64 nanosecond count"
+                ))
+            })
+        })
+        .transpose()?;
+    let quota_used = report.quota_used();
+    let outcome = report.into_result().map_err(|error| {
+        LabError::new(format!(
+            "benchmark: {phase} {index}: `{}` failed after using quota {quota_used}: {error}",
+            options.entry.function()
+        ))
+    })?;
+    let response = vm
+        .storage(TRANSFORMER_RESPONSE_STORAGE)
+        .expect("the benchmark response storage identifier is valid")
+        .cloned()
+        .ok_or_else(|| {
+            LabError::new(format!(
+                "benchmark: {phase} {index}: required response storage `{TRANSFORMER_RESPONSE_STORAGE}` is absent"
+            ))
+        })?;
+    let expected_outcome = worldless::ExecutionOutcome::Result {
+        success: true,
+        value: 1,
+    };
+    if outcome != expected_outcome {
+        return Err(LabError::new(format!(
+            "benchmark: {phase} {index}: unexpected `{}` outcome: expected {expected_outcome:?}, actual {outcome:?}; response `{}`",
+            options.entry.function(),
+            escaped_snbt(&response)
+        )));
+    }
+
+    Ok(BenchmarkInvocation {
+        quota_used,
+        duration_ns,
+        response,
+    })
+}
+
+fn verify_benchmark_invocation(
+    expected_response: &mut Option<CompoundTag>,
+    expected_quota: &mut Option<usize>,
+    actual: &BenchmarkInvocation,
+    phase: &str,
+    index: usize,
+) -> Result<(), LabError> {
+    if let Some(expected) = expected_response {
+        if expected != &actual.response {
+            return Err(LabError::new(format!(
+                "benchmark: {phase} {index}: response changed between invocations: expected `{}`, actual `{}`",
+                escaped_snbt(expected),
+                escaped_snbt(&actual.response)
+            )));
+        }
+    } else {
+        *expected_response = Some(actual.response.clone());
+    }
+
+    if let Some(expected) = expected_quota {
+        if *expected != actual.quota_used {
+            return Err(LabError::new(format!(
+                "benchmark: {phase} {index}: quota use changed between invocations: expected {expected}, actual {}",
+                actual.quota_used
+            )));
+        }
+    } else {
+        *expected_quota = Some(actual.quota_used);
+    }
+    Ok(())
+}
+
+fn summarize_benchmark_timings(durations_ns: Vec<u64>) -> BenchmarkTimingMeasurement {
+    let mut sorted = durations_ns.clone();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    let median_ns = if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] as f64 + sorted[middle] as f64) / 2.0
+    } else {
+        sorted[middle] as f64
+    };
+    let p95_index =
+        usize::try_from(((u128::try_from(sorted.len()).expect("usize fits u128") * 95) - 1) / 100)
+            .expect("nearest-rank index fits usize");
+    BenchmarkTimingMeasurement {
+        durations_ns,
+        median_ns,
+        p95_ns: sorted[p95_index],
+        min_ns: sorted[0],
+        max_ns: sorted[sorted.len() - 1],
+    }
 }
 
 fn check_prepared(suites: &[PreparedSuite]) -> Result<CheckReport, LabError> {
@@ -450,6 +800,18 @@ mod tests {
             cases: one_case().unwrap(),
             program: CompiledProgram::from_packs([Pack::memory([function])]).unwrap(),
         }
+    }
+
+    #[test]
+    fn benchmark_timing_uses_conventional_median_and_nearest_rank_p95() {
+        let timing = summarize_benchmark_timings((1..=20).rev().collect());
+        assert_eq!(timing.median_ns, 10.5);
+        assert_eq!(timing.p95_ns, 19);
+        assert_eq!(timing.min_ns, 1);
+        assert_eq!(timing.max_ns, 20);
+
+        let odd = summarize_benchmark_timings(vec![3, 1, 2]);
+        assert_eq!(odd.median_ns, 2.0);
     }
 
     #[test]

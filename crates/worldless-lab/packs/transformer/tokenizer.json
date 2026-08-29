@@ -1,5 +1,5 @@
 {
-  "architecture_id": "worldless_transformer/relu2_alibi_gsp512_l4_d96_q6_kv1_h16_ff192_c256_w64_v1",
+  "data_abi_id": "worldless_transformer/gsp512_c256_w64_v1",
   "bos_token_id": 510,
   "eos_token_id": 511,
   "kind": "greedy_string_piece",
@@ -515,7 +515,7 @@
     "bbbbbbab",
     "bbbbbbba"
   ],
-  "schema_version": 1,
-  "tokenizer_id": "e38aebd5ff980ed2207340143422fd28abd105e1ed727931cda8dbfad575a0a1",
+  "schema_version": 2,
+  "tokenizer_id": "c65b6c1c092e3de57f74073b34881799989ccf3f139e3d25aed199892b77f039",
   "vocab_size": 512
 }

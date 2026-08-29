@@ -1,1 +1,0 @@
-data modify storage transformer:runtime state.projected append compute default {"type":"maximum","operands":[-127,{"type":"minimum","operands":[127,{"type":"storage","storage":"transformer:runtime","path":"state.acc"}]}]} integer
