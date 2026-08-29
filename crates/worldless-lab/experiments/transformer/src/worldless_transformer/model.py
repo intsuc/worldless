@@ -319,7 +319,7 @@ class Transformer(nn.Module):
     def __init__(self, spec: ModelSpec = MODEL_SPEC) -> None:
         super().__init__()
         if spec != MODEL_SPEC:
-            raise ValueError("only the fixed candidate-B ModelSpec is supported")
+            raise ValueError("spec must match the fixed MODEL_SPEC")
         self.spec = spec
         self.token_embedding = nn.Embedding(spec.vocab_size, spec.d_model)
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=2.0)

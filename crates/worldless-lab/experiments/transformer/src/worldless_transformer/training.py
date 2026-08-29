@@ -6,6 +6,7 @@ import os
 import platform
 import random
 import sys
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Final
@@ -15,7 +16,12 @@ import torch
 import torch.nn.functional as F
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .data import TokenStream, load_token_stream, sample_batch
+from .data import (
+    TokenStream,
+    batch_from_window_indices,
+    load_token_stream,
+    sample_batch,
+)
 from .model import ExecutionMode, Transformer
 from .spec import MODEL_SPEC
 from .tokenizer import GreedyStringPieceTokenizer
@@ -26,7 +32,6 @@ _PARAMETER_MAX: Final = 127.0
 
 @dataclass(frozen=True, slots=True)
 class TrainConfig:
-    steps: int
     batch_size: int
     learning_rate: float
     seed: int
@@ -35,8 +40,6 @@ class TrainConfig:
     validation_batches: int
 
     def __post_init__(self) -> None:
-        if self.steps <= 0:
-            raise ValueError("steps must be positive")
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
@@ -84,9 +87,26 @@ def _torch_batch(
     generator: np.random.Generator,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    inputs, targets, loss_mask = sample_batch(
-        stream, batch_size=batch_size, generator=generator
-    )
+    batch = sample_batch(stream, batch_size=batch_size, generator=generator)
+    return _to_device_batch(batch, device=device)
+
+
+def _torch_batch_from_window_indices(
+    stream: TokenStream,
+    *,
+    window_indices: np.ndarray,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch = batch_from_window_indices(stream, window_indices=window_indices)
+    return _to_device_batch(batch, device=device)
+
+
+def _to_device_batch(
+    batch: tuple[np.ndarray, np.ndarray, np.ndarray],
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    inputs, targets, loss_mask = batch
     return (
         torch.from_numpy(inputs).to(device=device, non_blocking=True),
         torch.from_numpy(targets).to(device=device, non_blocking=True),
@@ -96,16 +116,27 @@ def _torch_batch(
 
 def _masked_cross_entropy(
     logits: torch.Tensor, targets: torch.Tensor, loss_mask: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, int]:
     losses = F.cross_entropy(
         logits.reshape(-1, MODEL_SPEC.vocab_size),
         targets.reshape(-1),
         reduction="none",
     ).view_as(targets)
-    count = loss_mask.sum()
-    if int(count.item()) == 0:
+    count = int(loss_mask.sum().item())
+    if count == 0:
         raise ValueError("sampled batch has no supervised targets")
     return (losses * loss_mask).sum(), count
+
+
+def _epoch_window_batches(
+    *,
+    window_count: int,
+    batch_size: int,
+    generator: np.random.Generator,
+) -> Iterator[np.ndarray]:
+    order = generator.permutation(window_count)
+    for start in range(0, window_count, batch_size):
+        yield order[start : start + batch_size]
 
 
 @torch.no_grad()
@@ -178,6 +209,10 @@ def _run_manifest(
     train_stream: TokenStream,
     validation_stream: TokenStream,
     device: torch.device,
+    optimizer_steps: int,
+    processed_window_count: int,
+    processed_target_count: int,
+    validation_metrics: dict[str, float],
 ) -> dict[str, object]:
     selected_device = str(device)
     if device.type == "cuda":
@@ -196,6 +231,14 @@ def _run_manifest(
             "python": sys.version,
             "torch": torch.__version__,
         },
+        "training": {
+            "epochs": 1,
+            "optimizer_steps": optimizer_steps,
+            "processed_target_count": processed_target_count,
+            "processed_window_count": processed_window_count,
+            "window_count": int(train_stream.metadata["window_count"]),
+        },
+        "validation": validation_metrics,
         "tokenizer_id": tokenizer_id,
         "train_offsets_sha256": train_stream.metadata["offset_sha256"],
         "train_stream_sha256": train_stream.metadata["sha256"],
@@ -203,6 +246,16 @@ def _run_manifest(
         "validation_offsets_sha256": validation_stream.metadata["offset_sha256"],
         "validation_stream_sha256": validation_stream.metadata["sha256"],
         "validation_windows_sha256": validation_stream.metadata["window_sha256"],
+    }
+
+
+def _validation_metrics(evaluation: Evaluation) -> dict[str, float]:
+    return {
+        "bits_per_byte": evaluation.bits_per_byte,
+        "eos_accuracy": evaluation.eos_accuracy,
+        "eos_loss": evaluation.eos_loss,
+        "loss": evaluation.loss,
+        "perplexity": math.exp(min(evaluation.loss, 80.0)),
     }
 
 
@@ -243,17 +296,26 @@ def train(
         weight_decay=0.1,
     )
     generator = np.random.default_rng(config.seed)
+    window_count = len(train_stream.windows)
+    total_steps = (window_count + config.batch_size - 1) // config.batch_size
+    completed_steps = 0
+    processed_window_count = 0
+    processed_target_count = 0
     model.train()
-    for step in range(1, config.steps + 1):
+    epoch_batches = _epoch_window_batches(
+        window_count=window_count,
+        batch_size=config.batch_size,
+        generator=generator,
+    )
+    for step, window_indices in enumerate(epoch_batches, start=1):
         learning_rate = _learning_rate(
-            config.learning_rate, step=step, total_steps=config.steps
+            config.learning_rate, step=step, total_steps=total_steps
         )
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = learning_rate
-        inputs, targets, loss_mask = _torch_batch(
+        inputs, targets, loss_mask = _torch_batch_from_window_indices(
             train_stream,
-            batch_size=config.batch_size,
-            generator=generator,
+            window_indices=window_indices,
             device=device,
         )
         optimizer.zero_grad(set_to_none=True)
@@ -268,16 +330,37 @@ def train(
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.clamp_(_PARAMETER_MIN, _PARAMETER_MAX)
-        print(
-            json.dumps(
-                {
-                    "learning_rate": learning_rate,
-                    "step": step,
-                    "train_loss": float(loss.detach().item()),
-                },
-                sort_keys=True,
-            ),
-            flush=True,
+        processed_window_count += len(window_indices)
+        processed_target_count += target_count
+        completed_steps = step
+        if step == 1 or step % 1_000 == 0 or step == total_steps:
+            print(
+                json.dumps(
+                    {
+                        "learning_rate": learning_rate,
+                        "step": step,
+                        "train_loss": float(loss.detach().item()),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    if completed_steps != total_steps:
+        raise AssertionError(
+            "one epoch must execute the derived number of optimizer steps: "
+            f"expected {total_steps}, got {completed_steps}"
+        )
+    if processed_window_count != window_count:
+        raise AssertionError(
+            "one epoch must process every training window exactly once: "
+            f"expected {window_count}, got {processed_window_count}"
+        )
+    expected_target_count = int(train_stream.metadata["prediction_count"])
+    if processed_target_count != expected_target_count:
+        raise AssertionError(
+            "one epoch must process every supervised target exactly once: "
+            f"expected {expected_target_count}, got {processed_target_count}"
         )
 
     validation = evaluate_loss(
@@ -289,15 +372,15 @@ def train(
         device=device,
         mode=config.mode,
     )
+    validation_metrics = _validation_metrics(validation)
     print(
         json.dumps(
             {
-                "step": config.steps,
-                "validation_bits_per_byte": validation.bits_per_byte,
-                "validation_eos_accuracy": validation.eos_accuracy,
-                "validation_eos_loss": validation.eos_loss,
-                "validation_loss": validation.loss,
-                "validation_perplexity": math.exp(min(validation.loss, 80.0)),
+                "step": total_steps,
+                **{
+                    f"validation_{field}": value
+                    for field, value in validation_metrics.items()
+                },
             },
             sort_keys=True,
         ),
@@ -306,7 +389,7 @@ def train(
     save_checkpoint(
         checkpoint_target,
         model=model.cpu(),
-        step=config.steps,
+        step=completed_steps,
         tokenizer_id=tokenizer.tokenizer_id,
     )
     manifest = _run_manifest(
@@ -315,6 +398,10 @@ def train(
         train_stream=train_stream,
         validation_stream=validation_stream,
         device=device,
+        optimizer_steps=completed_steps,
+        processed_window_count=processed_window_count,
+        processed_target_count=processed_target_count,
+        validation_metrics=validation_metrics,
     )
     try:
         with manifest_target.open("x", encoding="utf-8") as output:

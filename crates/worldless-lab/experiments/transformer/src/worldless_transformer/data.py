@@ -474,14 +474,33 @@ def sample_batch(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    sequence_length = MODEL_SPEC.context_length
     selected = generator.integers(0, len(stream.windows), size=batch_size)
+    return batch_from_window_indices(stream, window_indices=selected)
+
+
+def batch_from_window_indices(
+    stream: TokenStream,
+    *,
+    window_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not isinstance(window_indices, np.ndarray):
+        raise TypeError("window_indices must be a NumPy array")
+    if window_indices.ndim != 1:
+        raise ValueError("window_indices must be one-dimensional")
+    if window_indices.dtype.kind not in ("i", "u"):
+        raise TypeError("window_indices must have an integer dtype")
+    if len(window_indices) == 0:
+        raise ValueError("window_indices must not be empty")
+    if np.any(window_indices < 0) or np.any(window_indices >= len(stream.windows)):
+        raise ValueError(f"window_indices must be in 0..{len(stream.windows) - 1}")
+    batch_size = len(window_indices)
+    sequence_length = MODEL_SPEC.context_length
     inputs = np.full(
         (batch_size, sequence_length), MODEL_SPEC.eos_token_id, dtype=np.int64
     )
     targets = np.full_like(inputs, MODEL_SPEC.eos_token_id)
     loss_mask = np.zeros_like(inputs, dtype=np.bool_)
-    for row, window_index in enumerate(selected):
+    for row, window_index in enumerate(window_indices):
         window = stream.windows[window_index]
         start = int(window["start"])
         loss_start = int(window["loss_start"])

@@ -1,7 +1,7 @@
 # Integer decoder transformer pack
 
-This data pack executes the Candidate B decoder-only transformer with integer
-operations in Worldless and Minecraft. The architecture is
+This data pack executes a fixed decoder-only transformer with integer operations
+in Worldless and Minecraft. The architecture is
 `worldless_transformer/relu2_alibi_gsp512_l4_d96_q6_kv1_h16_ff192_c256_w64_v1`:
 four pre-norm layers, width 96, six query heads and one width-16 KV head,
 ReLU-squared FFN width 192, ALiBi, context 256, local attention window 64, and
@@ -11,8 +11,6 @@ a tied 512-token embedding/unembedding.
 
 Run `transformer:setup` once after the pack is loaded. It owns the scoreboard
 objective and the runtime RMS/softmax tables; it does not install model weights.
-The isolated lab adapters call setup themselves because each case starts in a
-fresh VM.
 
 Install one model compound at command storage `transformer:model`. Its only
 top-level fields are `abi`, `weights`, `biases`, and `shifts`.
@@ -58,14 +56,7 @@ artifact requires a single-scalar base piece for every scalar used by any
 longer piece, so supported text is lossless; a scalar absent from the artifact
 fails with error 4.
 
-## Generate a production tokenizer pack
-
-The checked tree contains a test-only production-shape sparse nonzero model and
-a complete 510-regular-piece tokenizer over `a`, `b`, and space. In that
-fixture `"ab"` greedily encodes as token 2 and both lab variants generate
-token 0. Every one of its 510 pieces is checked against the generated trie. The
-root `tokenizer.json` and canonical tokenizer-ID digest in `tokenizer.sha256`
-are the audit source for the compiled test trie.
+## Generate a tokenizer-specific pack
 
 Compile a trained TinyStories tokenizer artifact into a new, non-existing
 output directory with the locked uv project:
@@ -81,7 +72,7 @@ the canonical artifact and its tokenizer-ID SHA-256 into the output,
 regenerates all 510-piece trie states and runtime RMS/exp constants, and emits
 row-level `/compute`
 functions for the fixed architecture. It refuses to overwrite an output
-directory. Production output excludes the test-only
+directory. The output excludes the test-only
 `data/transformer/function/fixture` and `data/worldless_lab` trees, so it
 contains neither embedded weights nor fixture adapters.
 
@@ -89,19 +80,14 @@ contains neither embedded weights nor fixture adapters.
 
 Inference is synchronous and one invocation processes every prefix/model
 position, so command quota grows with the tokenized prefix and requested
-generation. On a fresh Worldless VM with a cold macro cache, the checked
-`"ab"` case (BOS plus one regular piece, one generated token) uses 44,891
-commands through the text adapter and 44,880 through the token adapter,
-including setup, fixture installation, strict validation, and inference. Both
-fit Minecraft's default `maxCommandChainLength=65536`.
-
-This does not mean the full 256-position context fits the default. After a
-separate setup call, a measured three-position public request uses 65,917
-commands through the text entry and 65,897 through the token entry. One
+generation. The full 256-position context does not fit Minecraft's default
+`maxCommandChainLength=65536`. After a separate setup call, a measured
+three-position public request uses 65,917 commands through the text entry and
+65,897 through the token entry. One
 isolated position with all 64 attention keys active uses 76,703 commands in
-`transformer:core/process_position` alone. Thus the default budget supports
-the checked one-piece prefix but not arbitrary longer prefixes, and it cannot
-execute even one full-window position.
+`transformer:core/process_position` alone. Thus the default budget can
+accommodate some short prefixes but not arbitrary longer prefixes, and it
+cannot execute even one full-window position.
 
 For capacity planning, let `R` be the regular-prefix piece count. Unless EOS
 ends generation early, the number of evaluated model positions is

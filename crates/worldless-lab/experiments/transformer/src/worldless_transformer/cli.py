@@ -41,7 +41,6 @@ def _parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--train-tokens", type=Path, required=True)
     train_parser.add_argument("--validation-tokens", type=Path, required=True)
     train_parser.add_argument("--output", type=Path, required=True)
-    train_parser.add_argument("--steps", type=_positive_integer, required=True)
     train_parser.add_argument("--batch-size", type=_positive_integer, required=True)
     train_parser.add_argument("--learning-rate", type=float, required=True)
     train_parser.add_argument("--seed", type=int, required=True)
@@ -130,7 +129,6 @@ def main() -> None:
             validation_tokens=arguments.validation_tokens,
             output_checkpoint=arguments.output,
             config=TrainConfig(
-                steps=arguments.steps,
                 batch_size=arguments.batch_size,
                 learning_rate=arguments.learning_rate,
                 seed=arguments.seed,

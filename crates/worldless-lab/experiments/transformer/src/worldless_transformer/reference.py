@@ -64,7 +64,7 @@ class GoldenTrace:
 class ExactRuntimeReference:
     def __init__(self, state: RuntimeState, spec: ModelSpec = MODEL_SPEC) -> None:
         if spec != MODEL_SPEC:
-            raise ValueError("only the fixed candidate-B ModelSpec is supported")
+            raise ValueError("spec must match the fixed MODEL_SPEC")
         expected = expected_weight_shapes(spec)
         if set(state.weights) != set(expected):
             raise ValueError("runtime state keys do not match architecture schema")
