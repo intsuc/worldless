@@ -81,9 +81,9 @@ contains neither embedded weights nor fixture adapters.
 Inference is synchronous and one invocation processes every prefix/model
 position, so command quota grows with the tokenized prefix and requested
 generation. The full 256-position context does not fit Minecraft's default
-`maxCommandChainLength=65536`. After a separate setup call, a measured
-three-position public request uses 65,917 commands through the text entry and
-65,897 through the token entry. One
+`minecraft:max_command_sequence_length` value of 65,536. After a separate setup
+call, a measured three-position public request uses 65,917 commands through the
+text entry and 65,897 through the token entry. One
 isolated position with all 64 attention keys active uses 76,703 commands in
 `transformer:core/process_position` alone. Thus the default budget can
 accommodate some short prefixes but not arbitrary longer prefixes, and it
@@ -95,8 +95,8 @@ ends generation early, the number of evaluated model positions is
 returned token removes one forward pass. A conservative model-core estimate is
 `76,703 * P` commands, because pre-saturation positions use no more attention
 keys than the measured full-window position; at `P=256` that term alone is
-19,635,968. Configure
-`maxCommandChainLength` above that core budget plus model validation, request
-validation, and generated-trie traversal for the concrete artifact and prefix.
+19,635,968. Configure `minecraft:max_command_sequence_length` above that core
+budget plus model validation, request validation, and generated-trie traversal
+for the concrete artifact and prefix.
 String input traversal also depends on UTF-16 input length, so there is no
 artifact-independent text-entry limit below the model's numerical context.
