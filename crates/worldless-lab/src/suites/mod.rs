@@ -1,3 +1,4 @@
+mod call_abi;
 mod concat;
 mod indirect_access;
 mod int_map;
@@ -7,6 +8,7 @@ mod transformer;
 use crate::SuiteSpec;
 
 pub(crate) const REGISTRY: &[SuiteSpec] = &[
+    call_abi::SPEC,
     concat::SPEC,
     indirect_access::SPEC,
     int_map::SPEC,
