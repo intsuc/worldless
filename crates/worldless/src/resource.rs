@@ -112,7 +112,7 @@ impl fmt::Display for Identifier {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum FunctionReference {
     Function(Identifier),
     Tag(Identifier),

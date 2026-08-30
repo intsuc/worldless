@@ -6,7 +6,7 @@
 //! providers, worldless loot predicates, `compute`, `seed`, and value/reset
 //! forms of `random`, monotonic stopwatches, function macros and tags, supported
 //! `execute` conditions and pure context transformations, caller-driven logical
-//! normal ticks, and result propagation.
+//! normal ticks and function scheduling, and result propagation.
 //! Supported resources can be compiled from a statically composed, ordered
 //! mixture of expanded directory data packs and in-memory packs. Construction
 //! is atomic: an invalid selected resource rejects the whole program instead of
@@ -14,6 +14,7 @@
 
 mod command_storage_file;
 mod execution_context;
+mod java_math;
 mod loader;
 mod macro_function;
 mod nbt;
@@ -25,6 +26,7 @@ mod random;
 mod resource;
 mod resource_json;
 mod runtime;
+mod schedule;
 mod stopwatch;
 
 pub use command_storage_file::CommandStorageLoadError;
@@ -42,7 +44,8 @@ use macro_function::MacroCacheState;
 use nbt::CommandStorage;
 use program::{Program, Scoreboard};
 use random::RandomState;
-use resource::Identifier;
+use resource::{FunctionReference, Identifier};
+use schedule::ScheduleState;
 use stopwatch::StopwatchState;
 
 /// An invalid command-storage identifier supplied to the host API.
@@ -94,22 +97,15 @@ impl CompiledProgram {
     }
 }
 
-/// The automatic-function phase in which a logical tick failure occurred.
+/// The logical-tick phase in which an automatic function failure occurred.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TickPhase {
     /// The first-tick `minecraft:load` phase.
     Load,
     /// The per-tick `minecraft:tick` phase.
     Tick,
-}
-
-impl TickPhase {
-    fn function_tag(self) -> &'static str {
-        match self {
-            Self::Load => "minecraft:load",
-            Self::Tick => "minecraft:tick",
-        }
-    }
+    /// A function selected by a due `schedule` callback.
+    Scheduled,
 }
 
 /// An automatic function whose execution did not complete during a logical tick.
@@ -139,7 +135,7 @@ impl TickFunctionFailure {
 
 /// Host diagnostics produced while advancing one logical normal tick.
 ///
-/// A failed automatic function does not stop later tag members or phases.
+/// A failed automatic or scheduled function does not stop later functions or phases.
 #[must_use = "tick reports contain automatic-function failures"]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TickReport {
@@ -162,6 +158,7 @@ pub struct Vm {
     command_storage: CommandStorage,
     random: RandomState,
     stopwatches: StopwatchState,
+    schedules: ScheduleState,
     load_pending: bool,
 }
 
@@ -234,6 +231,7 @@ impl Vm {
             &mut self.command_storage,
             &mut self.random,
             &mut self.stopwatches,
+            &mut self.schedules,
             reference,
             arguments,
             context,
@@ -262,6 +260,7 @@ impl Vm {
             &mut self.command_storage,
             &mut self.random,
             &mut self.stopwatches,
+            &mut self.schedules,
             command,
             context,
             command_limit,
@@ -273,9 +272,11 @@ impl Vm {
     ///
     /// The first tick executes every `minecraft:load` member before every
     /// `minecraft:tick` member. Later ticks execute only `minecraft:tick`.
-    /// Each member is an independent top-level execution with the supplied
-    /// context and command limit. Its command feedback and result are
-    /// suppressed, and a failure is recorded without stopping later members.
+    /// After those tags, the VM advances its logical scheduling tick and runs
+    /// callbacks that are due. Each function is an independent top-level
+    /// execution with the supplied context and command limit. Its command
+    /// feedback and result are suppressed, and a failure is recorded without
+    /// stopping later functions.
     pub fn tick(&mut self, context: ExecutionContext, command_limit: usize) -> TickReport {
         let run_load = self.load_pending;
         self.load_pending = false;
@@ -286,10 +287,13 @@ impl Vm {
             command_storage,
             random,
             stopwatches,
+            schedules,
             load_pending: _,
         } = self;
         let mut failures = Vec::new();
         if run_load {
+            let load_tag = Identifier::parse("minecraft:load")
+                .expect("the built-in load function tag identifier is valid");
             execute_automatic_tag(
                 program,
                 macro_cache,
@@ -297,12 +301,16 @@ impl Vm {
                 command_storage,
                 random,
                 stopwatches,
+                schedules,
+                &load_tag,
                 TickPhase::Load,
                 context,
                 command_limit,
                 &mut failures,
             );
         }
+        let tick_tag = Identifier::parse("minecraft:tick")
+            .expect("the built-in tick function tag identifier is valid");
         execute_automatic_tag(
             program,
             macro_cache,
@@ -310,11 +318,46 @@ impl Vm {
             command_storage,
             random,
             stopwatches,
+            schedules,
+            &tick_tag,
             TickPhase::Tick,
             context,
             command_limit,
             &mut failures,
         );
+        schedules.advance();
+        while let Some(reference) = schedules.pop_due() {
+            match reference {
+                FunctionReference::Function(function) => execute_tick_function(
+                    program,
+                    macro_cache,
+                    scoreboard,
+                    command_storage,
+                    random,
+                    stopwatches,
+                    schedules,
+                    &function,
+                    TickPhase::Scheduled,
+                    context,
+                    command_limit,
+                    &mut failures,
+                ),
+                FunctionReference::Tag(tag) => execute_automatic_tag(
+                    program,
+                    macro_cache,
+                    scoreboard,
+                    command_storage,
+                    random,
+                    stopwatches,
+                    schedules,
+                    &tag,
+                    TickPhase::Scheduled,
+                    context,
+                    command_limit,
+                    &mut failures,
+                ),
+            }
+        }
         TickReport { failures }
     }
 
@@ -326,6 +369,7 @@ impl Vm {
             command_storage: CommandStorage::default(),
             random: RandomState::new(world_seed),
             stopwatches: StopwatchState::new(),
+            schedules: ScheduleState::default(),
             load_pending: true,
         }
     }
@@ -339,36 +383,68 @@ fn execute_automatic_tag(
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
     stopwatches: &mut StopwatchState,
+    schedules: &mut ScheduleState,
+    tag: &Identifier,
     phase: TickPhase,
     context: ExecutionContext,
     command_limit: usize,
     failures: &mut Vec<TickFunctionFailure>,
 ) {
-    let id = resource::Identifier::parse(phase.function_tag())
-        .expect("built-in function tag identifiers are valid");
-    let Some(functions) = program.function_tag(&id) else {
+    let Some(functions) = program.function_tag(tag) else {
         return;
     };
     for function in functions {
-        if let Err(error) = runtime::execute_automatic_function(
+        execute_tick_function(
             program,
             macro_cache,
             scoreboard,
             command_storage,
             random,
             stopwatches,
+            schedules,
             function,
+            phase,
             context,
             command_limit,
-        )
-        .into_result()
-        {
-            failures.push(TickFunctionFailure {
-                phase,
-                function: function.to_string(),
-                error,
-            });
-        }
+            failures,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_tick_function(
+    program: &Program,
+    macro_cache: &mut MacroCacheState,
+    scoreboard: &mut Scoreboard,
+    command_storage: &mut CommandStorage,
+    random: &mut RandomState,
+    stopwatches: &mut StopwatchState,
+    schedules: &mut ScheduleState,
+    function: &Identifier,
+    phase: TickPhase,
+    context: ExecutionContext,
+    command_limit: usize,
+    failures: &mut Vec<TickFunctionFailure>,
+) {
+    if let Err(error) = runtime::execute_automatic_function(
+        program,
+        macro_cache,
+        scoreboard,
+        command_storage,
+        random,
+        stopwatches,
+        schedules,
+        function,
+        context,
+        command_limit,
+    )
+    .into_result()
+    {
+        failures.push(TickFunctionFailure {
+            phase,
+            function: function.to_string(),
+            error,
+        });
     }
 }
 

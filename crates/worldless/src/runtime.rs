@@ -10,12 +10,13 @@ use crate::{
     program::{
         Command, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation, DataSource,
         FunctionArguments, Instruction, Modifier, ObjectiveId, PredicateCondition, Program,
-        RandomCommand, ResolvedFunctions, ScoreCondition, ScoreHolderSet, ScorePredicate,
-        Scoreboard, ScoreboardCommand, StopwatchCommand, StopwatchCondition, StorageCondition,
-        StorageNumberType, StoreKind,
+        RandomCommand, ResolvedFunctions, ScheduleCommand, ScheduleMode, ScoreCondition,
+        ScoreHolderSet, ScorePredicate, Scoreboard, ScoreboardCommand, StopwatchCommand,
+        StopwatchCondition, StorageCondition, StorageNumberType, StoreKind,
     },
     random::{LegacyRandom, RandomState},
     resource::{FunctionReference, Identifier},
+    schedule::ScheduleState,
     stopwatch::StopwatchState,
 };
 
@@ -540,6 +541,7 @@ pub(crate) fn execute_function(
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
     stopwatches: &mut StopwatchState,
+    schedules: &mut ScheduleState,
     input: &str,
     arguments: Option<&CompoundTag>,
     context: ExecutionContext,
@@ -568,6 +570,7 @@ pub(crate) fn execute_function(
         command_storage,
         random,
         stopwatches,
+        schedules,
         instruction,
         None,
         context,
@@ -584,6 +587,7 @@ pub(crate) fn execute_command(
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
     stopwatches: &mut StopwatchState,
+    schedules: &mut ScheduleState,
     input: &str,
     context: ExecutionContext,
     command_limit: usize,
@@ -607,6 +611,7 @@ pub(crate) fn execute_command(
         command_storage,
         random,
         stopwatches,
+        schedules,
         instruction,
         Some(compiler),
         context,
@@ -623,6 +628,7 @@ fn execute_instruction(
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
     stopwatches: &mut StopwatchState,
+    schedules: &mut ScheduleState,
     instruction: Instruction,
     compiler: Option<CommandCompiler>,
     context: ExecutionContext,
@@ -649,6 +655,7 @@ fn execute_instruction(
         command_storage,
         random,
         stopwatches,
+        schedules,
         queue,
         compiler,
         command_limit,
@@ -664,13 +671,14 @@ pub(crate) fn execute_automatic_function(
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
     stopwatches: &mut StopwatchState,
+    schedules: &mut ScheduleState,
     id: &Identifier,
     context: ExecutionContext,
     command_limit: usize,
 ) -> ExecutionReport {
     let function = program
         .function(id)
-        .expect("a resolved function tag contains loaded functions");
+        .expect("automatic function identifiers are loaded");
     let mut compiler = None;
     let Ok(function) = instantiate_function(
         id,
@@ -701,6 +709,7 @@ pub(crate) fn execute_automatic_function(
         command_storage,
         random,
         stopwatches,
+        schedules,
         queue,
         compiler,
         command_limit,
@@ -716,6 +725,7 @@ fn execute_queue(
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
     stopwatches: &mut StopwatchState,
+    schedules: &mut ScheduleState,
     queue: VecDeque<QueueEntry>,
     compiler: Option<CommandCompiler>,
     command_limit: usize,
@@ -729,6 +739,7 @@ fn execute_queue(
         command_storage,
         random,
         stopwatches,
+        schedules,
         queue,
         compiler,
         &mut quota,
@@ -746,6 +757,7 @@ fn execute_queue_inner(
     command_storage: &mut CommandStorage,
     random: &mut RandomState,
     stopwatches: &mut StopwatchState,
+    schedules: &mut ScheduleState,
     mut queue: VecDeque<QueueEntry>,
     mut compiler: Option<CommandCompiler>,
     quota: &mut CommandQuota,
@@ -1101,6 +1113,7 @@ fn execute_queue_inner(
                     | Command::Data(_)
                     | Command::Compute(_)
                     | Command::Random(_)
+                    | Command::Schedule(_)
                     | Command::Stopwatch(_)
                     | Command::StopwatchCondition(_) => {
                         queue.push_front(QueueEntry::ExecuteOrdinary {
@@ -1182,6 +1195,13 @@ fn execute_queue_inner(
                     Command::Random(command) => {
                         execute_random_command(random, command, frame.silent, &mut feedback)
                     }
+                    Command::Schedule(command) => execute_schedule_command(
+                        program,
+                        schedules,
+                        command,
+                        frame.silent,
+                        &mut feedback,
+                    ),
                     Command::Stopwatch(command) => {
                         execute_stopwatch_command(stopwatches, command, frame.silent, &mut feedback)
                     }
@@ -1339,9 +1359,7 @@ fn execute_function_command(
                 frame.silent,
                 forked,
                 match reference {
-                    FunctionReference::Function(id) => {
-                        literal_feedback(&format!("Unknown function {id}"))
-                    }
+                    FunctionReference::Function(id) => unknown_function_feedback(id),
                     FunctionReference::Tag(id) => {
                         literal_feedback(&format!("Unknown function tag '{id}'"))
                     }
@@ -1466,6 +1484,10 @@ fn execute_function_command(
             return_run,
         );
     }
+}
+
+fn unknown_function_feedback(id: &Identifier) -> FeedbackText {
+    literal_feedback(&format!("Unknown function {id}"))
 }
 
 fn function_scheduled_feedback(
@@ -2262,6 +2284,74 @@ fn execute_condition(
         OrdinaryExecution::success(1)
     } else {
         OrdinaryExecution::failure(literal_feedback("Test failed"))
+    }
+}
+
+fn execute_schedule_command(
+    program: &Program,
+    schedules: &mut ScheduleState,
+    command: &ScheduleCommand,
+    silent: bool,
+    feedback: &mut impl FnMut(CommandFeedback),
+) -> OrdinaryExecution {
+    match command {
+        ScheduleCommand::Function {
+            reference,
+            delay,
+            mode,
+        } => {
+            let function = match reference {
+                FunctionReference::Function(id) => {
+                    let Some(function) = program.function(id) else {
+                        return OrdinaryExecution::failure(unknown_function_feedback(id));
+                    };
+                    Some(function)
+                }
+                FunctionReference::Tag(_) => None,
+            };
+            if *delay == 0 {
+                return OrdinaryExecution::failure(literal_feedback(
+                    "Can't schedule for current tick",
+                ));
+            }
+            if matches!(function, Some(Function::Macro(_))) {
+                return OrdinaryExecution::failure(literal_feedback("Can't schedule a macro"));
+            }
+
+            let due_tick = schedules.schedule(
+                reference.clone(),
+                *delay,
+                matches!(mode, ScheduleMode::Replace),
+            );
+            let (kind, id) = match reference {
+                FunctionReference::Function(id) => ("function", id),
+                FunctionReference::Tag(id) => ("tag", id),
+            };
+            send_success!(
+                silent,
+                literal_feedback(&format!(
+                    "Scheduled {kind} '{id}' in {delay} tick(s) at gametime {due_tick}"
+                )),
+                feedback,
+            );
+            OrdinaryExecution::success(due_tick.rem_euclid(i64::from(i32::MAX)) as i32)
+        }
+        ScheduleCommand::Clear { id } => {
+            let removed = schedules.clear(&FunctionReference::Function(id.clone()));
+            if removed == 0 {
+                return OrdinaryExecution::failure(literal_feedback(&format!(
+                    "No schedules with ID {id}"
+                )));
+            }
+            send_success!(
+                silent,
+                literal_feedback(&format!("Removed {removed} schedule(s) with ID {id}")),
+                feedback,
+            );
+            OrdinaryExecution::success(
+                i32::try_from(removed).expect("a schedule queue contains at most i32::MAX events"),
+            )
+        }
     }
 }
 

@@ -24,8 +24,8 @@ and result required by its Minecraft semantics can be represented using only:
 - static data-pack resources supplied as program input;
 - explicit invocation values whose meaning is independent of a world or live
   server identity, except for the configured level seed described below;
-- caller-driven logical normal data-pack ticks admitted only as described
-  below;
+- caller-driven logical normal data-pack and scheduling ticks admitted only as
+  described below;
 - elapsed monotonic time admitted only through the stopwatch clock described
   below; and
 - logical computation state owned entirely by the VM and whose meaning and
@@ -109,34 +109,47 @@ deterministically from the seed. It also does not seed the unnamed level random
 stream. A composed behavior using the seed remains subject to the
 mixed-behavior rule above.
 
-## Logical normal data-pack ticks
+## Logical normal data-pack and scheduling ticks
 
 An executable Worldless VM may be advanced by one logical normal data-pack
-tick only through an explicit caller action. The initial `minecraft:load`
-function-tag lifecycle runs at the beginning of the first such tick after VM
-construction, followed by that tick's `minecraft:tick` function-tag lifecycle.
-Each subsequent logical normal tick runs the `minecraft:tick` lifecycle.
+tick only through an explicit caller call to `Vm::tick`. The initial
+`minecraft:load` function-tag lifecycle runs at the beginning of the first such
+tick after VM construction, followed by that tick's `minecraft:tick`
+function-tag lifecycle. Each subsequent logical normal tick runs the
+`minecraft:tick` lifecycle.
 
-This discrete lifecycle admits only the invocation of those function tags and
-the resulting transitions of otherwise in-scope VM-owned state. It does not
-represent elapsed time or a running server, and it does not introduce game
-time, scheduled callbacks, world clocks, timelines, real-time pacing, tick-rate
-control, reload processing, or any physical-world tick behavior.
+Each `Vm::tick` call also advances exactly one VM-owned logical scheduling tick
+after the function-tag lifecycle and invokes due function or function-tag
+callbacks registered through the `schedule` command. The VM may retain pending
+callbacks between calls, and the admitted `schedule` command forms may register
+or clear those callbacks. No other action advances the logical scheduling tick
+or causes due callbacks to run.
+
+This discrete lifecycle admits only those function-tag lifecycles, the logical
+scheduling state needed for those callbacks, and the resulting transitions of
+otherwise in-scope VM-owned state. It does not represent elapsed time or a
+running server, and it does not introduce the `time` command, general game
+time, world clocks, timelines, real-time pacing, tick-rate control, reload
+processing, persistence of scheduled callbacks, or any physical-world tick
+behavior.
 
 ## Stopwatch clock
 
 Elapsed monotonic time is in scope only as required by Minecraft's stopwatch
-semantics. The stopwatch clock advances independently of data-pack commands and
-logical normal data-pack ticks while an executable VM exists. Advancing a
-logical tick does not advance the stopwatch except through actual monotonic
-elapsed time, and stopwatch time does not cause a logical tick. The stopwatch
-clock's origin has no meaning and it does not represent calendar time, a world
-clock, or a live server.
+semantics. The stopwatch clock advances independently of data-pack commands,
+logical normal data-pack ticks, and the logical scheduling tick while an
+executable VM exists. Calling `Vm::tick` does not advance the stopwatch except
+through actual monotonic elapsed time. Stopwatch time does not cause a logical
+tick, advance the logical scheduling tick, or cause a scheduled callback to
+become due. The stopwatch clock's origin has no meaning and it does not
+represent calendar time, a world clock, or a live server.
 
 This narrow exception does not bring world or server lifecycle, game time,
-world clocks, timelines, the `time` or `schedule` commands, or other
-time-dependent physical-world behavior into scope. A composed behavior that
-uses a stopwatch remains subject to the mixed-behavior rule above.
+world clocks, timelines, the `time` command, or other time-dependent
+physical-world behavior into scope. It does not itself admit `schedule`;
+schedule behavior is in scope only as explicitly described for logical ticks
+above. A composed behavior that uses a stopwatch remains subject to the
+mixed-behavior rule above.
 
 ## Unsupported and unimplemented behavior
 

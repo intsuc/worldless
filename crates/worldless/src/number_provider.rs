@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use crate::{
     execution_context::ExecutionContext,
+    java_math::round_float_to_int,
     nbt::{CommandStorage, JavaString, NbtPath, NbtSelection, Tag},
     predicate::{
         LootPredicate, PredicateReference, PredicateSet, builtin_predicates,
@@ -962,7 +963,7 @@ impl NumberProvider {
                     execution_context,
                     random,
                 )
-                .map(java_round),
+                .map(round_float_to_int),
         }
     }
 }
@@ -1607,10 +1608,6 @@ fn tag_boxed_int_value(value: &Tag) -> Option<i32> {
     }
 }
 
-fn java_round(value: f32) -> i32 {
-    (f64::from(value) + 0.5).floor() as i32
-}
-
 fn saturated_i64_to_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
@@ -1743,14 +1740,5 @@ mod tests {
             ),
             Ok(2)
         );
-    }
-
-    #[test]
-    fn java_round_does_not_round_the_half_addition_as_float() {
-        assert_eq!(java_round(8_388_609.0), 8_388_609);
-        assert_eq!(java_round(-8_388_609.0), -8_388_609);
-        assert_eq!(java_round(f32::NAN), 0);
-        assert_eq!(java_round(f32::INFINITY), i32::MAX);
-        assert_eq!(java_round(f32::NEG_INFINITY), i32::MIN);
     }
 }

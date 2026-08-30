@@ -105,6 +105,7 @@ pub(crate) enum Command {
         reference: FunctionReference,
         arguments: Option<FunctionArguments>,
     },
+    Schedule(ScheduleCommand),
     Return {
         success: bool,
         value: i32,
@@ -119,6 +120,24 @@ pub(crate) enum Command {
     Random(RandomCommand),
     Stopwatch(StopwatchCommand),
     StopwatchCondition(StopwatchCondition),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ScheduleCommand {
+    Function {
+        reference: FunctionReference,
+        delay: i32,
+        mode: ScheduleMode,
+    },
+    Clear {
+        id: Identifier,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScheduleMode {
+    Append,
+    Replace,
 }
 
 #[derive(Clone, Debug, PartialEq)]

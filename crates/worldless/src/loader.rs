@@ -28,6 +28,7 @@ use crate::{
     execution_context::{
         Axes, ContextTransform, PositionCoordinates, RotationCoordinates, WorldCoordinate,
     },
+    java_math::round_float_to_int,
     macro_function::{Function, FunctionBuilder, MAX_COMMAND_LENGTH},
     nbt::{CompoundTag, JavaString, NbtPath, Tag, parse_compound, parse_path, parse_tag},
     number_provider::{
@@ -43,9 +44,9 @@ use crate::{
         Command as CompiledCommand, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation,
         DataSource, DataStringSubstring, DoubleRange, FunctionArguments, Instruction, IntegerRange,
         Modifier, PredicateCondition, Program, RandomCommand, RandomSequenceSettings,
-        ScoreComparison, ScoreCondition, ScoreHolderSet, ScorePredicate, ScoreReference,
-        ScoreboardCommand, ScoreboardOperation, StopwatchCommand, StopwatchCondition,
-        StorageCondition, StorageNumberType, StoreKind,
+        ScheduleCommand, ScheduleMode, ScoreComparison, ScoreCondition, ScoreHolderSet,
+        ScorePredicate, ScoreReference, ScoreboardCommand, ScoreboardOperation, StopwatchCommand,
+        StopwatchCondition, StorageCondition, StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier, is_allowed_in_identifier},
     resource_json,
@@ -1706,6 +1707,10 @@ impl CommandCompiler {
             .expect("the command tree contains no conflicting random literal");
 
         dispatcher
+            .register(schedule_command_branch())
+            .expect("the command tree contains no conflicting schedule literal");
+
+        dispatcher
             .register(stopwatch_command_branch())
             .expect("the command tree contains no conflicting stopwatch literal");
 
@@ -2032,6 +2037,63 @@ fn random_command_branch() -> LiteralArgumentBuilder<LoweringSource> {
         .expect("the random literal can contain reset")
         .then(roll_branch)
         .expect("the random literal can reject roll")
+}
+
+fn schedule_command_branch() -> LiteralArgumentBuilder<LoweringSource> {
+    let schedule = |mode| -> Command<LoweringSource> {
+        Rc::new(move |context| {
+            let reference = context
+                .argument::<FunctionReference>("function")
+                .map(|reference| (*reference).clone())
+                .expect("schedule function is attached below its function argument");
+            let delay = context
+                .argument::<i32>("time")
+                .map(|delay| *delay)
+                .expect("schedule function is attached below its time argument");
+            context
+                .source()
+                .record(CompiledCommand::Schedule(ScheduleCommand::Function {
+                    reference,
+                    delay,
+                    mode,
+                }))
+        })
+    };
+    let clear: Command<LoweringSource> = Rc::new(|context| {
+        context
+            .source()
+            .record(CompiledCommand::Schedule(ScheduleCommand::Clear {
+                id: identifier(context, "function"),
+            }))
+    });
+
+    let time = RequiredArgumentBuilder::argument("time", TimeArgument)
+        .executes(schedule(ScheduleMode::Replace))
+        .then(LiteralArgumentBuilder::literal("append").executes(schedule(ScheduleMode::Append)))
+        .expect("a schedule time can contain append")
+        .then(LiteralArgumentBuilder::literal("replace").executes(schedule(ScheduleMode::Replace)))
+        .expect("a schedule time can contain replace");
+
+    LiteralArgumentBuilder::literal("schedule")
+        .then(
+            LiteralArgumentBuilder::literal("function")
+                .then(
+                    RequiredArgumentBuilder::argument("function", FunctionArgument)
+                        .then(time)
+                        .expect("a scheduled function can contain a time"),
+                )
+                .expect("schedule function can contain a function reference"),
+        )
+        .expect("schedule can contain function")
+        .then(
+            LiteralArgumentBuilder::literal("clear")
+                .then(
+                    RequiredArgumentBuilder::argument("function", IdentifierArgument)
+                        .executes(clear),
+                )
+                .expect("schedule clear can contain an identifier"),
+        )
+        .expect("schedule can contain clear")
 }
 
 fn stopwatch_command_branch() -> LiteralArgumentBuilder<LoweringSource> {
@@ -3350,6 +3412,48 @@ impl ArgumentType<LoweringSource> for IdentifierArgument {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TimeArgument;
+
+impl ArgumentType<LoweringSource> for TimeArgument {
+    type Value = i32;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let value = reader.read_float()?;
+        let unit = reader.read_unquoted_string();
+        let factor = match unit.as_str() {
+            "d" => 24_000.0_f32,
+            "s" => 20.0_f32,
+            "t" | "" => 1.0_f32,
+            _ => {
+                return Err(SimpleCommandExceptionType::new(LiteralMessage::new(
+                    "invalid time unit; expected `d`, `s`, `t`, or no unit",
+                ))
+                .create_with_context(reader));
+            }
+        };
+        let ticks = round_float_to_int(value * factor);
+        if ticks < 0 {
+            return Err(SimpleCommandExceptionType::new(LiteralMessage::new(format!(
+                "time rounds to {ticks} ticks; minimum is 0"
+            )))
+            .create_with_context(reader));
+        }
+        Ok(ticks)
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["0d", "0s", "0t", "0"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
 #[derive(Clone)]
 struct NumberProviderArgument {
     registry: Arc<LootRegistry>,
@@ -4194,6 +4298,90 @@ mod tests {
                 .unwrap_err()
                 .contains("outside Worldless scope")
         );
+    }
+
+    #[test]
+    fn compiler_lowers_schedule_commands() {
+        let compiler = CommandCompiler::new();
+
+        assert!(matches!(
+            compiler
+                .compile("schedule function example:later 2s")
+                .unwrap()
+                .command,
+            CompiledCommand::Schedule(ScheduleCommand::Function {
+                ref reference,
+                delay: 40,
+                mode: ScheduleMode::Replace
+            }) if reference.to_string() == "example:later"
+        ));
+        assert!(matches!(
+            compiler
+                .compile("schedule function #example:group 0.5d append")
+                .unwrap()
+                .command,
+            CompiledCommand::Schedule(ScheduleCommand::Function {
+                ref reference,
+                delay: 12_000,
+                mode: ScheduleMode::Append
+            }) if reference.to_string() == "#example:group"
+        ));
+        assert!(matches!(
+            compiler
+                .compile("schedule function example:later 1.25s replace")
+                .unwrap()
+                .command,
+            CompiledCommand::Schedule(ScheduleCommand::Function {
+                delay: 25,
+                mode: ScheduleMode::Replace,
+                ..
+            })
+        ));
+        assert!(matches!(
+            compiler
+                .compile("schedule function example:later -0.5t")
+                .unwrap()
+                .command,
+            CompiledCommand::Schedule(ScheduleCommand::Function { delay: 0, .. })
+        ));
+        assert!(matches!(
+            compiler
+                .compile("schedule function example:later 7 append")
+                .unwrap()
+                .command,
+            CompiledCommand::Schedule(ScheduleCommand::Function {
+                delay: 7,
+                mode: ScheduleMode::Append,
+                ..
+            })
+        ));
+        assert!(matches!(
+            compiler.compile("schedule clear example:later").unwrap().command,
+            CompiledCommand::Schedule(ScheduleCommand::Clear { ref id })
+                if id.to_string() == "example:later"
+        ));
+    }
+
+    #[test]
+    fn compiler_rejects_invalid_schedule_syntax() {
+        let compiler = CommandCompiler::new();
+
+        for invalid in [
+            "schedule",
+            "schedule function",
+            "schedule function Invalid:later 1t",
+            "schedule function example:later",
+            "schedule function example:later 1m",
+            "schedule function example:later -0.5001t",
+            "schedule function example:later 1 t",
+            "schedule function example:later 1t keep",
+            "schedule function example:later 1t append extra",
+            "schedule clear",
+            "schedule clear #example:group",
+            "schedule clear example:later extra",
+        ] {
+            assert!(compiler.compile(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]
