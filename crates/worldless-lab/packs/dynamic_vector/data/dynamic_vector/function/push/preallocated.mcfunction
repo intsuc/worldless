@@ -1,0 +1,2 @@
+execute store result storage dynamic_vector:state work.macro.index int 1 run scoreboard players get #length dynamic_vector
+return run function dynamic_vector:write/flat.macro with storage dynamic_vector:state work.macro
