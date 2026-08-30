@@ -1,0 +1,1 @@
+execute store result score #dot numeric_lowering run compute default {"type":"sum","operands":[{"type":"product","operands":[{"type":"storage","storage":"worldless_lab:numeric_lowering/input","path":"a[0]"},{"type":"storage","storage":"worldless_lab:numeric_lowering/input","path":"b[0]"}]}]} integer
