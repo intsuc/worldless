@@ -8,10 +8,11 @@ use std::{
 
 use worldless::CompoundTag;
 use worldless_lab::{
-    BenchmarkEntry, BenchmarkOptions, BenchmarkReport, CheckReport, ComparisonReport,
+    BenchmarkEntry, BenchmarkOptions, BenchmarkReport, CheckReport, ComparisonExecution,
+    ComparisonReport,
 };
 
-const USAGE: &str = "usage: worldless-lab check [--suite <NAME>] --format <text|json>\n       worldless-lab compare --suite <NAME> --samples <NONZERO_USIZE> --format <text|json>\n       worldless-lab benchmark --pack <DIRECTORY> --model-storage <FILE.dat> --entry <text|tokens> --request <COMPOUND_SNBT> --warmup <USIZE> --samples <NONZERO_USIZE> --quota <NONZERO_USIZE> --format <text|json>";
+const USAGE: &str = "usage: worldless-lab check [--suite <NAME>] --format <text|json>\n       worldless-lab compare --suite <NAME> --execution fresh --samples <NONZERO_USIZE> --format <text|json>\n       worldless-lab compare --suite <NAME> --execution persistent --warmup <NONZERO_USIZE> --samples <NONZERO_USIZE> --format <text|json>\n       worldless-lab benchmark --pack <DIRECTORY> --model-storage <FILE.dat> --entry <text|tokens> --request <COMPOUND_SNBT> --warmup <USIZE> --samples <NONZERO_USIZE> --quota <NONZERO_USIZE> --format <text|json>";
 const EXIT_USAGE: u8 = 2;
 const EXIT_LAB: u8 = 3;
 
@@ -21,9 +22,23 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParsedComparisonExecution {
+    Fresh,
+    Persistent,
+}
+
 #[derive(Debug, Eq, PartialEq)]
-struct CommonOptions {
+struct CheckCommandOptions {
     suite: Option<String>,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CompareCommandOptions {
+    suite: String,
+    execution: ComparisonExecution,
+    samples: usize,
     format: OutputFormat,
 }
 
@@ -41,11 +56,8 @@ struct BenchmarkCommandOptions {
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
-    Check(CommonOptions),
-    Compare {
-        common: CommonOptions,
-        samples: usize,
-    },
+    Check(CheckCommandOptions),
+    Compare(CompareCommandOptions),
     Benchmark(BenchmarkCommandOptions),
 }
 
@@ -70,19 +82,15 @@ fn main() -> ExitCode {
     let result = match command {
         Command::Check(options) => worldless_lab::check(options.suite.as_deref())
             .and_then(|report| write_check(report, options.format).map_err(output_error)),
-        Command::Compare { common, samples } => {
+        Command::Compare(options) => {
             if cfg!(debug_assertions) {
                 Err(worldless_lab::LabError::from_message(
                     "timing comparison requires a release build; run `cargo run --release -p worldless-lab -- compare ...`",
                 ))
             } else {
-                let suite = common
-                    .suite
-                    .as_deref()
-                    .expect("compare parsing requires --suite");
-                worldless_lab::compare(suite, samples).and_then(|report| {
-                    write_comparison(report, common.format).map_err(output_error)
-                })
+                worldless_lab::compare(&options.suite, options.execution, options.samples).and_then(
+                    |report| write_comparison(report, options.format).map_err(output_error),
+                )
             }
         }
         Command::Benchmark(options) => {
@@ -161,6 +169,11 @@ fn write_comparison(report: ComparisonReport, format: OutputFormat) -> io::Resul
                 output,
                 "execution vm_state={} macro_cache={}",
                 report.execution.vm_state, report.execution.macro_cache
+            )?;
+            writeln!(
+                output,
+                "measurement warmup_discarded={} measured_samples={}",
+                report.warmup_discarded, report.measured_samples
             )?;
             writeln!(
                 output,
@@ -258,15 +271,9 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
         .next()
         .ok_or_else(|| usage_error("missing command"))?;
     if command == "check" {
-        let (common, samples) = parse_options(arguments, false)?;
-        debug_assert!(samples.is_none());
-        Ok(Command::Check(common))
+        Ok(Command::Check(parse_check_options(arguments)?))
     } else if command == "compare" {
-        let (common, samples) = parse_options(arguments, true)?;
-        Ok(Command::Compare {
-            common,
-            samples: samples.expect("compare requires --samples"),
-        })
+        Ok(Command::Compare(parse_compare_options(arguments)?))
     } else if command == "benchmark" {
         Ok(Command::Benchmark(parse_benchmark_options(arguments)?))
     } else {
@@ -355,13 +362,11 @@ fn parse_benchmark_options(
     })
 }
 
-fn parse_options(
+fn parse_check_options(
     mut arguments: impl Iterator<Item = OsString>,
-    allow_samples: bool,
-) -> Result<(CommonOptions, Option<usize>), UsageError> {
+) -> Result<CheckCommandOptions, UsageError> {
     let mut suite = None;
     let mut format = None;
-    let mut samples = None;
     while let Some(option) = arguments.next() {
         if option == "--suite" {
             if suite.is_some() {
@@ -376,23 +381,80 @@ fn parse_options(
                 .next()
                 .ok_or_else(|| usage_error("missing value for --format"))?;
             format = Some(parse_format(&value)?);
-        } else if option == "--samples" && allow_samples {
-            if samples.is_some() {
-                return Err(usage_error("duplicate --samples"));
-            }
-            samples = Some(parse_samples(arguments.next())?);
         } else {
             return Err(usage_error(format!("unexpected argument {option:?}")));
         }
     }
     let format = format.ok_or_else(|| usage_error("missing required --format"))?;
-    if allow_samples && suite.is_none() {
-        return Err(usage_error("missing required --suite"));
+    Ok(CheckCommandOptions { suite, format })
+}
+
+fn parse_compare_options(
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<CompareCommandOptions, UsageError> {
+    let mut suite = None;
+    let mut execution = None;
+    let mut warmup = None;
+    let mut samples = None;
+    let mut format = None;
+    while let Some(option) = arguments.next() {
+        if option == "--suite" {
+            if suite.is_some() {
+                return Err(usage_error("duplicate --suite"));
+            }
+            suite = Some(parse_utf8("--suite", arguments.next())?);
+        } else if option == "--execution" {
+            if execution.is_some() {
+                return Err(usage_error("duplicate --execution"));
+            }
+            let value = arguments
+                .next()
+                .ok_or_else(|| usage_error("missing value for --execution"))?;
+            execution = Some(parse_comparison_execution(&value)?);
+        } else if option == "--warmup" {
+            if warmup.is_some() {
+                return Err(usage_error("duplicate --warmup"));
+            }
+            warmup = Some(parse_positive_usize("--warmup", arguments.next())?);
+        } else if option == "--samples" {
+            if samples.is_some() {
+                return Err(usage_error("duplicate --samples"));
+            }
+            samples = Some(parse_samples(arguments.next())?);
+        } else if option == "--format" {
+            if format.is_some() {
+                return Err(usage_error("duplicate --format"));
+            }
+            let value = arguments
+                .next()
+                .ok_or_else(|| usage_error("missing value for --format"))?;
+            format = Some(parse_format(&value)?);
+        } else {
+            return Err(usage_error(format!("unexpected argument {option:?}")));
+        }
     }
-    if allow_samples && samples.is_none() {
-        return Err(usage_error("missing required --samples"));
-    }
-    Ok((CommonOptions { suite, format }, samples))
+
+    let execution = execution.ok_or_else(|| usage_error("missing required --execution"))?;
+    let execution = match (execution, warmup) {
+        (ParsedComparisonExecution::Fresh, None) => ComparisonExecution::Fresh,
+        (ParsedComparisonExecution::Fresh, Some(_)) => {
+            return Err(usage_error("--warmup is not valid with fresh execution"));
+        }
+        (ParsedComparisonExecution::Persistent, Some(warmup)) => {
+            ComparisonExecution::Persistent { warmup }
+        }
+        (ParsedComparisonExecution::Persistent, None) => {
+            return Err(usage_error(
+                "missing required --warmup for persistent execution",
+            ));
+        }
+    };
+    Ok(CompareCommandOptions {
+        suite: suite.ok_or_else(|| usage_error("missing required --suite"))?,
+        execution,
+        samples: samples.ok_or_else(|| usage_error("missing required --samples"))?,
+        format: format.ok_or_else(|| usage_error("missing required --format"))?,
+    })
 }
 
 fn parse_utf8(option: &str, value: Option<OsString>) -> Result<String, UsageError> {
@@ -416,6 +478,18 @@ fn parse_benchmark_entry(value: &OsStr) -> Result<BenchmarkEntry, UsageError> {
     } else {
         Err(usage_error(format!(
             "invalid --entry {value:?}; expected text or tokens"
+        )))
+    }
+}
+
+fn parse_comparison_execution(value: &OsStr) -> Result<ParsedComparisonExecution, UsageError> {
+    if value == "fresh" {
+        Ok(ParsedComparisonExecution::Fresh)
+    } else if value == "persistent" {
+        Ok(ParsedComparisonExecution::Persistent)
+    } else {
+        Err(usage_error(format!(
+            "invalid --execution {value:?}; expected fresh or persistent"
         )))
     }
 }
@@ -470,7 +544,7 @@ mod tests {
     fn parses_check_and_compare_options_in_any_order() {
         assert_eq!(
             parse_args(args(&["check", "--format", "json", "--suite", "concat"])),
-            Ok(Command::Check(CommonOptions {
+            Ok(Command::Check(CheckCommandOptions {
                 suite: Some("concat".to_owned()),
                 format: OutputFormat::Json,
             }))
@@ -478,6 +552,10 @@ mod tests {
         assert_eq!(
             parse_args(args(&[
                 "compare",
+                "--execution",
+                "persistent",
+                "--warmup",
+                "3",
                 "--samples",
                 "7",
                 "--suite",
@@ -485,13 +563,32 @@ mod tests {
                 "--format",
                 "text",
             ])),
-            Ok(Command::Compare {
-                common: CommonOptions {
-                    suite: Some("concat".to_owned()),
-                    format: OutputFormat::Text,
-                },
+            Ok(Command::Compare(CompareCommandOptions {
+                suite: "concat".to_owned(),
+                execution: ComparisonExecution::Persistent { warmup: 3 },
                 samples: 7,
-            })
+                format: OutputFormat::Text,
+            }))
+        );
+
+        assert_eq!(
+            parse_args(args(&[
+                "compare",
+                "--suite",
+                "concat",
+                "--execution",
+                "fresh",
+                "--samples",
+                "7",
+                "--format",
+                "json",
+            ])),
+            Ok(Command::Compare(CompareCommandOptions {
+                suite: "concat".to_owned(),
+                execution: ComparisonExecution::Fresh,
+                samples: 7,
+                format: OutputFormat::Json,
+            }))
         );
     }
 
@@ -538,7 +635,39 @@ mod tests {
             &["compare", "--unknown"][..],
             &["check"][..],
             &["compare", "--suite", "concat", "--format", "text"][..],
-            &["compare", "--samples", "1", "--format", "text"][..],
+            &[
+                "compare",
+                "--execution",
+                "fresh",
+                "--samples",
+                "1",
+                "--format",
+                "text",
+            ][..],
+            &[
+                "compare",
+                "--suite",
+                "concat",
+                "--execution",
+                "persistent",
+                "--samples",
+                "1",
+                "--format",
+                "text",
+            ][..],
+            &[
+                "compare",
+                "--suite",
+                "concat",
+                "--execution",
+                "fresh",
+                "--warmup",
+                "1",
+                "--samples",
+                "1",
+                "--format",
+                "text",
+            ][..],
         ] {
             assert!(parse_args(args(values)).is_err(), "{values:?}");
         }
@@ -552,8 +681,33 @@ mod tests {
                     "compare",
                     "--suite",
                     "concat",
+                    "--execution",
+                    "fresh",
                     "--samples",
                     value,
+                    "--format",
+                    "text",
+                ]))
+                .is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_warmups_are_strictly_positive_integers() {
+        for value in ["0", "-1", "1.5", "many"] {
+            assert!(
+                parse_args(args(&[
+                    "compare",
+                    "--suite",
+                    "concat",
+                    "--execution",
+                    "persistent",
+                    "--warmup",
+                    value,
+                    "--samples",
+                    "1",
                     "--format",
                     "text",
                 ]))

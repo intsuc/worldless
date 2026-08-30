@@ -124,7 +124,7 @@ Reproduce the comparison with a release build:
 
 ```sh
 cargo run --release -p worldless-lab -- compare \
-  --suite int_map --samples 31 --format text
+  --suite int_map --execution fresh --samples 31 --format text
 ```
 
 The tables below were measured on 2026-08-30 on an AMD Ryzen 9 9950X3D

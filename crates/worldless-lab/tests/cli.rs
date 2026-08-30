@@ -43,6 +43,7 @@ fn usage_errors_are_rejected_before_loading_a_suite() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn production_benchmark_requires_a_release_binary_before_loading_inputs() {
     let output = run(&[
@@ -61,6 +62,27 @@ fn production_benchmark_requires_a_release_binary_before_loading_inputs() {
         "30",
         "--quota",
         "1000000",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires a release build"));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn timing_comparison_requires_a_release_binary_before_loading_a_suite() {
+    let output = run(&[
+        "compare",
+        "--suite",
+        "missing",
+        "--execution",
+        "persistent",
+        "--warmup",
+        "1",
+        "--samples",
+        "1",
         "--format",
         "json",
     ]);

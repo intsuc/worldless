@@ -83,7 +83,15 @@ pub struct CheckedSuite {
 #[derive(Debug, Serialize)]
 pub struct ComparisonReport {
     pub execution: ExecutionMode,
+    pub warmup_discarded: usize,
+    pub measured_samples: usize,
     pub rows: Vec<ComparisonRow>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComparisonExecution {
+    Fresh,
+    Persistent { warmup: usize },
 }
 
 #[derive(Debug, Serialize)]
@@ -179,9 +187,16 @@ pub fn check(selected_suite: Option<&str>) -> Result<CheckReport, LabError> {
     check_prepared(&suites)
 }
 
-pub fn compare(selected_suite: &str, samples: usize) -> Result<ComparisonReport, LabError> {
+pub fn compare(
+    selected_suite: &str,
+    execution: ComparisonExecution,
+    samples: usize,
+) -> Result<ComparisonReport, LabError> {
     if samples == 0 {
         return Err(LabError::new("sample count must be greater than zero"));
+    }
+    if matches!(execution, ComparisonExecution::Persistent { warmup: 0 }) {
+        return Err(LabError::new("warm-up count must be greater than zero"));
     }
     let suites = prepare_suites(Some(selected_suite))?;
     check_prepared(&suites)?;
@@ -190,16 +205,12 @@ pub fn compare(selected_suite: &str, samples: usize) -> Result<ComparisonReport,
     for suite in &suites {
         for case in &suite.cases {
             for variant in suite.spec.variants {
-                let quota_used = invoke_and_verify(suite, case, variant, false)?.quota_used;
-                let mut durations_ns = Vec::with_capacity(samples);
-                for _ in 0..samples {
-                    let measured = invoke_and_verify(suite, case, variant, true)?;
-                    durations_ns.push(
-                        measured
-                            .duration_ns
-                            .expect("timed invocations record their duration"),
-                    );
-                }
+                let (quota_used, durations_ns) = match execution {
+                    ComparisonExecution::Fresh => measure_fresh_row(suite, case, variant, samples)?,
+                    ComparisonExecution::Persistent { warmup } => {
+                        measure_persistent_row(suite, case, variant, warmup, samples)?
+                    }
+                };
                 rows.push(ComparisonRow {
                     suite: suite.spec.slug,
                     case: case.slug,
@@ -214,9 +225,76 @@ pub fn compare(selected_suite: &str, samples: usize) -> Result<ComparisonReport,
         }
     }
     Ok(ComparisonReport {
-        execution: execution_mode(),
+        execution: comparison_execution_mode(execution),
+        warmup_discarded: match execution {
+            ComparisonExecution::Fresh => 0,
+            ComparisonExecution::Persistent { warmup } => warmup,
+        },
+        measured_samples: samples,
         rows,
     })
+}
+
+fn measure_fresh_row(
+    suite: &PreparedSuite,
+    case: &Case,
+    variant: &VariantSpec,
+    samples: usize,
+) -> Result<(usize, Vec<u64>), LabError> {
+    let quota_used = invoke_fresh_and_verify(suite, case, variant, false)?.quota_used;
+    let mut durations_ns = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let measured = invoke_fresh_and_verify(suite, case, variant, true)?;
+        durations_ns.push(
+            measured
+                .duration_ns
+                .expect("timed invocations record their duration"),
+        );
+    }
+    Ok((quota_used, durations_ns))
+}
+
+fn measure_persistent_row(
+    suite: &PreparedSuite,
+    case: &Case,
+    variant: &VariantSpec,
+    warmup: usize,
+    samples: usize,
+) -> Result<(usize, Vec<u64>), LabError> {
+    let mut vm = suite.program.create_vm(suite.spec.world_seed);
+    for _ in 0..warmup {
+        invoke_and_verify(&mut vm, suite, case, variant, false)?;
+    }
+
+    let mut expected_quota = None;
+    let mut durations_ns = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let measured = invoke_and_verify(&mut vm, suite, case, variant, true)?;
+        if let Some(expected) = expected_quota {
+            if measured.quota_used != expected {
+                return Err(contextual_error(
+                    suite,
+                    case,
+                    variant,
+                    format!(
+                        "quota use changed between measured invocations: expected {expected}, actual {}",
+                        measured.quota_used
+                    ),
+                ));
+            }
+        } else {
+            expected_quota = Some(measured.quota_used);
+        }
+        durations_ns.push(
+            measured
+                .duration_ns
+                .expect("timed invocations record their duration"),
+        );
+    }
+    Ok((
+        expected_quota.expect("a positive sample count records quota use"),
+        durations_ns,
+    ))
 }
 
 pub fn benchmark(options: BenchmarkOptions<'_>) -> Result<BenchmarkReport, LabError> {
@@ -506,7 +584,7 @@ fn check_prepared(suites: &[PreparedSuite]) -> Result<CheckReport, LabError> {
     for suite in suites {
         for case in &suite.cases {
             for variant in suite.spec.variants {
-                invoke_and_verify(suite, case, variant, false)?;
+                invoke_fresh_and_verify(suite, case, variant, false)?;
             }
         }
         checked.push(CheckedSuite {
@@ -517,7 +595,7 @@ fn check_prepared(suites: &[PreparedSuite]) -> Result<CheckReport, LabError> {
         });
     }
     Ok(CheckReport {
-        execution: execution_mode(),
+        execution: fresh_execution_mode(),
         suites: checked,
     })
 }
@@ -528,6 +606,7 @@ struct InvocationMeasurement {
 }
 
 fn invoke_and_verify(
+    vm: &mut worldless::Vm,
     suite: &PreparedSuite,
     case: &Case,
     variant: &VariantSpec,
@@ -536,9 +615,12 @@ fn invoke_and_verify(
     let input_storage = storage_id(suite.spec.slug, "input");
     let output_storage = storage_id(suite.spec.slug, "output");
     let entrypoint = entrypoint(suite.spec.slug, variant.slug);
-    let mut vm = suite.program.create_vm(suite.spec.world_seed);
     vm.set_storage(&input_storage, case.input.clone())
         .map_err(|error| contextual_error(suite, case, variant, format!("set input: {error}")))?;
+    vm.set_storage(&output_storage, CompoundTag::default())
+        .map_err(|error| {
+            contextual_error(suite, case, variant, format!("clear output: {error}"))
+        })?;
 
     let start = timed.then(Instant::now);
     let report = vm.execute_function(&entrypoint, None, context(), suite.spec.command_limit, drop);
@@ -599,6 +681,16 @@ fn invoke_and_verify(
         quota_used,
         duration_ns,
     })
+}
+
+fn invoke_fresh_and_verify(
+    suite: &PreparedSuite,
+    case: &Case,
+    variant: &VariantSpec,
+    timed: bool,
+) -> Result<InvocationMeasurement, LabError> {
+    let mut vm = suite.program.create_vm(suite.spec.world_seed);
+    invoke_and_verify(&mut vm, suite, case, variant, timed)
 }
 
 fn checked_duration_ns(
@@ -734,10 +826,20 @@ fn context() -> ExecutionContext {
     ExecutionContext::new(POSITION, ROTATION)
 }
 
-fn execution_mode() -> ExecutionMode {
+fn fresh_execution_mode() -> ExecutionMode {
     ExecutionMode {
         vm_state: "fresh",
         macro_cache: "cold",
+    }
+}
+
+fn comparison_execution_mode(execution: ComparisonExecution) -> ExecutionMode {
+    match execution {
+        ComparisonExecution::Fresh => fresh_execution_mode(),
+        ComparisonExecution::Persistent { .. } => ExecutionMode {
+            vm_state: "persistent",
+            macro_cache: "warm",
+        },
     }
 }
 
@@ -783,7 +885,7 @@ mod tests {
         Ok(vec![Case {
             slug: "case",
             input: CompoundTag::from_snbt("{}").unwrap(),
-            expected_output: CompoundTag::from_snbt("{}").unwrap(),
+            expected_output: CompoundTag::from_snbt("{value:1}").unwrap(),
         }])
     }
 
@@ -828,15 +930,61 @@ mod tests {
             ),
         ] {
             let suite = prepared_contract(source);
-            let error = match invoke_and_verify(&suite, &suite.cases[0], &CONTRACT_VARIANT, false) {
-                Ok(_) => panic!("the invalid invocation contract was accepted"),
-                Err(error) => error,
-            };
+            let error =
+                match invoke_fresh_and_verify(&suite, &suite.cases[0], &CONTRACT_VARIANT, false) {
+                    Ok(_) => panic!("the invalid invocation contract was accepted"),
+                    Err(error) => error,
+                };
             assert!(
                 error.to_string().contains(expected_reason),
                 "{error} did not contain {expected_reason:?}"
             );
         }
+    }
+
+    #[test]
+    fn persistent_measurement_reuses_one_vm_for_warmups_and_samples() {
+        let suite = prepared_contract(
+            "scoreboard objectives add contract dummy\n\
+             scoreboard players add #runs contract 1\n\
+             data modify storage worldless_lab:contract/output value set value 1\n\
+             execute if score #runs contract matches 3.. run return 0\n\
+             return 1\n",
+        );
+        let error =
+            measure_persistent_row(&suite, &suite.cases[0], &CONTRACT_VARIANT, 1, 2).unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected invocation outcome"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn persistent_measurement_clears_output_before_every_invocation() {
+        let suite = prepared_contract(
+            "scoreboard objectives add contract dummy\n\
+             scoreboard players add #runs contract 1\n\
+             execute if score #runs contract matches 1 run data modify storage worldless_lab:contract/output value set value 1\n\
+             return 1\n",
+        );
+        let error =
+            measure_persistent_row(&suite, &suite.cases[0], &CONTRACT_VARIANT, 1, 1).unwrap_err();
+        assert!(
+            error.to_string().contains("required output storage"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn comparison_counts_are_validated_before_suite_loading() {
+        assert_eq!(
+            compare("missing", ComparisonExecution::Fresh, 0).unwrap_err(),
+            LabError::new("sample count must be greater than zero")
+        );
+        assert_eq!(
+            compare("missing", ComparisonExecution::Persistent { warmup: 0 }, 1).unwrap_err(),
+            LabError::new("warm-up count must be greater than zero")
+        );
     }
 
     #[test]
