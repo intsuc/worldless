@@ -1,0 +1,8 @@
+function aggregate_layout:kernel/record_compounds/record_major/n64
+function aggregate_layout:kernel/record_compounds/record_major/n64
+function aggregate_layout:kernel/record_compounds/record_major/n64
+function aggregate_layout:kernel/record_compounds/record_major/n64
+function aggregate_layout:kernel/record_compounds/record_major/n64
+function aggregate_layout:kernel/record_compounds/record_major/n64
+function aggregate_layout:kernel/record_compounds/record_major/n64
+function aggregate_layout:checksum/record_compounds/n64

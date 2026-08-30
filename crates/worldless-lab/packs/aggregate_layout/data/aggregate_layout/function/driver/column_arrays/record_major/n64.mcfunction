@@ -1,0 +1,8 @@
+function aggregate_layout:kernel/column_arrays/record_major/n64
+function aggregate_layout:kernel/column_arrays/record_major/n64
+function aggregate_layout:kernel/column_arrays/record_major/n64
+function aggregate_layout:kernel/column_arrays/record_major/n64
+function aggregate_layout:kernel/column_arrays/record_major/n64
+function aggregate_layout:kernel/column_arrays/record_major/n64
+function aggregate_layout:kernel/column_arrays/record_major/n64
+function aggregate_layout:checksum/column_arrays/n64

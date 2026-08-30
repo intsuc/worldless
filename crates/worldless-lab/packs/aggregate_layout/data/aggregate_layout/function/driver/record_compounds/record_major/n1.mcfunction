@@ -1,0 +1,8 @@
+function aggregate_layout:kernel/record_compounds/record_major/n1
+function aggregate_layout:kernel/record_compounds/record_major/n1
+function aggregate_layout:kernel/record_compounds/record_major/n1
+function aggregate_layout:kernel/record_compounds/record_major/n1
+function aggregate_layout:kernel/record_compounds/record_major/n1
+function aggregate_layout:kernel/record_compounds/record_major/n1
+function aggregate_layout:kernel/record_compounds/record_major/n1
+function aggregate_layout:checksum/record_compounds/n1

@@ -1,0 +1,8 @@
+function aggregate_layout:kernel/record_compounds/field_major/n128
+function aggregate_layout:kernel/record_compounds/field_major/n128
+function aggregate_layout:kernel/record_compounds/field_major/n128
+function aggregate_layout:kernel/record_compounds/field_major/n128
+function aggregate_layout:kernel/record_compounds/field_major/n128
+function aggregate_layout:kernel/record_compounds/field_major/n128
+function aggregate_layout:kernel/record_compounds/field_major/n128
+function aggregate_layout:checksum/record_compounds/n128

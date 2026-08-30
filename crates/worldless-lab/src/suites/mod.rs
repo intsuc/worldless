@@ -1,3 +1,4 @@
+mod aggregate_layout;
 mod call_abi;
 mod call_frames;
 mod concat;
@@ -10,6 +11,7 @@ mod transformer;
 use crate::SuiteSpec;
 
 pub(crate) const REGISTRY: &[SuiteSpec] = &[
+    aggregate_layout::SPEC,
     call_abi::SPEC,
     call_frames::SPEC,
     concat::SPEC,
