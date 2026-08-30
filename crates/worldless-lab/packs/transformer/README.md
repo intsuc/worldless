@@ -1,18 +1,26 @@
 # Integer decoder transformer pack
 
 This data pack executes a decoder-only transformer with integer operations in
-Worldless and Minecraft. The generator supports exactly three runtime
-architectures. All use four pre-norm layers, width 96, one KV head,
-ReLU-squared FFNs, ALiBi, context 256, and local attention window 64:
+Worldless and Minecraft. The generator accepts exactly the runtime specs owned
+by `worldless_transformer.spec.ARCHITECTURE_CHOICES`:
 
-- `worldless_transformer/relu2_alibi_gsp512_l4_d96_q6_kv1_h16_ff192_c256_w64_v1`
-  uses FFN width 192 and a tied 512-token embedding/unembedding.
-- `worldless_transformer/relu2_alibi_gsp512_l4_d96_q6_kv1_h16_ff96_untied_ve13_c256_w64_v1`
-  uses FFN width 96, an untied language-model head, and token value embeddings
-  in zero-based `blocks.1` and `blocks.3` (the second and fourth blocks).
-- `worldless_transformer/relu2_alibi_gsp512_l4_d96_q4_kv1_h24_ff96_untied_ve13_ad24_c256_w64_v1`
-  uses four width-24 query heads, a width-24 KV head, FFN width 96, the untied
-  head and value embeddings, and attention-logit denominator 24.
+- `baseline`: four width-96 layers, six width-16 query heads, FFN width 192,
+  and tied token embedding/language-model head;
+- `efficient`: four width-96 layers, six width-16 query heads, FFN width 96,
+  an untied language-model head, and token value embeddings in zero-based
+  blocks 1 and 3;
+- `efficient_q4`: the efficient layout with four width-24 query heads and
+  attention-logit denominator 24;
+- `efficient_q4_ff192`: the four-head layout with FFN width 192;
+- `efficient_q4_wide`: four width-128 layers with four width-32 query heads,
+  FFN width 128, and attention-logit denominator 32; and
+- `efficient_q4_deep`: eight width-96 layers with width-24 heads and value
+  embeddings in zero-based blocks 1, 3, 5, and 7.
+
+All six use a 512-token greedy StringPiece vocabulary, one KV head,
+ReLU-squared FFNs, ALiBi, context 256, and local attention window 64. Exact
+architecture IDs, tensor shapes, value-embedding layers, and runtime attention
+denominators are derived from the selected Python spec.
 
 The checked-in fixture pack uses the `baseline` architecture. Production pack
 generation requires an explicit architecture selection.
@@ -50,12 +58,11 @@ reactivation from bank 0 reports 5,112. In Worldless, limit 5,111 interrupts
 before that reactivation's commit, limit 5,112 executes the commit and then
 reports `CommandLimitExceeded` while draining the queue, and limit 5,113
 completes with success 1. The `efficient` pack reports 5,054 for fresh
-activation and 5,055 for reactivation; its corresponding pre-commit,
-post-commit, and clean reactivation limits are 5,054, 5,055, and 5,056.
-Configure at least the clean limit for the selected architecture. The
-`efficient_q4` pack reports 5,276 for fresh activation and 5,277 for
-reactivation; its corresponding limits are 5,276, 5,277, and 5,278. A data pack
-cannot inspect the caller's remaining command quota.
+activation and 5,055 for reactivation; the `efficient_q4` pack reports 5,276
+and 5,277 respectively. Generated architectures have different validation and
+staging costs. Measure activation with a high limit and configure at least one
+command beyond the reported reactivation use. A data pack cannot inspect the
+caller's remaining command quota.
 
 The public entry points read exact request compounds from
 `transformer:request`:
@@ -72,7 +79,7 @@ Unknown, missing, or wrongly typed request fields fail before inference state or
 the KV cache is committed. `max_new_tokens` is in 1..256, and the tokenized
 prefix plus requested generation must satisfy the fixed 256-position model
 input context. Success writes
-`{ok:1b,generated:<IntArrayTag>,final_hidden:<IntArrayTag[96]>}` to
+`{ok:1b,generated:<IntArrayTag>,final_hidden:<IntArrayTag[spec.d_model]>}` to
 `transformer:response`. Failure writes `{ok:0b,error:<IntTag>}` and returns
 failure. Error values are:
 
@@ -102,8 +109,9 @@ uv run --locked --project crates/worldless-lab/experiments/transformer \
   --architecture baseline TOKENIZER_JSON OUTPUT_DIR
 ```
 
-`--architecture` is required and accepts `baseline`, `efficient`, or
-`efficient_q4`. The tokenizer must use data schema 2 and
+`--architecture` is required and accepts one exact value from
+`worldless_transformer.spec.ARCHITECTURE_CHOICES`; the six values are listed
+above. The tokenizer must use data schema 2 and
 `data_abi_id = worldless_transformer/gsp512_c256_w64_v1`. The generator
 validates the tokenizer with the Python implementation, copies
 the canonical artifact and its tokenizer-ID SHA-256 into the output,

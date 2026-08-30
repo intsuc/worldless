@@ -22,11 +22,10 @@ from .quantization import (
 )
 from .spec import (
     ATTENTION_SCORE_SHIFT,
-    BASELINE_SPEC,
     DEFAULT_DENSE_SHIFTS,
-    EFFICIENT_Q4_SPEC,
-    EFFICIENT_SPEC,
     INT32_MIN,
+    KNOWN_MODEL_SPECS,
+    KNOWN_MODEL_WIDTHS,
     RMS_GAIN_FRACTION_BITS,
     RMS_GAIN_TABLE,
     RMS_TARGET,
@@ -50,8 +49,8 @@ def _validate_mode(mode: str) -> ExecutionMode:
 class AffineFreeRMSNorm(nn.Module):
     def __init__(self, width: int) -> None:
         super().__init__()
-        if width != BASELINE_SPEC.d_model:
-            raise ValueError(f"RMSNorm width must be {BASELINE_SPEC.d_model}")
+        if width not in KNOWN_MODEL_WIDTHS:
+            raise ValueError(f"RMSNorm width must be one of {KNOWN_MODEL_WIDTHS}")
         self.width = width
         self.register_buffer(
             "_gain_table",
@@ -394,7 +393,7 @@ class Transformer(nn.Module):
         attention_logit_denominator: int | None = None,
     ) -> None:
         super().__init__()
-        if spec not in (BASELINE_SPEC, EFFICIENT_SPEC, EFFICIENT_Q4_SPEC):
+        if spec not in KNOWN_MODEL_SPECS:
             raise ValueError("spec must match a known architecture")
         resolved_logit_denominator = (
             spec.runtime_attention_logit_denominator

@@ -12,8 +12,142 @@ BASELINE_ARCHITECTURE_ID: Final = (
 )
 EFFICIENT_ARCHITECTURE_ID: Final = "worldless_transformer/relu2_alibi_gsp512_l4_d96_q6_kv1_h16_ff96_untied_ve13_c256_w64_v1"
 EFFICIENT_Q4_ARCHITECTURE_ID: Final = "worldless_transformer/relu2_alibi_gsp512_l4_d96_q4_kv1_h24_ff96_untied_ve13_ad24_c256_w64_v1"
-Architecture = Literal["baseline", "efficient", "efficient_q4"]
-ARCHITECTURE_CHOICES: Final = ("baseline", "efficient", "efficient_q4")
+EFFICIENT_Q4_FF192_ARCHITECTURE_ID: Final = "worldless_transformer/relu2_alibi_gsp512_l4_d96_q4_kv1_h24_ff192_untied_ve13_ad24_c256_w64_v1"
+EFFICIENT_Q4_WIDE_ARCHITECTURE_ID: Final = "worldless_transformer/relu2_alibi_gsp512_l4_d128_q4_kv1_h32_ff128_untied_ve13_ad32_c256_w64_v1"
+EFFICIENT_Q4_DEEP_ARCHITECTURE_ID: Final = "worldless_transformer/relu2_alibi_gsp512_l8_d96_q4_kv1_h24_ff96_untied_ve1357_ad24_c256_w64_v1"
+Architecture = Literal[
+    "baseline",
+    "efficient",
+    "efficient_q4",
+    "efficient_q4_ff192",
+    "efficient_q4_wide",
+    "efficient_q4_deep",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _ArchitectureDefinition:
+    architecture: Architecture
+    architecture_id: str
+    layers: int
+    d_model: int
+    q_heads: int
+    kv_heads: int
+    head_dim: int
+    d_ff: int
+    alibi_slopes: tuple[tuple[int, int], ...]
+    tied_lm_head: bool
+    value_embedding_layers: tuple[int, ...]
+    runtime_attention_logit_denominator: int
+
+
+_Q6_ALIBI_SLOPES: Final = (
+    (1, 4),
+    (1, 16),
+    (1, 64),
+    (1, 256),
+    (1, 2),
+    (1, 8),
+)
+_Q4_ALIBI_SLOPES: Final = _Q6_ALIBI_SLOPES[:4]
+_ARCHITECTURE_DEFINITIONS: Final = (
+    _ArchitectureDefinition(
+        architecture="baseline",
+        architecture_id=BASELINE_ARCHITECTURE_ID,
+        layers=4,
+        d_model=96,
+        q_heads=6,
+        kv_heads=1,
+        head_dim=16,
+        d_ff=192,
+        alibi_slopes=_Q6_ALIBI_SLOPES,
+        tied_lm_head=True,
+        value_embedding_layers=(),
+        runtime_attention_logit_denominator=16,
+    ),
+    _ArchitectureDefinition(
+        architecture="efficient",
+        architecture_id=EFFICIENT_ARCHITECTURE_ID,
+        layers=4,
+        d_model=96,
+        q_heads=6,
+        kv_heads=1,
+        head_dim=16,
+        d_ff=96,
+        alibi_slopes=_Q6_ALIBI_SLOPES,
+        tied_lm_head=False,
+        value_embedding_layers=(1, 3),
+        runtime_attention_logit_denominator=16,
+    ),
+    _ArchitectureDefinition(
+        architecture="efficient_q4",
+        architecture_id=EFFICIENT_Q4_ARCHITECTURE_ID,
+        layers=4,
+        d_model=96,
+        q_heads=4,
+        kv_heads=1,
+        head_dim=24,
+        d_ff=96,
+        alibi_slopes=_Q4_ALIBI_SLOPES,
+        tied_lm_head=False,
+        value_embedding_layers=(1, 3),
+        runtime_attention_logit_denominator=24,
+    ),
+    _ArchitectureDefinition(
+        architecture="efficient_q4_ff192",
+        architecture_id=EFFICIENT_Q4_FF192_ARCHITECTURE_ID,
+        layers=4,
+        d_model=96,
+        q_heads=4,
+        kv_heads=1,
+        head_dim=24,
+        d_ff=192,
+        alibi_slopes=_Q4_ALIBI_SLOPES,
+        tied_lm_head=False,
+        value_embedding_layers=(1, 3),
+        runtime_attention_logit_denominator=24,
+    ),
+    _ArchitectureDefinition(
+        architecture="efficient_q4_wide",
+        architecture_id=EFFICIENT_Q4_WIDE_ARCHITECTURE_ID,
+        layers=4,
+        d_model=128,
+        q_heads=4,
+        kv_heads=1,
+        head_dim=32,
+        d_ff=128,
+        alibi_slopes=_Q4_ALIBI_SLOPES,
+        tied_lm_head=False,
+        value_embedding_layers=(1, 3),
+        runtime_attention_logit_denominator=32,
+    ),
+    _ArchitectureDefinition(
+        architecture="efficient_q4_deep",
+        architecture_id=EFFICIENT_Q4_DEEP_ARCHITECTURE_ID,
+        layers=8,
+        d_model=96,
+        q_heads=4,
+        kv_heads=1,
+        head_dim=24,
+        d_ff=96,
+        alibi_slopes=_Q4_ALIBI_SLOPES,
+        tied_lm_head=False,
+        value_embedding_layers=(1, 3, 5, 7),
+        runtime_attention_logit_denominator=24,
+    ),
+)
+ARCHITECTURE_CHOICES: Final = tuple(
+    definition.architecture for definition in _ARCHITECTURE_DEFINITIONS
+)
+
+
+def _definition_for_architecture_id(
+    architecture_id: object,
+) -> _ArchitectureDefinition:
+    for definition in _ARCHITECTURE_DEFINITIONS:
+        if architecture_id == definition.architecture_id:
+            return definition
+    raise ValueError("architecture_id must identify a known architecture")
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,27 +197,27 @@ class ModelSpec:
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
             raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
-        if self.architecture_id == BASELINE_ARCHITECTURE_ID:
-            required_d_ff = 192
-            required_attention = (6, 16)
-        elif self.architecture_id == EFFICIENT_ARCHITECTURE_ID:
-            required_d_ff = 96
-            required_attention = (6, 16)
-        elif self.architecture_id == EFFICIENT_Q4_ARCHITECTURE_ID:
-            required_d_ff = 96
-            required_attention = (4, 24)
-        else:
-            raise ValueError("architecture_id must identify a known architecture")
-        if (self.layers, self.d_model, self.kv_heads) != (4, 96, 1):
-            raise ValueError("model dimensions must use L4 d96 kv1")
-        if (self.q_heads, self.head_dim) != required_attention:
+        definition = _definition_for_architecture_id(self.architecture_id)
+        actual_layout = (
+            self.layers,
+            self.d_model,
+            self.q_heads,
+            self.kv_heads,
+            self.head_dim,
+            self.d_ff,
+        )
+        required_layout = (
+            definition.layers,
+            definition.d_model,
+            definition.q_heads,
+            definition.kv_heads,
+            definition.head_dim,
+            definition.d_ff,
+        )
+        if actual_layout != required_layout:
             raise ValueError(
-                f"q_heads and head_dim must be {required_attention} for "
-                f"architecture {self.architecture_id!r}"
-            )
-        if self.d_ff != required_d_ff:
-            raise ValueError(
-                f"d_ff must be {required_d_ff} for architecture {self.architecture_id!r}"
+                f"model dimensions must be {required_layout} for architecture "
+                f"{self.architecture_id!r}"
             )
 
     @property
@@ -120,33 +254,27 @@ class ModelSpec:
 
     @property
     def architecture(self) -> Architecture:
-        if self.architecture_id == BASELINE_ARCHITECTURE_ID:
-            return "baseline"
-        if self.architecture_id == EFFICIENT_ARCHITECTURE_ID:
-            return "efficient"
-        return "efficient_q4"
+        return _definition_for_architecture_id(self.architecture_id).architecture
 
     @property
     def alibi_slopes(self) -> tuple[tuple[int, int], ...]:
-        if self.architecture == "efficient_q4":
-            return ((1, 4), (1, 16), (1, 64), (1, 256))
-        return ((1, 4), (1, 16), (1, 64), (1, 256), (1, 2), (1, 8))
+        return _definition_for_architecture_id(self.architecture_id).alibi_slopes
 
     @property
     def tied_lm_head(self) -> bool:
-        return self.architecture == "baseline"
+        return _definition_for_architecture_id(self.architecture_id).tied_lm_head
 
     @property
     def value_embedding_layers(self) -> tuple[int, ...]:
-        if self.architecture == "baseline":
-            return ()
-        return (1, 3)
+        return _definition_for_architecture_id(
+            self.architecture_id
+        ).value_embedding_layers
 
     @property
     def runtime_attention_logit_denominator(self) -> int:
-        if self.architecture == "efficient_q4":
-            return 24
-        return 16
+        return _definition_for_architecture_id(
+            self.architecture_id
+        ).runtime_attention_logit_denominator
 
     @property
     def data_pack_runtime_compatible(self) -> bool:
@@ -164,39 +292,45 @@ class ModelSpec:
         }
 
 
-BASELINE_SPEC: Final = ModelSpec(
-    architecture_id=BASELINE_ARCHITECTURE_ID,
-    d_ff=192,
+def _model_spec(definition: _ArchitectureDefinition) -> ModelSpec:
+    return ModelSpec(
+        architecture_id=definition.architecture_id,
+        d_ff=definition.d_ff,
+        layers=definition.layers,
+        d_model=definition.d_model,
+        q_heads=definition.q_heads,
+        kv_heads=definition.kv_heads,
+        head_dim=definition.head_dim,
+    )
+
+
+KNOWN_MODEL_SPECS: Final = tuple(
+    _model_spec(definition) for definition in _ARCHITECTURE_DEFINITIONS
 )
-EFFICIENT_SPEC: Final = ModelSpec(
-    architecture_id=EFFICIENT_ARCHITECTURE_ID,
-    d_ff=96,
-)
-EFFICIENT_Q4_SPEC: Final = ModelSpec(
-    architecture_id=EFFICIENT_Q4_ARCHITECTURE_ID,
-    d_ff=96,
-    q_heads=4,
-    head_dim=24,
+(
+    BASELINE_SPEC,
+    EFFICIENT_SPEC,
+    EFFICIENT_Q4_SPEC,
+    EFFICIENT_Q4_FF192_SPEC,
+    EFFICIENT_Q4_WIDE_SPEC,
+    EFFICIENT_Q4_DEEP_SPEC,
+) = KNOWN_MODEL_SPECS
+KNOWN_MODEL_WIDTHS: Final = tuple(
+    dict.fromkeys(spec.d_model for spec in KNOWN_MODEL_SPECS)
 )
 
 
 def spec_for_architecture(architecture: str) -> ModelSpec:
-    if architecture == "baseline":
-        return BASELINE_SPEC
-    if architecture == "efficient":
-        return EFFICIENT_SPEC
-    if architecture == "efficient_q4":
-        return EFFICIENT_Q4_SPEC
+    for spec in KNOWN_MODEL_SPECS:
+        if architecture == spec.architecture:
+            return spec
     raise ValueError(f"architecture must be one of {ARCHITECTURE_CHOICES}")
 
 
 def spec_for_architecture_id(architecture_id: object) -> ModelSpec:
-    if architecture_id == BASELINE_ARCHITECTURE_ID:
-        return BASELINE_SPEC
-    if architecture_id == EFFICIENT_ARCHITECTURE_ID:
-        return EFFICIENT_SPEC
-    if architecture_id == EFFICIENT_Q4_ARCHITECTURE_ID:
-        return EFFICIENT_Q4_SPEC
+    for spec in KNOWN_MODEL_SPECS:
+        if architecture_id == spec.architecture_id:
+            return spec
     raise ValueError("architecture_id must identify a known architecture")
 
 
@@ -211,9 +345,10 @@ def _data_contract(spec: ModelSpec) -> tuple[str, int, int, int, int, int]:
     )
 
 
-if _data_contract(BASELINE_SPEC) != _data_contract(EFFICIENT_SPEC) or _data_contract(
-    BASELINE_SPEC
-) != _data_contract(EFFICIENT_Q4_SPEC):
+if any(
+    _data_contract(spec) != _data_contract(BASELINE_SPEC)
+    for spec in KNOWN_MODEL_SPECS[1:]
+):
     raise AssertionError("known architectures must share the fixed tokenizer/data ABI")
 if _data_contract(BASELINE_SPEC) != (
     DATA_SPEC.tokenizer_kind,

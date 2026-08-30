@@ -33,6 +33,7 @@ from .tokenizer import GreedyStringPieceTokenizer
 
 _PARAMETER_MIN: Final = -127.0
 _PARAMETER_MAX: Final = 127.0
+TRAINING_EPOCH_CHOICES: Final = (1, 2)
 LearningRateDecay = Literal["cosine", "linear"]
 
 
@@ -40,6 +41,7 @@ LearningRateDecay = Literal["cosine", "linear"]
 class TrainConfig:
     architecture: Architecture
     batch_size: int
+    epochs: int
     learning_rate: float
     seed: int
     device: str
@@ -71,6 +73,10 @@ class TrainConfig:
             or self.batch_size <= 0
         ):
             raise ValueError("batch_size must be positive")
+        if not isinstance(self.epochs, int) or isinstance(self.epochs, bool):
+            raise TypeError("epochs must be an integer")
+        if self.epochs not in TRAINING_EPOCH_CHOICES:
+            raise ValueError(f"epochs must be one of {TRAINING_EPOCH_CHOICES}")
         if (
             not isinstance(self.learning_rate, (int, float))
             or isinstance(self.learning_rate, bool)
@@ -220,7 +226,7 @@ class _EvaluationTotals:
         )
 
 
-_RUN_MANIFEST_SCHEMA_VERSION: Final = 2
+_RUN_MANIFEST_SCHEMA_VERSION: Final = 3
 _TRAIN_CONFIG_KEYS: Final = frozenset(field.name for field in fields(TrainConfig))
 _RUN_MANIFEST_KEYS: Final = frozenset(
     {
@@ -392,6 +398,10 @@ def _epoch_window_batches(
         yield order[start : start + batch_size]
 
 
+def _training_step_count(*, window_count: int, batch_size: int, epochs: int) -> int:
+    return epochs * ((window_count + batch_size - 1) // batch_size)
+
+
 def _ordered_window_batches(
     *, window_count: int, batch_size: int
 ) -> Iterator[np.ndarray]:
@@ -512,7 +522,7 @@ def _run_manifest(
             "torch": torch.__version__,
         },
         "training": {
-            "epochs": 1,
+            "epochs": config.epochs,
             "optimizer_steps": optimizer_steps,
             "processed_target_count": processed_target_count,
             "processed_window_count": processed_window_count,
@@ -645,8 +655,9 @@ def _load_training_run_checkpoint(
     training = _exact_mapping(
         manifest["training"], field="training", keys=_TRAINING_MANIFEST_KEYS
     )
-    if _positive_manifest_integer(training["epochs"], field="epochs") != 1:
-        raise ValueError("training run epochs must be 1")
+    epochs = _positive_manifest_integer(training["epochs"], field="epochs")
+    if epochs != config.epochs:
+        raise ValueError("training run epochs does not match its config")
     optimizer_steps = _positive_manifest_integer(
         training["optimizer_steps"], field="optimizer_steps"
     )
@@ -656,14 +667,23 @@ def _load_training_run_checkpoint(
     processed_window_count = _positive_manifest_integer(
         training["processed_window_count"], field="processed_window_count"
     )
-    if processed_window_count != window_count:
-        raise ValueError("training run processed_window_count must equal window_count")
-    _positive_manifest_integer(
+    expected_processed_window_count = window_count * epochs
+    if processed_window_count != expected_processed_window_count:
+        raise ValueError(
+            "training run processed_window_count does not match window_count and epochs"
+        )
+    processed_target_count = _positive_manifest_integer(
         training["processed_target_count"], field="processed_target_count"
     )
-    expected_optimizer_steps = (
-        window_count + config.batch_size - 1
-    ) // config.batch_size
+    if processed_target_count % epochs != 0:
+        raise ValueError(
+            "training run processed_target_count must be divisible by epochs"
+        )
+    expected_optimizer_steps = _training_step_count(
+        window_count=window_count,
+        batch_size=config.batch_size,
+        epochs=epochs,
+    )
     if optimizer_steps != expected_optimizer_steps:
         raise ValueError(
             "training run optimizer_steps does not match window_count and batch_size"
@@ -728,7 +748,11 @@ def train(
         expected_split="validation",
     )
     window_count = len(train_stream.windows)
-    total_steps = (window_count + config.batch_size - 1) // config.batch_size
+    total_steps = _training_step_count(
+        window_count=window_count,
+        batch_size=config.batch_size,
+        epochs=config.epochs,
+    )
     _learning_rate(
         config.learning_rate,
         step=1,
@@ -759,72 +783,78 @@ def train(
     processed_window_count = 0
     processed_target_count = 0
     model.train()
-    epoch_batches = _epoch_window_batches(
-        window_count=window_count,
-        batch_size=config.batch_size,
-        generator=generator,
-    )
-    for step, window_indices in enumerate(epoch_batches, start=1):
-        learning_rate = _learning_rate(
-            config.learning_rate,
-            step=step,
-            total_steps=total_steps,
-            warmup_ratio=config.warmup_ratio,
-            warmup_steps=config.warmup_steps,
-            warmdown_ratio=config.warmdown_ratio,
-            final_fraction=config.final_learning_rate_fraction,
-            decay=config.learning_rate_decay,
+    for _ in range(config.epochs):
+        epoch_batches = _epoch_window_batches(
+            window_count=window_count,
+            batch_size=config.batch_size,
+            generator=generator,
         )
-        for parameter_group in optimizer.param_groups:
-            parameter_group["lr"] = learning_rate
-        inputs, targets, loss_mask = _torch_batch_from_window_indices(
-            train_stream,
-            window_indices=window_indices,
-            device=device,
-        )
-        optimizer.zero_grad(set_to_none=True)
-        raw_logits = model(inputs, mode=config.mode)
-        logits = _apply_logit_softcap(raw_logits, config.logit_softcap)
-        loss_sum, target_count = _masked_cross_entropy(logits, targets, loss_mask)
-        loss = loss_sum / target_count
-        if not torch.isfinite(loss):
-            raise RuntimeError(f"non-finite training loss at step {step}")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        with torch.no_grad():
-            for parameter in model.parameters():
-                parameter.clamp_(_PARAMETER_MIN, _PARAMETER_MAX)
-        processed_window_count += len(window_indices)
-        processed_target_count += target_count
-        completed_steps = step
-        if step == 1 or step % 1_000 == 0 or step == total_steps:
-            print(
-                json.dumps(
-                    {
-                        "learning_rate": learning_rate,
-                        "step": step,
-                        "train_loss": float(loss.detach().item()),
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
+        for window_indices in epoch_batches:
+            step = completed_steps + 1
+            learning_rate = _learning_rate(
+                config.learning_rate,
+                step=step,
+                total_steps=total_steps,
+                warmup_ratio=config.warmup_ratio,
+                warmup_steps=config.warmup_steps,
+                warmdown_ratio=config.warmdown_ratio,
+                final_fraction=config.final_learning_rate_fraction,
+                decay=config.learning_rate_decay,
             )
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = learning_rate
+            inputs, targets, loss_mask = _torch_batch_from_window_indices(
+                train_stream,
+                window_indices=window_indices,
+                device=device,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            raw_logits = model(inputs, mode=config.mode)
+            logits = _apply_logit_softcap(raw_logits, config.logit_softcap)
+            loss_sum, target_count = _masked_cross_entropy(logits, targets, loss_mask)
+            loss = loss_sum / target_count
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"non-finite training loss at step {step}")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            with torch.no_grad():
+                for parameter in model.parameters():
+                    parameter.clamp_(_PARAMETER_MIN, _PARAMETER_MAX)
+            processed_window_count += len(window_indices)
+            processed_target_count += target_count
+            completed_steps = step
+            if step == 1 or step % 1_000 == 0 or step == total_steps:
+                print(
+                    json.dumps(
+                        {
+                            "learning_rate": learning_rate,
+                            "step": step,
+                            "train_loss": float(loss.detach().item()),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
 
     if completed_steps != total_steps:
         raise AssertionError(
-            "one epoch must execute the derived number of optimizer steps: "
+            "training must execute the derived number of optimizer steps: "
             f"expected {total_steps}, got {completed_steps}"
         )
-    if processed_window_count != window_count:
+    expected_processed_window_count = config.epochs * window_count
+    if processed_window_count != expected_processed_window_count:
         raise AssertionError(
-            "one epoch must process every training window exactly once: "
-            f"expected {window_count}, got {processed_window_count}"
+            "training must process every window once per epoch: "
+            f"expected {expected_processed_window_count}, "
+            f"got {processed_window_count}"
         )
-    expected_target_count = int(train_stream.metadata["prediction_count"])
+    expected_target_count = config.epochs * int(
+        train_stream.metadata["prediction_count"]
+    )
     if processed_target_count != expected_target_count:
         raise AssertionError(
-            "one epoch must process every supervised target exactly once: "
+            "training must process every supervised target once per epoch: "
             f"expected {expected_target_count}, got {processed_target_count}"
         )
 

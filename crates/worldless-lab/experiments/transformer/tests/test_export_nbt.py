@@ -18,7 +18,10 @@ from worldless_transformer.export_nbt import (
 )
 from worldless_transformer.spec import (
     BASELINE_SPEC,
+    EFFICIENT_Q4_DEEP_SPEC,
+    EFFICIENT_Q4_FF192_SPEC,
     EFFICIENT_Q4_SPEC,
+    EFFICIENT_Q4_WIDE_SPEC,
     EFFICIENT_SPEC,
     ModelSpec,
     expected_weight_shapes,
@@ -147,7 +150,17 @@ def test_export_matches_worldless_command_storage_envelope_and_abi() -> None:
     assert bundle["shifts"]["blocks.0.attention.q_proj.weight"] == (1,)
 
 
-@pytest.mark.parametrize("spec", [BASELINE_SPEC, EFFICIENT_SPEC, EFFICIENT_Q4_SPEC])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        BASELINE_SPEC,
+        EFFICIENT_SPEC,
+        EFFICIENT_Q4_SPEC,
+        EFFICIENT_Q4_FF192_SPEC,
+        EFFICIENT_Q4_WIDE_SPEC,
+        EFFICIENT_Q4_DEEP_SPEC,
+    ],
+)
 def test_export_uses_selected_architecture_contract(spec: ModelSpec) -> None:
     shapes = expected_weight_shapes(spec)
     weights = {name: bytes(math.prod(shape)) for name, shape in shapes.items()}

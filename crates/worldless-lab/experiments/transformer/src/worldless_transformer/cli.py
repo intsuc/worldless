@@ -18,6 +18,7 @@ from .spec import (
 )
 from .tokenizer import GreedyStringPieceTokenizer, train_tokenizer
 from .training import (
+    TRAINING_EPOCH_CHOICES,
     TrainConfig,
     evaluate_all_training_run_checkpoint,
     evaluate_checkpoint,
@@ -69,6 +70,9 @@ def _parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--validation-tokens", type=Path, required=True)
     train_parser.add_argument("--output", type=Path, required=True)
     train_parser.add_argument("--batch-size", type=_positive_integer, required=True)
+    train_parser.add_argument(
+        "--epochs", type=int, choices=TRAINING_EPOCH_CHOICES, required=True
+    )
     train_parser.add_argument("--learning-rate", type=float, required=True)
     train_parser.add_argument("--seed", type=int, required=True)
     train_parser.add_argument("--device", required=True)
@@ -199,6 +203,7 @@ def main() -> None:
             config=TrainConfig(
                 architecture=arguments.architecture,
                 batch_size=arguments.batch_size,
+                epochs=arguments.epochs,
                 learning_rate=arguments.learning_rate,
                 seed=arguments.seed,
                 device=arguments.device,

@@ -7,13 +7,39 @@ from worldless_transformer.model import Transformer
 from worldless_transformer.quantization import round_shift_int
 from worldless_transformer.reference import ExactRuntimeReference
 from worldless_transformer.spec import (
+    ARCHITECTURE_CHOICES,
     ATTENTION_LOGIT_DENOMINATOR_CANDIDATES,
     BASELINE_SPEC,
+    EFFICIENT_Q4_DEEP_SPEC,
+    EFFICIENT_Q4_FF192_SPEC,
     EFFICIENT_Q4_SPEC,
+    EFFICIENT_Q4_WIDE_SPEC,
     EFFICIENT_SPEC,
+    INT8_MAX,
+    INT32_MAX,
+    KNOWN_MODEL_SPECS,
     RMS_GAIN_TABLE,
+    SOFTMAX_FRACTION_BITS,
     expected_weight_shapes,
+    spec_for_architecture,
 )
+
+
+def test_known_architecture_names_and_ids_are_exact() -> None:
+    expected_ids = {
+        "baseline": "worldless_transformer/relu2_alibi_gsp512_l4_d96_q6_kv1_h16_ff192_c256_w64_v1",
+        "efficient": "worldless_transformer/relu2_alibi_gsp512_l4_d96_q6_kv1_h16_ff96_untied_ve13_c256_w64_v1",
+        "efficient_q4": "worldless_transformer/relu2_alibi_gsp512_l4_d96_q4_kv1_h24_ff96_untied_ve13_ad24_c256_w64_v1",
+        "efficient_q4_ff192": "worldless_transformer/relu2_alibi_gsp512_l4_d96_q4_kv1_h24_ff192_untied_ve13_ad24_c256_w64_v1",
+        "efficient_q4_wide": "worldless_transformer/relu2_alibi_gsp512_l4_d128_q4_kv1_h32_ff128_untied_ve13_ad32_c256_w64_v1",
+        "efficient_q4_deep": "worldless_transformer/relu2_alibi_gsp512_l8_d96_q4_kv1_h24_ff96_untied_ve1357_ad24_c256_w64_v1",
+    }
+
+    assert ARCHITECTURE_CHOICES == tuple(expected_ids)
+    assert {
+        architecture: spec_for_architecture(architecture).architecture_id
+        for architecture in ARCHITECTURE_CHOICES
+    } == expected_ids
 
 
 @pytest.mark.parametrize(
@@ -22,6 +48,9 @@ from worldless_transformer.spec import (
         (BASELINE_SPEC, 282_624),
         (EFFICIENT_SPEC, 274_432),
         (EFFICIENT_Q4_SPEC, 288_768),
+        (EFFICIENT_Q4_FF192_SPEC, 362_496),
+        (EFFICIENT_Q4_WIDE_SPEC, 458_752),
+        (EFFICIENT_Q4_DEEP_SPEC, 479_232),
     ],
 )
 def test_known_model_layouts_and_parameter_counts(spec, parameter_count: int) -> None:
@@ -38,6 +67,29 @@ def test_known_model_layouts_and_parameter_counts(spec, parameter_count: int) ->
         assert model.runtime_state().shifts["lm_head.weight"] == 0
     assert len(spec.alibi_slopes) == spec.q_heads
     assert RMS_GAIN_TABLE[64 * 64] == 1 << 15
+
+
+def test_known_architecture_accumulators_remain_exact_and_inside_int32() -> None:
+    for spec in KNOWN_MODEL_SPECS:
+        int8_dot_widths = (
+            spec.d_model,
+            spec.q_heads * spec.head_dim,
+            spec.head_dim,
+        )
+        for width in int8_dot_widths:
+            dense_or_qk_bound = INT8_MAX**2 * width
+            assert dense_or_qk_bound <= INT32_MAX
+            assert dense_or_qk_bound < 2**53
+
+        relu_squared_down_bound = INT8_MAX**3 * spec.d_ff
+        assert relu_squared_down_bound <= INT32_MAX
+        assert relu_squared_down_bound < 2**53
+
+        attention_numerator_bound = (
+            ((1 << SOFTMAX_FRACTION_BITS) - 1) * INT8_MAX * spec.attention_window
+        )
+        assert attention_numerator_bound <= INT32_MAX
+        assert attention_numerator_bound < 2**53
 
 
 def test_runtime_state_rejects_non_finite_master_weights() -> None:
@@ -62,12 +114,18 @@ def test_alibi_slopes_follow_each_known_query_head_layout() -> None:
             (1, 8),
         )
     )
-    assert EFFICIENT_Q4_SPEC.alibi_slopes == (
-        (1, 4),
-        (1, 16),
-        (1, 64),
-        (1, 256),
-    )
+    for spec in (
+        EFFICIENT_Q4_SPEC,
+        EFFICIENT_Q4_FF192_SPEC,
+        EFFICIENT_Q4_WIDE_SPEC,
+        EFFICIENT_Q4_DEEP_SPEC,
+    ):
+        assert spec.alibi_slopes == (
+            (1, 4),
+            (1, 16),
+            (1, 64),
+            (1, 256),
+        )
 
 
 def test_power_of_two_requantization_rounds_half_away_from_zero() -> None:
@@ -88,7 +146,17 @@ def test_power_of_two_requantization_rounds_half_away_from_zero() -> None:
     ]
 
 
-@pytest.mark.parametrize("spec", [BASELINE_SPEC, EFFICIENT_SPEC, EFFICIENT_Q4_SPEC])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        BASELINE_SPEC,
+        EFFICIENT_SPEC,
+        EFFICIENT_Q4_SPEC,
+        EFFICIENT_Q4_FF192_SPEC,
+        EFFICIENT_Q4_WIDE_SPEC,
+        EFFICIENT_Q4_DEEP_SPEC,
+    ],
+)
 def test_fake_runtime_matches_independent_exact_reference(spec) -> None:
     torch.manual_seed(11)
     model = Transformer(spec).eval()
@@ -140,7 +208,14 @@ def test_attention_scale_candidates_match_the_exact_integer_reference(
 
 
 def test_only_the_runtime_attention_denominator_is_export_compatible() -> None:
-    for spec in (BASELINE_SPEC, EFFICIENT_SPEC, EFFICIENT_Q4_SPEC):
+    for spec in (
+        BASELINE_SPEC,
+        EFFICIENT_SPEC,
+        EFFICIENT_Q4_SPEC,
+        EFFICIENT_Q4_FF192_SPEC,
+        EFFICIENT_Q4_WIDE_SPEC,
+        EFFICIENT_Q4_DEEP_SPEC,
+    ):
         Transformer(spec).require_runtime_compatible()
 
     with pytest.raises(ValueError, match="architecture runtime denominator 16"):
@@ -150,6 +225,10 @@ def test_only_the_runtime_attention_denominator_is_export_compatible() -> None:
     with pytest.raises(ValueError, match="architecture runtime denominator 24"):
         Transformer(
             EFFICIENT_Q4_SPEC, attention_logit_denominator=16
+        ).require_runtime_compatible()
+    with pytest.raises(ValueError, match="architecture runtime denominator 32"):
+        Transformer(
+            EFFICIENT_Q4_WIDE_SPEC, attention_logit_denominator=24
         ).require_runtime_compatible()
 
 
@@ -202,7 +281,17 @@ def test_fake_runtime_cuda_matches_cpu_integer_reference() -> None:
     assert torch.equal(cuda_logits.to(torch.int32), reference.logits(token_ids))
 
 
-@pytest.mark.parametrize("spec", [BASELINE_SPEC, EFFICIENT_SPEC, EFFICIENT_Q4_SPEC])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        BASELINE_SPEC,
+        EFFICIENT_SPEC,
+        EFFICIENT_Q4_SPEC,
+        EFFICIENT_Q4_FF192_SPEC,
+        EFFICIENT_Q4_WIDE_SPEC,
+        EFFICIENT_Q4_DEEP_SPEC,
+    ],
+)
 def test_fake_runtime_keeps_gradients_for_every_weight(spec) -> None:
     torch.manual_seed(13)
     model = Transformer(spec)

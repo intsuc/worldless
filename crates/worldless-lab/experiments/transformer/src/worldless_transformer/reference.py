@@ -16,10 +16,8 @@ from .quantization import (
 )
 from .spec import (
     ATTENTION_SCORE_SHIFT,
-    BASELINE_SPEC,
-    EFFICIENT_Q4_SPEC,
-    EFFICIENT_SPEC,
     INT32_MIN,
+    KNOWN_MODEL_SPECS,
     RMS_GAIN_FRACTION_BITS,
     RMS_GAIN_TABLE,
     SOFTMAX_MIN_DIFFERENCE,
@@ -70,7 +68,7 @@ class ExactRuntimeReference:
         *,
         attention_logit_denominator: int | None = None,
     ) -> None:
-        if spec not in (BASELINE_SPEC, EFFICIENT_SPEC, EFFICIENT_Q4_SPEC):
+        if spec not in KNOWN_MODEL_SPECS:
             raise ValueError("spec must match a known architecture")
         expected = expected_weight_shapes(spec)
         if set(state.weights) != set(expected):

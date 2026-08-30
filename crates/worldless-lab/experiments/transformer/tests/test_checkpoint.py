@@ -5,12 +5,27 @@ import torch
 
 from worldless_transformer.checkpoint import load_checkpoint, save_checkpoint
 from worldless_transformer.model import Transformer
-from worldless_transformer.spec import BASELINE_SPEC, EFFICIENT_Q4_SPEC, EFFICIENT_SPEC
+from worldless_transformer.spec import (
+    BASELINE_SPEC,
+    EFFICIENT_Q4_DEEP_SPEC,
+    EFFICIENT_Q4_FF192_SPEC,
+    EFFICIENT_Q4_SPEC,
+    EFFICIENT_Q4_WIDE_SPEC,
+    EFFICIENT_SPEC,
+)
 
 
 @pytest.mark.parametrize(
     ("spec", "attention_logit_denominator"),
-    [(BASELINE_SPEC, 11), (EFFICIENT_SPEC, 24), (EFFICIENT_Q4_SPEC, 24)],
+    [
+        (BASELINE_SPEC, 11),
+        (EFFICIENT_SPEC, 24),
+        (EFFICIENT_Q4_SPEC, 24),
+        (EFFICIENT_Q4_FF192_SPEC, 24),
+        (EFFICIENT_Q4_WIDE_SPEC, 24),
+        (EFFICIENT_Q4_WIDE_SPEC, 32),
+        (EFFICIENT_Q4_DEEP_SPEC, 24),
+    ],
 )
 def test_checkpoint_round_trip_selects_the_exact_known_architecture(
     tmp_path, tokenizer, spec, attention_logit_denominator: int

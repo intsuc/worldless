@@ -13,7 +13,10 @@ from worldless_transformer.artifact import (
 from worldless_transformer.model import Transformer
 from worldless_transformer.spec import (
     BASELINE_SPEC,
+    EFFICIENT_Q4_DEEP_SPEC,
+    EFFICIENT_Q4_FF192_SPEC,
     EFFICIENT_Q4_SPEC,
+    EFFICIENT_Q4_WIDE_SPEC,
     EFFICIENT_SPEC,
     ModelSpec,
     expected_weight_shapes,
@@ -199,7 +202,17 @@ def test_create_rejects_invalid_tokenizer_ids() -> None:
         )
 
 
-@pytest.mark.parametrize("spec", [BASELINE_SPEC, EFFICIENT_SPEC, EFFICIENT_Q4_SPEC])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        BASELINE_SPEC,
+        EFFICIENT_SPEC,
+        EFFICIENT_Q4_SPEC,
+        EFFICIENT_Q4_FF192_SPEC,
+        EFFICIENT_Q4_WIDE_SPEC,
+        EFFICIENT_Q4_DEEP_SPEC,
+    ],
+)
 def test_create_supports_each_exact_runtime_architecture(spec: ModelSpec) -> None:
     state = Transformer(spec).runtime_state()
 
@@ -215,7 +228,16 @@ def test_create_supports_each_exact_runtime_architecture(spec: ModelSpec) -> Non
     assert all(artifact.shifts[name] == (0,) for name in zero_shift_weight_names(spec))
 
 
-@pytest.mark.parametrize("spec", [EFFICIENT_SPEC, EFFICIENT_Q4_SPEC])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        EFFICIENT_SPEC,
+        EFFICIENT_Q4_SPEC,
+        EFFICIENT_Q4_FF192_SPEC,
+        EFFICIENT_Q4_WIDE_SPEC,
+        EFFICIENT_Q4_DEEP_SPEC,
+    ],
+)
 def test_create_rejects_nonzero_value_embedding_and_lm_head_shifts(
     spec: ModelSpec,
 ) -> None:
