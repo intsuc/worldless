@@ -8,6 +8,7 @@ mod int_map;
 mod int_sort;
 mod loop_lowering;
 mod numeric_lowering;
+mod register_pressure;
 mod transformer;
 
 use crate::SuiteSpec;
@@ -23,5 +24,6 @@ pub(crate) const REGISTRY: &[SuiteSpec] = &[
     int_sort::SPEC,
     loop_lowering::SPEC,
     numeric_lowering::SPEC,
+    register_pressure::SPEC,
     transformer::SPEC,
 ];
