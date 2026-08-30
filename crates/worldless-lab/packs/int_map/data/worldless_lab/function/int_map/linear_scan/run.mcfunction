@@ -1,0 +1,4 @@
+function int_map:prepare
+execute unless score #valid int_map matches 1 run return fail
+function int_map:linear_scan/run
+return run function int_map:finish
