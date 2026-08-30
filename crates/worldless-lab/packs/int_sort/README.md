@@ -2,8 +2,8 @@
 
 This data pack compares two signed 32-bit integer sorting algorithms using
 only data-pack functions, scoreboards, command storage, and function macros.
-It operates entirely on VM-owned logical data and does not observe or modify a
-physical Minecraft world.
+All state lives in command storage and scoreboards; the pack does not observe
+or modify blocks, entities, or other physical world state.
 
 ## Lab contract
 
@@ -57,13 +57,24 @@ input length, so odd-sized tails require no padding or sentinel value.
 
 Each merge reads the current left and right values through dynamic-index
 macros and appends the smaller value. Equal values are taken from the left run.
-Unlike insertion sort, every input order requires all merge passes, but its
-growth is bounded by `O(n log n)`.
+Unlike insertion sort, every input order requires all merge passes. Its
+comparison and data-pack command growth is bounded by `O(n log n)`.
 
-| Variant | Best time | Average time | Worst time | Working NBT |
+| Variant | Best command growth | Average command growth | Worst command growth | Working NBT |
 | --- | --- | --- | --- | --- |
 | Insertion | `O(n)` | `O(n²)` | `O(n²)` | One saved key |
 | Bottom-up merge | `O(n log n)` | `O(n log n)` | `O(n log n)` | A second array of up to `n` values |
+
+Those bounds count the algorithm's comparisons and data-pack operations, not
+the native work hidden inside one NBT command. Worldless stores primitive
+arrays in mutable Rust vectors: appending is amortized `O(1)`, while an indexed
+remove or insert shifts the affected suffix. In Minecraft
+`26.3-snapshot-10`, the three primitive array tags instead hold fixed Java
+arrays; every append, insert, or remove allocates a replacement and copies the
+preserved elements. For this implementation, insertion keeps its stated
+best/average/worst bounds, but merge's repeated array construction adds
+`Theta(n²)` copying per pass and `Theta(n² log n)` across all passes. This is a
+runtime-representation cost, not an observable data-pack compatibility rule.
 
 Values are compared directly as scoreboard scores. Neither algorithm subtracts
 one input value from another, so `-2147483648` and `2147483647` do not create a
@@ -88,7 +99,9 @@ Run the complete correctness check from the repository root:
 cargo run -p worldless-lab -- check --suite int_sort --format text
 ```
 
-## Benchmark
+## Benchmarks
+
+### Worldless VM
 
 Reproduce the comparison with a release build:
 
@@ -135,3 +148,63 @@ define a universal threshold.
 The largest measured command use was 75,847 for reverse insertion at length
 128. Larger or more adversarial inputs must be measured against the caller's
 command limit rather than inferred from the 128-element results.
+
+### Minecraft Java Edition
+
+The same eleven inputs and both public entry points were also checked and
+measured on the actual Minecraft Java dedicated server. This snapshot was
+taken on 2026-08-30 on the same AMD Ryzen 9 9950X3D host, using Minecraft
+`26.3-snapshot-10`, Microsoft OpenJDK 25.0.1+8-LTS, `-Xms2G -Xmx2G`,
+`--nogui`, and no players. The server JAR SHA-256 was
+`cdbbda7cc47e026e57be8e10d9ef097ad16f1086b63b88a469a4c0e6e4f77dbe`.
+The command-sequence game rule was 1,000,000.
+
+Minecraft's stopwatch has 1 ms resolution, so a sample was an unrolled batch
+of `R` consecutive calls to one public entry point. Calibration selected a
+power-of-two `R` toward 100 ms while keeping `R` times the Worldless quota
+below 800,000. For every row, each of two fresh server JVMs discarded 20
+warm-up batches and measured 15; the second JVM traversed all rows in reverse
+order. The table pools the resulting 30 unfiltered batch averages. Median and
+nearest-rank p95 are shown in microseconds per call, obtained by dividing each
+batch duration by `R`; fractional values do not imply sub-millisecond stopwatch
+resolution. These are sustained warm-call measurements, not individual-call
+latency samples.
+
+Input installation, the single-call correctness preflight, and output
+verification were outside each timed batch; calibration batches were excluded
+from the reported samples. The timed region contained the complete public
+calls, including validation, state preparation, sorting, and output writes.
+Every preflight and every batch produced the exact expected output. Across the
+complete JVM lifetimes of the combined sort-and-map run, the GC logs recorded
+612 and 605 young collections and no full collection; the maximum pauses were
+47.780 and 48.367 ms. Samples were not filtered, so any pause inside a timed
+batch remains in the result.
+
+| Case | Length | Insertion `R` | Insertion median (µs) | Insertion p95 (µs) | Merge `R` | Merge median (µs) | Merge p95 (µs) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `empty` | 0 | 16,384 | 4.425 | 4.578 | 16,384 | 4.547 | 4.700 |
+| `singleton` | 1 | 16,384 | 3.784 | 3.967 | 16,384 | 3.845 | 4.089 |
+| `mixed_extremes_7` | 7 | 1,024 | 33.203 | 34.180 | 512 | 95.703 | 97.656 |
+| `sorted_8` | 8 | 2,048 | 24.902 | 25.391 | 1,024 | 95.703 | 98.633 |
+| `reverse_8` | 8 | 1,024 | 53.711 | 55.664 | 1,024 | 95.703 | 97.656 |
+| `sorted_32` | 32 | 256 | 226.562 | 230.469 | 64 | 812.500 | 843.750 |
+| `reverse_32` | 32 | 64 | 1,437.500 | 1,468.750 | 128 | 816.406 | 828.125 |
+| `permuted_32` | 32 | 128 | 734.375 | 742.188 | 64 | 1,000.000 | 1,015.625 |
+| `sorted_128` | 128 | 64 | 890.625 | 921.875 | 16 | 4,437.500 | 4,500.000 |
+| `reverse_128` | 128 | 4 | 20,750.000 | 21,500.000 | 16 | 4,437.500 | 4,500.000 |
+| `permuted_128` | 128 | 8 | 10,750.000 | 10,875.000 | 16 | 5,687.500 | 5,812.500 |
+
+The measured crossover remained input-sensitive despite Minecraft's more
+expensive primitive-array appends. At 128 sorted values, merge was 4.98 times
+slower than insertion. On the reverse and permuted 128-value cases, insertion
+was respectively 4.68 and 1.89 times slower than merge. At length 32,
+insertion still won the deterministic permutation while merge won the reverse
+case. These rankings describe the tested warm server and sizes, not a general
+crossover or the asymptotic behavior at larger `n`.
+
+The Worldless and Minecraft absolute times above are not paired runtime
+latencies: Worldless starts every timed sample in a fresh VM with a cold macro
+cache, whereas Minecraft batches repeated calls in a warmed persistent JVM.
+The tables are useful for comparing variants within each runtime and for
+exposing runtime-specific NBT costs, but an absolute Worldless/Minecraft speed
+ratio would require a matched cache-state and lifecycle protocol.
