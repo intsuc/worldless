@@ -1,0 +1,32 @@
+scoreboard players set #base i64_lowering 65536
+scoreboard players set #sign_bias i64_lowering 32768
+scoreboard players operation #x0 i64_lowering = #x_in_low i64_lowering
+scoreboard players operation #x0 i64_lowering %= #base i64_lowering
+scoreboard players operation #x1 i64_lowering = #x_in_low i64_lowering
+scoreboard players operation #x1 i64_lowering /= #base i64_lowering
+scoreboard players operation #x1 i64_lowering %= #base i64_lowering
+scoreboard players operation #x2 i64_lowering = #x_in_high i64_lowering
+scoreboard players operation #x2 i64_lowering %= #base i64_lowering
+scoreboard players operation #x3 i64_lowering = #x_in_high i64_lowering
+scoreboard players operation #x3 i64_lowering /= #base i64_lowering
+scoreboard players operation #x3 i64_lowering += #sign_bias i64_lowering
+scoreboard players operation #y0 i64_lowering = #y_in_low i64_lowering
+scoreboard players operation #y0 i64_lowering %= #base i64_lowering
+scoreboard players operation #y1 i64_lowering = #y_in_low i64_lowering
+scoreboard players operation #y1 i64_lowering /= #base i64_lowering
+scoreboard players operation #y1 i64_lowering %= #base i64_lowering
+scoreboard players operation #y2 i64_lowering = #y_in_high i64_lowering
+scoreboard players operation #y2 i64_lowering %= #base i64_lowering
+scoreboard players operation #y3 i64_lowering = #y_in_high i64_lowering
+scoreboard players operation #y3 i64_lowering /= #base i64_lowering
+scoreboard players operation #y3 i64_lowering += #sign_bias i64_lowering
+scoreboard players operation #step0 i64_lowering = #step_in_low i64_lowering
+scoreboard players operation #step0 i64_lowering %= #base i64_lowering
+scoreboard players operation #step1 i64_lowering = #step_in_low i64_lowering
+scoreboard players operation #step1 i64_lowering /= #base i64_lowering
+scoreboard players operation #step1 i64_lowering %= #base i64_lowering
+scoreboard players operation #step2 i64_lowering = #step_in_high i64_lowering
+scoreboard players operation #step2 i64_lowering %= #base i64_lowering
+scoreboard players operation #step3 i64_lowering = #step_in_high i64_lowering
+scoreboard players operation #step3 i64_lowering /= #base i64_lowering
+scoreboard players operation #step3 i64_lowering %= #base i64_lowering

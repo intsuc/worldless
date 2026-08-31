@@ -1,0 +1,14 @@
+scoreboard players operation #result_x_low i64_lowering = #x1 i64_lowering
+scoreboard players operation #result_x_low i64_lowering *= #base i64_lowering
+scoreboard players operation #result_x_low i64_lowering += #x0 i64_lowering
+scoreboard players operation #result_x_high i64_lowering = #x3 i64_lowering
+scoreboard players operation #result_x_high i64_lowering += #sign_bias i64_lowering
+scoreboard players operation #result_x_high i64_lowering *= #base i64_lowering
+scoreboard players operation #result_x_high i64_lowering += #x2 i64_lowering
+scoreboard players operation #result_y_low i64_lowering = #y1 i64_lowering
+scoreboard players operation #result_y_low i64_lowering *= #base i64_lowering
+scoreboard players operation #result_y_low i64_lowering += #y0 i64_lowering
+scoreboard players operation #result_y_high i64_lowering = #y3 i64_lowering
+scoreboard players operation #result_y_high i64_lowering += #sign_bias i64_lowering
+scoreboard players operation #result_y_high i64_lowering *= #base i64_lowering
+scoreboard players operation #result_y_high i64_lowering += #y2 i64_lowering
