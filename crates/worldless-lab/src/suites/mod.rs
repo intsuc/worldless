@@ -11,6 +11,7 @@ mod numeric_lowering;
 mod predicate_lowering;
 mod register_pressure;
 mod result_abi;
+mod scalar_replacement;
 mod tagged_union_layout;
 mod transformer;
 
@@ -30,6 +31,7 @@ pub(crate) const REGISTRY: &[SuiteSpec] = &[
     predicate_lowering::SPEC,
     register_pressure::SPEC,
     result_abi::SPEC,
+    scalar_replacement::SPEC,
     tagged_union_layout::SPEC,
     transformer::SPEC,
 ];

@@ -1,0 +1,6 @@
+function scalar_replacement:storage_roundtrip/begin/w4
+function scalar_replacement:storage_roundtrip/round/w4
+function scalar_replacement:storage_roundtrip/round/w4
+function scalar_replacement:storage_roundtrip/round/w4
+function scalar_replacement:storage_roundtrip/round/w4
+function scalar_replacement:storage_roundtrip/end/w4

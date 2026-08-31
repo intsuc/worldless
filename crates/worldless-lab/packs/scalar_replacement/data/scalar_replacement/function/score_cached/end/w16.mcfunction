@@ -1,0 +1,16 @@
+execute store result storage scalar_replacement:state work.values[0] int 1 run scoreboard players get #v0 scalar_replace
+execute store result storage scalar_replacement:state work.values[1] int 1 run scoreboard players get #v1 scalar_replace
+execute store result storage scalar_replacement:state work.values[2] int 1 run scoreboard players get #v2 scalar_replace
+execute store result storage scalar_replacement:state work.values[3] int 1 run scoreboard players get #v3 scalar_replace
+execute store result storage scalar_replacement:state work.values[4] int 1 run scoreboard players get #v4 scalar_replace
+execute store result storage scalar_replacement:state work.values[5] int 1 run scoreboard players get #v5 scalar_replace
+execute store result storage scalar_replacement:state work.values[6] int 1 run scoreboard players get #v6 scalar_replace
+execute store result storage scalar_replacement:state work.values[7] int 1 run scoreboard players get #v7 scalar_replace
+execute store result storage scalar_replacement:state work.values[8] int 1 run scoreboard players get #v8 scalar_replace
+execute store result storage scalar_replacement:state work.values[9] int 1 run scoreboard players get #v9 scalar_replace
+execute store result storage scalar_replacement:state work.values[10] int 1 run scoreboard players get #v10 scalar_replace
+execute store result storage scalar_replacement:state work.values[11] int 1 run scoreboard players get #v11 scalar_replace
+execute store result storage scalar_replacement:state work.values[12] int 1 run scoreboard players get #v12 scalar_replace
+execute store result storage scalar_replacement:state work.values[13] int 1 run scoreboard players get #v13 scalar_replace
+execute store result storage scalar_replacement:state work.values[14] int 1 run scoreboard players get #v14 scalar_replace
+execute store result storage scalar_replacement:state work.values[15] int 1 run scoreboard players get #v15 scalar_replace

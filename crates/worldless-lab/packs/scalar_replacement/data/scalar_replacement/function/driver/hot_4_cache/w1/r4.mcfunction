@@ -1,0 +1,6 @@
+function scalar_replacement:hot_4_cache/begin/w1
+function scalar_replacement:hot_4_cache/round/w1
+function scalar_replacement:hot_4_cache/round/w1
+function scalar_replacement:hot_4_cache/round/w1
+function scalar_replacement:hot_4_cache/round/w1
+function scalar_replacement:hot_4_cache/end/w1
