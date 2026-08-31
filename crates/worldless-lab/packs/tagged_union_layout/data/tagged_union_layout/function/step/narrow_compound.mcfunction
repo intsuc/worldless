@@ -1,0 +1,4 @@
+function tagged_union_layout:generate
+function tagged_union_layout:construct/narrow_compound/dispatch
+function tagged_union_layout:match/compound
+scoreboard players add #evaluations tag_union 1
