@@ -1,0 +1,2 @@
+execute if score #t0 pred_lower matches 1 if score #t1 pred_lower matches 1 if score #t2 pred_lower matches 1 if score #t3 pred_lower matches 1 if score #t4 pred_lower matches 1 if score #t5 pred_lower matches 1 if score #t6 pred_lower matches 1 if score #t7 pred_lower matches 1 if score #t8 pred_lower matches 1 if score #t9 pred_lower matches 1 if score #t10 pred_lower matches 1 if score #t11 pred_lower matches 1 if score #t12 pred_lower matches 1 if score #t13 pred_lower matches 1 if score #t14 pred_lower matches 1 if score #t15 pred_lower matches 1 run return 1
+return 0
