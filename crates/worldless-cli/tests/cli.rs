@@ -22,7 +22,7 @@ impl TestPack {
         fs::create_dir(&root).unwrap();
         fs::write(
             root.join("pack.mcmeta"),
-            r#"{"pack":{"description":"test","min_format":[118,0],"max_format":[118,0]}}"#,
+            r#"{"pack":{"description":"test","min_format":[119,0],"max_format":[119,0]}}"#,
         )
         .unwrap();
         Self { root }
@@ -711,7 +711,7 @@ fn run_loads_command_storage_before_executing_the_command() {
         &storage,
         [
             0x0a, 0x00, 0x00, 0x03, 0x00, 0x0b, b'D', b'a', b't', b'a', b'V', b'e', b'r', b's',
-            b'i', b'o', b'n', 0x00, 0x00, 0x13, 0x97, 0x0a, 0x00, 0x04, b'd', b'a', b't', b'a',
+            b'i', b'o', b'n', 0x00, 0x00, 0x13, 0x99, 0x0a, 0x00, 0x04, b'd', b'a', b't', b'a',
             0x0a, 0x00, 0x08, b'c', b'o', b'n', b't', b'e', b'n', b't', b's', 0x0a, 0x00, 0x05,
             b's', b't', b'a', b't', b'e', 0x03, 0x00, 0x05, b'v', b'a', b'l', b'u', b'e', 0x00,
             0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,

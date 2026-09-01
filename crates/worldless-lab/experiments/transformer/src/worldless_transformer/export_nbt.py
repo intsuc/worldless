@@ -13,7 +13,7 @@ from .spec import ModelSpec, expected_weight_shapes, spec_for_architecture_id
 
 # This is the command-storage data version accepted by the target Minecraft
 # version and by worldless::command_storage_file.
-COMMAND_STORAGE_DATA_VERSION = 5015
+COMMAND_STORAGE_DATA_VERSION = 5017
 
 _TAG_END = 0
 _TAG_INT = 3

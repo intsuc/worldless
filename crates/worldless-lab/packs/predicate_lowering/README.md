@@ -92,7 +92,7 @@ construction are outside the timer.
   through 15, and returns that score. Exact 0/1 validation makes multiplication
   equivalent to conjunction, but every term is evaluated eagerly.
 - `predicate_resource` moves the conjunction into a static `minecraft:all_of`
-  predicate resource containing 16 ordered score-backed `value_check` terms.
+  predicate resource containing 16 ordered score-backed `int_value_check` terms.
   Its two-command evaluator returns 1 or 0 from that resource.
 
 All four forms use the same fixed term holders and order, evaluator function

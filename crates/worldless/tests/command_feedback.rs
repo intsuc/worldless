@@ -274,7 +274,7 @@ fn supported_commands_emit_their_console_feedback() {
     let mut vm = load(0, &[]);
 
     let (_, data) = execute(&mut vm, "data merge storage example:state {value:1}");
-    let (_, compute) = execute(&mut vm, "compute default {type:constant,value:7} integer");
+    let (_, compute) = execute(&mut vm, "compute default integer {type:constant,value:7}");
     let (random_outcome, random) = execute(&mut vm, "random value 4..5");
     let random_value = match random_outcome.unwrap() {
         ExecutionOutcome::Result {

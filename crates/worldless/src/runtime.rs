@@ -8,11 +8,11 @@ use crate::{
     macro_function::{Function, FunctionInstantiationError, Instructions, MacroCacheState},
     nbt::{CommandStorage, CompoundTag, JavaString, NbtEditError, NbtSelection, Tag},
     program::{
-        Command, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation, DataSource,
-        FunctionArguments, Instruction, Modifier, ObjectiveId, PredicateCondition, Program,
-        RandomCommand, ResolvedFunctions, ScheduleCommand, ScheduleMode, ScoreCondition,
-        ScoreHolderSet, ScorePredicate, Scoreboard, ScoreboardCommand, StopwatchCommand,
-        StopwatchCondition, StorageCondition, StorageNumberType, StoreKind,
+        Command, ComputeCommand, DataCommand, DataModifyOperation, DataSource, FunctionArguments,
+        Instruction, Modifier, ObjectiveId, PredicateCondition, Program, RandomCommand,
+        ResolvedFunctions, ScheduleCommand, ScheduleMode, ScoreCondition, ScoreHolderSet,
+        ScorePredicate, Scoreboard, ScoreboardCommand, StopwatchCommand, StopwatchCondition,
+        StorageCondition, StorageNumberType, StoreKind,
     },
     random::{LegacyRandom, RandomState},
     resource::{FunctionReference, Identifier},
@@ -115,7 +115,7 @@ pub enum ExecutionError {
     InvalidFunctionReference { input: String },
     CommandCompilationFailed { reason: String },
     PredicateEvaluationFailed { reason: String },
-    NumberProviderEvaluationFailed { reason: String },
+    ContextProviderEvaluationFailed { reason: String },
     CommandLimitExceeded { limit: usize },
 }
 
@@ -131,8 +131,8 @@ impl fmt::Display for ExecutionError {
             Self::PredicateEvaluationFailed { reason } => {
                 write!(formatter, "predicate evaluation failed: {reason}")
             }
-            Self::NumberProviderEvaluationFailed { reason } => {
-                write!(formatter, "number provider evaluation failed: {reason}")
+            Self::ContextProviderEvaluationFailed { reason } => {
+                write!(formatter, "context provider evaluation failed: {reason}")
             }
             Self::CommandLimitExceeded { limit } => {
                 write!(
@@ -1180,7 +1180,7 @@ fn execute_queue_inner(
                         frame.silent,
                         &mut feedback,
                     )
-                    .map_err(|reason| ExecutionError::NumberProviderEvaluationFailed { reason })?,
+                    .map_err(|reason| ExecutionError::ContextProviderEvaluationFailed { reason })?,
                     Command::Compute(command) => execute_compute_command(
                         program,
                         scoreboard,
@@ -1191,7 +1191,7 @@ fn execute_queue_inner(
                         frame.silent,
                         &mut feedback,
                     )
-                    .map_err(|reason| ExecutionError::NumberProviderEvaluationFailed { reason })?,
+                    .map_err(|reason| ExecutionError::ContextProviderEvaluationFailed { reason })?,
                     Command::Random(command) => {
                         execute_random_command(random, command, frame.silent, &mut feedback)
                     }
@@ -2489,32 +2489,43 @@ fn execute_compute_command(
     feedback: &mut impl FnMut(CommandFeedback),
 ) -> Result<OrdinaryExecution, String> {
     let providers = program.loot_registry();
-    let (result, rounded_from) = match command.mode {
-        ComputeMode::Float { scale } => {
-            let original = providers.get_float(
-                &command.provider,
+    let (result, rounded_from, named) = match command {
+        ComputeCommand::Float { provider, scale } => {
+            let original = providers.get_float_unsafe(
+                provider,
                 scoreboard,
                 command_storage,
                 execution_context,
                 random,
             )?;
-            let result = (original * scale).floor() as i32;
-            (result, (result as f32 != original).then_some(original))
+            if !original.is_finite() {
+                return Err(java_f32(original));
+            }
+            let result = (original * *scale).floor() as i32;
+            let named = match provider {
+                crate::number_provider::ProviderReference::Named(id) => Some(id),
+                crate::number_provider::ProviderReference::Inline(_) => None,
+            };
+            (
+                result,
+                (result as f32 != original).then_some(original),
+                named,
+            )
         }
-        ComputeMode::Integer => (
-            providers.get_int(
-                &command.provider,
+        ComputeCommand::Integer { provider } => {
+            let result = providers.get_int_unsafe(
+                provider,
                 scoreboard,
                 command_storage,
                 execution_context,
                 random,
-            )?,
-            None,
-        ),
-    };
-    let named = match &command.provider {
-        crate::number_provider::NumberProviderReference::Named(id) => Some(id),
-        crate::number_provider::NumberProviderReference::Inline(_) => None,
+            )?;
+            let named = match provider {
+                crate::number_provider::ProviderReference::Named(id) => Some(id),
+                crate::number_provider::ProviderReference::Inline(_) => None,
+            };
+            (result, None, named)
+        }
     };
     send_success!(
         silent,
@@ -3093,33 +3104,33 @@ fn resolve_data_source(
                 })
                 .collect()
         }
-        DataSource::Compute { provider, integer } => {
+        DataSource::ComputeFloat(provider) => {
             let providers = program.loot_registry();
-            Ok(vec![if *integer {
-                Tag::Int(
-                    providers
-                        .get_int(
-                            provider,
-                            scoreboard,
-                            command_storage,
-                            execution_context,
-                            random,
-                        )
-                        .map_err(DataSourceError::Evaluation)?,
-                )
-            } else {
-                Tag::float(
-                    providers
-                        .get_float(
-                            provider,
-                            scoreboard,
-                            command_storage,
-                            execution_context,
-                            random,
-                        )
-                        .map_err(DataSourceError::Evaluation)?,
-                )
-            }])
+            Ok(vec![Tag::float(
+                providers
+                    .get_float(
+                        provider,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )
+                    .map_err(DataSourceError::Evaluation)?,
+            )])
+        }
+        DataSource::ComputeInteger(provider) => {
+            let providers = program.loot_registry();
+            Ok(vec![Tag::Int(
+                providers
+                    .get_int(
+                        provider,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )
+                    .map_err(DataSourceError::Evaluation)?,
+            )])
         }
     }
 }

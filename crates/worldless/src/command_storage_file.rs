@@ -13,7 +13,7 @@ use crate::{
     resource::Identifier,
 };
 
-const COMMAND_STORAGE_DATA_VERSION: i32 = 5015;
+const COMMAND_STORAGE_DATA_VERSION: i32 = 5017;
 
 /// An error produced while loading Minecraft command-storage files.
 #[derive(Debug)]

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::{
-    execution_context::ExecutionContext,
+    execution_context::{ExecutionContext, mth_cos, mth_sin},
     java_math::round_float_to_int,
     nbt::{CommandStorage, JavaString, NbtPath, NbtSelection, Tag},
     predicate::{
@@ -17,126 +17,275 @@ use crate::{
 };
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum NumberProviderReference {
+pub(crate) enum ProviderReference<T> {
     Named(Identifier),
-    Inline(Box<NumberProvider>),
+    Inline(Box<T>),
+}
+
+pub(crate) type IntProviderReference = ProviderReference<IntProvider>;
+pub(crate) type FloatProviderReference = ProviderReference<FloatProvider>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ProviderSet<T> {
+    Direct(Vec<ProviderReference<T>>),
+    Tag(Identifier),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IntUnaryOperation {
+    Absolute,
+    Negate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IntBinaryOperation {
+    Difference,
+    FloorModulus,
+    FloorQuotient,
+    Modulus,
+    Quotient,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IntAggregateOperation {
+    Average,
+    Maximum,
+    Minimum,
+    Product,
+    Sum,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum NumberProvider {
-    Constant(f32),
+pub(crate) enum IntProvider {
+    Constant(i32),
     Uniform {
-        min: NumberProviderReference,
-        max: NumberProviderReference,
+        min: IntProviderReference,
+        max: IntProviderReference,
     },
     Binomial {
-        n: NumberProviderReference,
-        p: NumberProviderReference,
+        n: IntProviderReference,
+        p: FloatProviderReference,
     },
     Storage {
         storage: Identifier,
         path: NbtPath,
+        fallback: IntProviderReference,
     },
     Score {
         holder: JavaString,
-        objective: String,
-        scale: f32,
+        objective: JavaString,
+        fallback: IntProviderReference,
     },
-    Sum(NumberProviderSet),
-    Product(NumberProviderSet),
-    Minimum(NumberProviderSet),
-    Maximum(NumberProviderSet),
-    Average(NumberProviderSet),
+    Unary {
+        operation: IntUnaryOperation,
+        input: IntProviderReference,
+    },
+    Binary {
+        operation: IntBinaryOperation,
+        left: IntProviderReference,
+        right: IntProviderReference,
+    },
+    Power {
+        base: IntProviderReference,
+        exponent: IntProviderReference,
+    },
+    Aggregate {
+        operation: IntAggregateOperation,
+        inputs: ProviderSet<IntProvider>,
+    },
+    FromFloat(FloatProviderReference),
     NumberDispatcher {
-        cases: Vec<NumberDispatcherCase>,
-        default: NumberProviderReference,
+        cases: Vec<DispatcherCase<IntProvider>>,
+        default: IntProviderReference,
     },
     Conditional {
         condition: PredicateReference,
-        on_true: NumberProviderReference,
-        on_false: NumberProviderReference,
+        on_true: IntProviderReference,
+        on_false: IntProviderReference,
     },
     WeightedList {
-        distribution: Vec<WeightedProvider>,
+        distribution: Vec<WeightedProvider<IntProvider>>,
+        total_weight: i32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FloatUnaryOperation {
+    Absolute,
+    Ceiling,
+    Cosine,
+    Floor,
+    Negate,
+    Round,
+    Sine,
+    SquareRoot,
+    Truncate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FloatBinaryOperation {
+    Difference,
+    Modulus,
+    Quotient,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FloatAggregateOperation {
+    Average,
+    Length,
+    Maximum,
+    Minimum,
+    Product,
+    Sum,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum FloatProvider {
+    Constant(f32),
+    Uniform {
+        min: FloatProviderReference,
+        max: FloatProviderReference,
+    },
+    Storage {
+        storage: Identifier,
+        path: NbtPath,
+        fallback: FloatProviderReference,
+    },
+    Unary {
+        operation: FloatUnaryOperation,
+        input: FloatProviderReference,
+    },
+    Binary {
+        operation: FloatBinaryOperation,
+        left: FloatProviderReference,
+        right: FloatProviderReference,
+    },
+    Power {
+        base: FloatProviderReference,
+        exponent: FloatProviderReference,
+    },
+    Aggregate {
+        operation: FloatAggregateOperation,
+        inputs: ProviderSet<FloatProvider>,
+    },
+    FromInt(IntProviderReference),
+    NumberDispatcher {
+        cases: Vec<DispatcherCase<FloatProvider>>,
+        default: FloatProviderReference,
+    },
+    Conditional {
+        condition: PredicateReference,
+        on_true: FloatProviderReference,
+        on_false: FloatProviderReference,
+    },
+    WeightedList {
+        distribution: Vec<WeightedProvider<FloatProvider>>,
         total_weight: i32,
     },
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum NumberProviderSet {
-    Direct(Vec<NumberProviderReference>),
-    Tag(Identifier),
+pub(crate) struct WeightedProvider<T> {
+    pub(crate) provider: ProviderReference<T>,
+    pub(crate) weight: i32,
 }
 
-enum NumberProviderValues<'a> {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DispatcherCase<T> {
+    pub(crate) condition: PredicateReference,
+    pub(crate) value: ProviderReference<T>,
+}
+
+enum ProviderValues<'a, T> {
     Direct {
-        registry: &'a LootRegistry,
-        values: std::slice::Iter<'a, NumberProviderReference>,
+        providers: &'a HashMap<Identifier, T>,
+        values: std::slice::Iter<'a, ProviderReference<T>>,
     },
     Tag {
-        registry: &'a LootRegistry,
+        providers: &'a HashMap<Identifier, T>,
         values: std::slice::Iter<'a, Identifier>,
     },
 }
 
-impl<'a> Iterator for NumberProviderValues<'a> {
-    type Item = &'a NumberProvider;
+impl<'a, T> Iterator for ProviderValues<'a, T> {
+    type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Direct { registry, values } => values
-                .next()
-                .map(|value| registry.resolve_number_provider(value)),
-            Self::Tag { registry, values } => values.next().map(|id| {
-                registry
-                    .providers
+            Self::Direct { providers, values } => values.next().map(|value| match value {
+                ProviderReference::Named(id) => providers
                     .get(id)
-                    .expect("number provider tags contain validated providers")
+                    .expect("provider references are validated before execution"),
+                ProviderReference::Inline(provider) => provider,
+            }),
+            Self::Tag { providers, values } => values.next().map(|id| {
+                providers
+                    .get(id)
+                    .expect("provider tags contain validated providers")
             }),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct WeightedProvider {
-    pub(crate) provider: NumberProviderReference,
-    pub(crate) weight: i32,
+#[derive(Debug)]
+enum EvaluationError {
+    Arithmetic(String),
+    Context(String),
+    InvalidArgument(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct NumberDispatcherCase {
-    pub(crate) condition: PredicateReference,
-    pub(crate) number_provider: NumberProviderReference,
+impl EvaluationError {
+    fn into_reason(self) -> String {
+        match self {
+            Self::Arithmetic(reason) | Self::Context(reason) | Self::InvalidArgument(reason) => {
+                reason
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct LootRegistry {
-    providers: HashMap<Identifier, NumberProvider>,
-    provider_tags: HashMap<Identifier, Vec<Identifier>>,
+    int_providers: HashMap<Identifier, IntProvider>,
+    int_provider_tags: HashMap<Identifier, Vec<Identifier>>,
+    float_providers: HashMap<Identifier, FloatProvider>,
+    float_provider_tags: HashMap<Identifier, Vec<Identifier>>,
     predicates: HashMap<Identifier, LootPredicate>,
     predicate_tags: HashMap<Identifier, Vec<Identifier>>,
 }
 
 impl LootRegistry {
     pub(crate) fn new(
-        providers: HashMap<Identifier, NumberProvider>,
-        provider_tags: HashMap<Identifier, Vec<Identifier>>,
+        int_providers: HashMap<Identifier, IntProvider>,
+        int_provider_tags: HashMap<Identifier, Vec<Identifier>>,
+        float_providers: HashMap<Identifier, FloatProvider>,
+        float_provider_tags: HashMap<Identifier, Vec<Identifier>>,
         predicates: HashMap<Identifier, LootPredicate>,
         predicate_tags: HashMap<Identifier, Vec<Identifier>>,
     ) -> Result<Self, RegistryValidationError> {
-        let user_resources = providers
+        let user_resources = int_providers
             .keys()
             .cloned()
-            .map(RegistryResource::NumberProvider)
+            .map(RegistryResource::IntProvider)
+            .chain(
+                float_providers
+                    .keys()
+                    .cloned()
+                    .map(RegistryResource::FloatProvider),
+            )
             .chain(predicates.keys().cloned().map(RegistryResource::Predicate))
             .collect::<HashSet<_>>();
-        let mut all_providers = builtin_providers();
-        all_providers.extend(providers);
+        let mut all_int_providers = builtin_int_providers();
+        all_int_providers.extend(int_providers);
+        let mut all_float_providers = builtin_float_providers();
+        all_float_providers.extend(float_providers);
         let mut all_predicates = builtin_predicates();
         all_predicates.extend(predicates);
         let registry = Self {
-            providers: all_providers,
-            provider_tags,
+            int_providers: all_int_providers,
+            int_provider_tags,
+            float_providers: all_float_providers,
+            float_provider_tags,
             predicates: all_predicates,
             predicate_tags,
         };
@@ -150,16 +299,26 @@ impl LootRegistry {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
         )
         .expect("the supported built-in loot resources are valid")
     }
 
-    pub(crate) fn contains_number_provider(&self, id: &Identifier) -> bool {
-        self.providers.contains_key(id)
+    pub(crate) fn contains_int_provider(&self, id: &Identifier) -> bool {
+        self.int_providers.contains_key(id)
     }
 
-    pub(crate) fn number_provider_ids(&self) -> HashSet<Identifier> {
-        self.providers.keys().cloned().collect()
+    pub(crate) fn int_provider_ids(&self) -> HashSet<Identifier> {
+        self.int_providers.keys().cloned().collect()
+    }
+
+    pub(crate) fn contains_float_provider(&self, id: &Identifier) -> bool {
+        self.float_providers.contains_key(id)
+    }
+
+    pub(crate) fn float_provider_ids(&self) -> HashSet<Identifier> {
+        self.float_providers.keys().cloned().collect()
     }
 
     pub(crate) fn contains_predicate(&self, id: &Identifier) -> bool {
@@ -170,87 +329,125 @@ impl LootRegistry {
         self.predicates.keys().cloned().collect()
     }
 
-    pub(crate) fn validate_inline_number_provider(
+    pub(crate) fn validate_inline_int_provider(
         &self,
-        provider: &NumberProvider,
+        provider: &IntProvider,
     ) -> Result<(), String> {
-        let mut dependencies = Vec::new();
-        self.collect_number_provider_dependencies(provider, &mut dependencies)
+        self.collect_int_provider_dependencies(provider, &mut Vec::new())
+    }
+
+    pub(crate) fn validate_inline_float_provider(
+        &self,
+        provider: &FloatProvider,
+    ) -> Result<(), String> {
+        self.collect_float_provider_dependencies(provider, &mut Vec::new())
     }
 
     pub(crate) fn validate_inline_predicate(
         &self,
         predicate: &LootPredicate,
     ) -> Result<(), String> {
-        let mut dependencies = Vec::new();
-        self.collect_predicate_dependencies(predicate, &mut dependencies)
+        self.collect_predicate_dependencies(predicate, &mut Vec::new())
     }
 
-    pub(crate) fn get_float(
+    pub(crate) fn get_int_unsafe(
         &self,
-        provider: &NumberProviderReference,
-        scoreboard: &Scoreboard,
-        command_storage: &CommandStorage,
-        execution_context: &ExecutionContext,
-        random: &mut LegacyRandom,
-    ) -> Result<f32, String> {
-        self.resolve_number_provider(provider).get_float(
-            self,
-            scoreboard,
-            command_storage,
-            execution_context,
-            random,
-        )
-    }
-
-    pub(crate) fn get_int(
-        &self,
-        provider: &NumberProviderReference,
+        provider: &IntProviderReference,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
         execution_context: &ExecutionContext,
         random: &mut LegacyRandom,
     ) -> Result<i32, String> {
-        self.resolve_number_provider(provider).get_int(
+        self.resolve_int_provider(provider)
+            .get_int_unsafe(self, scoreboard, command_storage, execution_context, random)
+            .map_err(EvaluationError::into_reason)
+    }
+
+    pub(crate) fn get_int(
+        &self,
+        provider: &IntProviderReference,
+        scoreboard: &Scoreboard,
+        command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
+        random: &mut LegacyRandom,
+    ) -> Result<i32, String> {
+        match self.resolve_int_provider(provider).get_int_unsafe(
             self,
             scoreboard,
             command_storage,
             execution_context,
             random,
-        )
-    }
-
-    pub(crate) fn resolve_number_provider<'a>(
-        &'a self,
-        provider: &'a NumberProviderReference,
-    ) -> &'a NumberProvider {
-        match provider {
-            NumberProviderReference::Named(id) => self
-                .providers
-                .get(id)
-                .expect("number provider references are validated before execution"),
-            NumberProviderReference::Inline(provider) => provider,
+        ) {
+            Ok(value) => Ok(value),
+            Err(EvaluationError::Arithmetic(_)) => Ok(0),
+            Err(EvaluationError::Context(reason) | EvaluationError::InvalidArgument(reason)) => {
+                Err(reason)
+            }
         }
     }
 
-    fn number_provider_values<'a>(
-        &'a self,
-        providers: &'a NumberProviderSet,
-    ) -> NumberProviderValues<'a> {
-        match providers {
-            NumberProviderSet::Direct(values) => NumberProviderValues::Direct {
-                registry: self,
-                values: values.iter(),
-            },
-            NumberProviderSet::Tag(tag) => NumberProviderValues::Tag {
-                registry: self,
-                values: self
-                    .provider_tags
-                    .get(tag)
-                    .expect("number provider tags are validated before execution")
-                    .iter(),
-            },
+    pub(crate) fn get_float_unsafe(
+        &self,
+        provider: &FloatProviderReference,
+        scoreboard: &Scoreboard,
+        command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
+        random: &mut LegacyRandom,
+    ) -> Result<f32, String> {
+        self.resolve_float_provider(provider)
+            .get_float_unsafe(self, scoreboard, command_storage, execution_context, random)
+            .map_err(EvaluationError::into_reason)
+    }
+
+    pub(crate) fn get_float(
+        &self,
+        provider: &FloatProviderReference,
+        scoreboard: &Scoreboard,
+        command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
+        random: &mut LegacyRandom,
+    ) -> Result<f32, String> {
+        match self.resolve_float_provider(provider).get_float_unsafe(
+            self,
+            scoreboard,
+            command_storage,
+            execution_context,
+            random,
+        ) {
+            Ok(value) if value.is_finite() => Ok(value),
+            Ok(_) | Err(EvaluationError::Arithmetic(_)) => Ok(0.0),
+            Err(EvaluationError::Context(reason) | EvaluationError::InvalidArgument(reason)) => {
+                Err(reason)
+            }
         }
+    }
+
+    pub(crate) fn resolve_int_provider<'a>(
+        &'a self,
+        provider: &'a IntProviderReference,
+    ) -> &'a IntProvider {
+        resolve_provider(&self.int_providers, provider)
+    }
+
+    pub(crate) fn resolve_float_provider<'a>(
+        &'a self,
+        provider: &'a FloatProviderReference,
+    ) -> &'a FloatProvider {
+        resolve_provider(&self.float_providers, provider)
+    }
+
+    fn int_provider_values<'a>(
+        &'a self,
+        providers: &'a ProviderSet<IntProvider>,
+    ) -> ProviderValues<'a, IntProvider> {
+        provider_values(&self.int_providers, &self.int_provider_tags, providers)
+    }
+
+    fn float_provider_values<'a>(
+        &'a self,
+        providers: &'a ProviderSet<FloatProvider>,
+    ) -> ProviderValues<'a, FloatProvider> {
+        provider_values(&self.float_providers, &self.float_provider_tags, providers)
     }
 
     pub(crate) fn resolve_predicate<'a>(
@@ -313,10 +510,16 @@ impl LootRegistry {
     ) -> Result<(), RegistryValidationError> {
         let mut graph = HashMap::new();
         let mut resources = self
-            .providers
+            .int_providers
             .keys()
             .cloned()
-            .map(RegistryResource::NumberProvider)
+            .map(RegistryResource::IntProvider)
+            .chain(
+                self.float_providers
+                    .keys()
+                    .cloned()
+                    .map(RegistryResource::FloatProvider),
+            )
             .chain(
                 self.predicates
                     .keys()
@@ -328,10 +531,16 @@ impl LootRegistry {
         for resource in &resources {
             let mut dependencies = Vec::new();
             match resource {
-                RegistryResource::NumberProvider(id) => self.collect_number_provider_dependencies(
-                    self.providers
+                RegistryResource::IntProvider(id) => self.collect_int_provider_dependencies(
+                    self.int_providers
                         .get(id)
-                        .expect("the identifier came from the provider map"),
+                        .expect("the identifier came from the int provider map"),
+                    &mut dependencies,
+                ),
+                RegistryResource::FloatProvider(id) => self.collect_float_provider_dependencies(
+                    self.float_providers
+                        .get(id)
+                        .expect("the identifier came from the float provider map"),
                     &mut dependencies,
                 ),
                 RegistryResource::Predicate(id) => self.collect_predicate_dependencies(
@@ -413,70 +622,174 @@ impl LootRegistry {
         Ok(())
     }
 
-    fn collect_number_provider_dependencies(
+    fn collect_int_provider_dependencies(
         &self,
-        provider: &NumberProvider,
+        provider: &IntProvider,
         dependencies: &mut Vec<RegistryResource>,
     ) -> Result<(), String> {
-        let providers = match provider {
-            NumberProvider::Sum(providers)
-            | NumberProvider::Product(providers)
-            | NumberProvider::Minimum(providers)
-            | NumberProvider::Maximum(providers)
-            | NumberProvider::Average(providers) => providers,
-            NumberProvider::Constant(_)
-            | NumberProvider::Storage { .. }
-            | NumberProvider::Score { .. } => return Ok(()),
-            NumberProvider::Uniform { min, max } => {
-                self.collect_number_provider_reference_dependencies(min, dependencies)?;
-                return self.collect_number_provider_reference_dependencies(max, dependencies);
+        match provider {
+            IntProvider::Constant(_) => Ok(()),
+            IntProvider::Uniform { min, max } => {
+                self.collect_int_reference_dependencies(min, dependencies)?;
+                self.collect_int_reference_dependencies(max, dependencies)
             }
-            NumberProvider::Binomial { n, p } => {
-                self.collect_number_provider_reference_dependencies(n, dependencies)?;
-                return self.collect_number_provider_reference_dependencies(p, dependencies);
+            IntProvider::Binomial { n, p } => {
+                self.collect_int_reference_dependencies(n, dependencies)?;
+                self.collect_float_reference_dependencies(p, dependencies)
             }
-            NumberProvider::WeightedList { distribution, .. } => {
-                for entry in distribution {
-                    self.collect_number_provider_reference_dependencies(
-                        &entry.provider,
-                        dependencies,
-                    )?;
-                }
-                return Ok(());
+            IntProvider::Storage { fallback, .. }
+            | IntProvider::Score { fallback, .. }
+            | IntProvider::Unary {
+                input: fallback, ..
+            } => self.collect_int_reference_dependencies(fallback, dependencies),
+            IntProvider::Binary { left, right, .. } => {
+                self.collect_int_reference_dependencies(left, dependencies)?;
+                self.collect_int_reference_dependencies(right, dependencies)
             }
-            NumberProvider::NumberDispatcher { cases, default } => {
+            IntProvider::Power { base, exponent } => {
+                self.collect_int_reference_dependencies(base, dependencies)?;
+                self.collect_int_reference_dependencies(exponent, dependencies)
+            }
+            IntProvider::Aggregate { inputs, .. } => {
+                self.collect_int_set_dependencies(inputs, dependencies)
+            }
+            IntProvider::FromFloat(input) => {
+                self.collect_float_reference_dependencies(input, dependencies)
+            }
+            IntProvider::NumberDispatcher { cases, default } => {
                 for case in cases {
                     self.collect_predicate_reference_dependencies(&case.condition, dependencies)?;
-                    self.collect_number_provider_reference_dependencies(
-                        &case.number_provider,
-                        dependencies,
-                    )?;
+                    self.collect_int_reference_dependencies(&case.value, dependencies)?;
                 }
-                return self.collect_number_provider_reference_dependencies(default, dependencies);
+                self.collect_int_reference_dependencies(default, dependencies)
             }
-            NumberProvider::Conditional {
+            IntProvider::Conditional {
                 condition,
                 on_true,
                 on_false,
             } => {
                 self.collect_predicate_reference_dependencies(condition, dependencies)?;
-                self.collect_number_provider_reference_dependencies(on_true, dependencies)?;
-                return self.collect_number_provider_reference_dependencies(on_false, dependencies);
+                self.collect_int_reference_dependencies(on_true, dependencies)?;
+                self.collect_int_reference_dependencies(on_false, dependencies)
             }
-        };
+            IntProvider::WeightedList { distribution, .. } => {
+                for entry in distribution {
+                    self.collect_int_reference_dependencies(&entry.provider, dependencies)?;
+                }
+                Ok(())
+            }
+        }
+    }
 
+    fn collect_float_provider_dependencies(
+        &self,
+        provider: &FloatProvider,
+        dependencies: &mut Vec<RegistryResource>,
+    ) -> Result<(), String> {
+        match provider {
+            FloatProvider::Constant(_) => Ok(()),
+            FloatProvider::Uniform { min, max } => {
+                self.collect_float_reference_dependencies(min, dependencies)?;
+                self.collect_float_reference_dependencies(max, dependencies)
+            }
+            FloatProvider::Storage { fallback, .. }
+            | FloatProvider::Unary {
+                input: fallback, ..
+            } => self.collect_float_reference_dependencies(fallback, dependencies),
+            FloatProvider::Binary { left, right, .. } => {
+                self.collect_float_reference_dependencies(left, dependencies)?;
+                self.collect_float_reference_dependencies(right, dependencies)
+            }
+            FloatProvider::Power { base, exponent } => {
+                self.collect_float_reference_dependencies(base, dependencies)?;
+                self.collect_float_reference_dependencies(exponent, dependencies)
+            }
+            FloatProvider::Aggregate { inputs, .. } => {
+                self.collect_float_set_dependencies(inputs, dependencies)
+            }
+            FloatProvider::FromInt(input) => {
+                self.collect_int_reference_dependencies(input, dependencies)
+            }
+            FloatProvider::NumberDispatcher { cases, default } => {
+                for case in cases {
+                    self.collect_predicate_reference_dependencies(&case.condition, dependencies)?;
+                    self.collect_float_reference_dependencies(&case.value, dependencies)?;
+                }
+                self.collect_float_reference_dependencies(default, dependencies)
+            }
+            FloatProvider::Conditional {
+                condition,
+                on_true,
+                on_false,
+            } => {
+                self.collect_predicate_reference_dependencies(condition, dependencies)?;
+                self.collect_float_reference_dependencies(on_true, dependencies)?;
+                self.collect_float_reference_dependencies(on_false, dependencies)
+            }
+            FloatProvider::WeightedList { distribution, .. } => {
+                for entry in distribution {
+                    self.collect_float_reference_dependencies(&entry.provider, dependencies)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn collect_int_set_dependencies(
+        &self,
+        providers: &ProviderSet<IntProvider>,
+        dependencies: &mut Vec<RegistryResource>,
+    ) -> Result<(), String> {
         match providers {
-            NumberProviderSet::Direct(values) => {
+            ProviderSet::Direct(values) => {
+                if values.is_empty() {
+                    return Err("provider `inputs` must contain at least one value".to_owned());
+                }
                 for value in values {
-                    self.collect_number_provider_reference_dependencies(value, dependencies)?;
+                    self.collect_int_reference_dependencies(value, dependencies)?;
                 }
             }
-            NumberProviderSet::Tag(tag) => {
+            ProviderSet::Tag(tag) => {
                 let values = self
-                    .provider_tags
+                    .int_provider_tags
                     .get(tag)
-                    .ok_or_else(|| format!("number provider tag `#{tag}` does not exist"))?;
-                dependencies.extend(values.iter().cloned().map(RegistryResource::NumberProvider));
+                    .ok_or_else(|| format!("context int provider tag `#{tag}` does not exist"))?;
+                if values.is_empty() {
+                    return Err(format!(
+                        "context int provider tag `#{tag}` must contain at least one value"
+                    ));
+                }
+                dependencies.extend(values.iter().cloned().map(RegistryResource::IntProvider));
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_float_set_dependencies(
+        &self,
+        providers: &ProviderSet<FloatProvider>,
+        dependencies: &mut Vec<RegistryResource>,
+    ) -> Result<(), String> {
+        match providers {
+            ProviderSet::Direct(values) => {
+                if values.is_empty() {
+                    return Err("provider `inputs` must contain at least one value".to_owned());
+                }
+                for value in values {
+                    self.collect_float_reference_dependencies(value, dependencies)?;
+                }
+            }
+            ProviderSet::Tag(tag) => {
+                let values = self
+                    .float_provider_tags
+                    .get(tag)
+                    .ok_or_else(|| format!("context float provider tag `#{tag}` does not exist"))?;
+                if values.is_empty() {
+                    return Err(format!(
+                        "context float provider tag `#{tag}` must contain at least one value"
+                    ));
+                }
+                dependencies.extend(values.iter().cloned().map(RegistryResource::FloatProvider));
             }
         }
         Ok(())
@@ -510,24 +823,22 @@ impl LootRegistry {
                 self.collect_predicate_reference_dependencies(predicate, dependencies)
             }
             LootPredicate::RandomChance { chance } => {
-                self.collect_number_provider_reference_dependencies(chance, dependencies)
+                self.collect_float_reference_dependencies(chance, dependencies)
             }
-            LootPredicate::ValueCheck { value, range } => {
-                self.collect_number_provider_reference_dependencies(value, dependencies)?;
-                if let Some(min) = &range.min {
-                    self.collect_number_provider_reference_dependencies(min, dependencies)?;
-                }
-                if let Some(max) = &range.max {
-                    self.collect_number_provider_reference_dependencies(max, dependencies)?;
-                }
-                Ok(())
+            LootPredicate::IntValueCheck { value, range } => {
+                self.collect_int_reference_dependencies(value, dependencies)?;
+                range.collect_dependencies(self, dependencies)
+            }
+            LootPredicate::FloatValueCheck { value, range } => {
+                self.collect_float_reference_dependencies(value, dependencies)?;
+                range.collect_dependencies(self, dependencies)
             }
             LootPredicate::AbsentContext {
-                referenced_number_providers,
+                referenced_int_providers,
                 ..
             } => {
-                for provider in referenced_number_providers {
-                    self.collect_number_provider_reference_dependencies(provider, dependencies)?;
+                for provider in referenced_int_providers {
+                    self.collect_int_reference_dependencies(provider, dependencies)?;
                 }
                 Ok(())
             }
@@ -537,21 +848,40 @@ impl LootRegistry {
         }
     }
 
-    fn collect_number_provider_reference_dependencies(
+    pub(crate) fn collect_int_reference_dependencies(
         &self,
-        provider: &NumberProviderReference,
+        provider: &IntProviderReference,
         dependencies: &mut Vec<RegistryResource>,
     ) -> Result<(), String> {
         match provider {
-            NumberProviderReference::Named(id) => {
-                if !self.providers.contains_key(id) {
-                    return Err(format!("number provider `{id}` does not exist"));
+            ProviderReference::Named(id) => {
+                if !self.int_providers.contains_key(id) {
+                    return Err(format!("context int provider `{id}` does not exist"));
                 }
-                dependencies.push(RegistryResource::NumberProvider(id.clone()));
+                dependencies.push(RegistryResource::IntProvider(id.clone()));
                 Ok(())
             }
-            NumberProviderReference::Inline(provider) => {
-                self.collect_number_provider_dependencies(provider, dependencies)
+            ProviderReference::Inline(provider) => {
+                self.collect_int_provider_dependencies(provider, dependencies)
+            }
+        }
+    }
+
+    pub(crate) fn collect_float_reference_dependencies(
+        &self,
+        provider: &FloatProviderReference,
+        dependencies: &mut Vec<RegistryResource>,
+    ) -> Result<(), String> {
+        match provider {
+            ProviderReference::Named(id) => {
+                if !self.float_providers.contains_key(id) {
+                    return Err(format!("context float provider `{id}` does not exist"));
+                }
+                dependencies.push(RegistryResource::FloatProvider(id.clone()));
+                Ok(())
+            }
+            ProviderReference::Inline(provider) => {
+                self.collect_float_provider_dependencies(provider, dependencies)
             }
         }
     }
@@ -576,27 +906,423 @@ impl LootRegistry {
     }
 }
 
-impl NumberProvider {
-    fn get_float(
+fn resolve_provider<'a, T>(
+    providers: &'a HashMap<Identifier, T>,
+    provider: &'a ProviderReference<T>,
+) -> &'a T {
+    match provider {
+        ProviderReference::Named(id) => providers
+            .get(id)
+            .expect("provider references are validated before execution"),
+        ProviderReference::Inline(provider) => provider,
+    }
+}
+
+fn provider_values<'a, T>(
+    providers: &'a HashMap<Identifier, T>,
+    tags: &'a HashMap<Identifier, Vec<Identifier>>,
+    set: &'a ProviderSet<T>,
+) -> ProviderValues<'a, T> {
+    match set {
+        ProviderSet::Direct(values) => ProviderValues::Direct {
+            providers,
+            values: values.iter(),
+        },
+        ProviderSet::Tag(tag) => ProviderValues::Tag {
+            providers,
+            values: tags
+                .get(tag)
+                .expect("provider tags are validated before execution")
+                .iter(),
+        },
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RegistryResource {
+    IntProvider(Identifier),
+    FloatProvider(Identifier),
+    Predicate(Identifier),
+}
+
+impl RegistryResource {
+    fn sort_key(&self) -> (u8, String) {
+        match self {
+            Self::IntProvider(id) => (0, id.to_string()),
+            Self::FloatProvider(id) => (1, id.to_string()),
+            Self::Predicate(id) => (2, id.to_string()),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::IntProvider(_) => "context int provider",
+            Self::FloatProvider(_) => "context float provider",
+            Self::Predicate(_) => "predicate",
+        }
+    }
+
+    pub(crate) fn id(&self) -> &Identifier {
+        match self {
+            Self::IntProvider(id) | Self::FloatProvider(id) | Self::Predicate(id) => id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RegistryValidationError {
+    pub(crate) resource: RegistryResource,
+    pub(crate) reason: String,
+}
+
+impl IntProvider {
+    #[allow(clippy::too_many_arguments)]
+    fn get_int_unsafe(
         &self,
         registry: &LootRegistry,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
         execution_context: &ExecutionContext,
         random: &mut LegacyRandom,
-    ) -> Result<f32, String> {
+    ) -> Result<i32, EvaluationError> {
         match self {
             Self::Constant(value) => Ok(*value),
             Self::Uniform { min, max } => {
-                let min = registry.resolve_number_provider(min).get_float(
+                let min = evaluate_int(
                     registry,
+                    min,
                     scoreboard,
                     command_storage,
                     execution_context,
                     random,
                 )?;
-                let max = registry.resolve_number_provider(max).get_float(
+                let max = evaluate_int(
                     registry,
+                    max,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                if min >= max {
+                    Ok(min)
+                } else {
+                    let bound = max.wrapping_sub(min).wrapping_add(1);
+                    random
+                        .next_int(bound)
+                        .map(|value| value.wrapping_add(min))
+                        .map_err(EvaluationError::InvalidArgument)
+                }
+            }
+            Self::Binomial { n, p } => {
+                let n = evaluate_int(
+                    registry,
+                    n,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                let p = evaluate_float(
+                    registry,
+                    p,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                if !p.is_finite() {
+                    return Err(EvaluationError::Arithmetic(format!(
+                        "invalid binomial probability {p}"
+                    )));
+                }
+                let mut result = 0;
+                for _ in 0..n.max(0) {
+                    if random.next_float() < p {
+                        result += 1;
+                    }
+                }
+                Ok(result)
+            }
+            Self::Storage {
+                storage,
+                path,
+                fallback,
+            } => match storage_number(command_storage, storage, path)
+                .as_ref()
+                .and_then(NbtSelection::as_tag)
+                .and_then(tag_boxed_int_value)
+            {
+                Some(value) => Ok(value),
+                None => evaluate_int(
+                    registry,
+                    fallback,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                ),
+            },
+            Self::Score {
+                holder,
+                objective,
+                fallback,
+            } => match String::from_utf16(objective.units())
+                .ok()
+                .and_then(|objective| scoreboard.score(holder, &objective))
+            {
+                Some(value) => Ok(value),
+                None => evaluate_int(
+                    registry,
+                    fallback,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                ),
+            },
+            Self::Unary { operation, input } => {
+                let input = evaluate_int(
+                    registry,
+                    input,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                match operation {
+                    IntUnaryOperation::Absolute => input.checked_abs().ok_or_else(|| {
+                        EvaluationError::Arithmetic(format!(
+                            "integer absolute value overflow for {input}"
+                        ))
+                    }),
+                    IntUnaryOperation::Negate => input.checked_neg().ok_or_else(|| {
+                        EvaluationError::Arithmetic(format!(
+                            "integer negation overflow for {input}"
+                        ))
+                    }),
+                }
+            }
+            Self::Binary {
+                operation,
+                left,
+                right,
+            } => {
+                let left = evaluate_int(
+                    registry,
+                    left,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                let right = evaluate_int(
+                    registry,
+                    right,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                evaluate_int_binary(*operation, left, right)
+            }
+            Self::Power { base, exponent } => {
+                let base = evaluate_int(
+                    registry,
+                    base,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                let exponent = evaluate_int(
+                    registry,
+                    exponent,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                int_pow_exact(base, exponent)
+            }
+            Self::Aggregate { operation, inputs } => match operation {
+                IntAggregateOperation::Average => {
+                    let mut sum = 0_i64;
+                    let mut count = 0_i64;
+                    for provider in registry.int_provider_values(inputs) {
+                        sum = sum.wrapping_add(i64::from(provider.get_int_unsafe(
+                            registry,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?));
+                        count += 1;
+                    }
+                    long_to_int_safe(sum / count)
+                }
+                IntAggregateOperation::Maximum => {
+                    let mut value = i32::MIN;
+                    for provider in registry.int_provider_values(inputs) {
+                        value = value.max(provider.get_int_unsafe(
+                            registry,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?);
+                    }
+                    Ok(value)
+                }
+                IntAggregateOperation::Minimum => {
+                    let mut value = i32::MAX;
+                    for provider in registry.int_provider_values(inputs) {
+                        value = value.min(provider.get_int_unsafe(
+                            registry,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?);
+                    }
+                    Ok(value)
+                }
+                IntAggregateOperation::Product => {
+                    let mut value = 1_i64;
+                    for provider in registry.int_provider_values(inputs) {
+                        value = value.wrapping_mul(i64::from(provider.get_int_unsafe(
+                            registry,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?));
+                    }
+                    long_to_int_safe(value)
+                }
+                IntAggregateOperation::Sum => {
+                    let mut value = 0_i64;
+                    for provider in registry.int_provider_values(inputs) {
+                        value = value.wrapping_add(i64::from(provider.get_int_unsafe(
+                            registry,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?));
+                    }
+                    long_to_int_safe(value)
+                }
+            },
+            Self::FromFloat(input) => {
+                let input = evaluate_float(
+                    registry,
+                    input,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                float_to_int_safe(input)
+            }
+            Self::NumberDispatcher { cases, default } => {
+                let mut selected = default;
+                for case in cases {
+                    if registry
+                        .test_predicate(
+                            &case.condition,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )
+                        .map_err(EvaluationError::Context)?
+                    {
+                        selected = &case.value;
+                        break;
+                    }
+                }
+                evaluate_int(
+                    registry,
+                    selected,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )
+            }
+            Self::Conditional {
+                condition,
+                on_true,
+                on_false,
+            } => {
+                let selected = if registry
+                    .test_predicate(
+                        condition,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )
+                    .map_err(EvaluationError::Context)?
+                {
+                    on_true
+                } else {
+                    on_false
+                };
+                evaluate_int(
+                    registry,
+                    selected,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )
+            }
+            Self::WeightedList {
+                distribution,
+                total_weight,
+            } => {
+                let selected = random
+                    .next_int(*total_weight)
+                    .map_err(EvaluationError::Arithmetic)?;
+                evaluate_int(
+                    registry,
+                    select_weighted(distribution, selected),
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )
+            }
+        }
+    }
+}
+
+impl FloatProvider {
+    #[allow(clippy::too_many_arguments)]
+    fn get_float_unsafe(
+        &self,
+        registry: &LootRegistry,
+        scoreboard: &Scoreboard,
+        command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
+        random: &mut LegacyRandom,
+    ) -> Result<f32, EvaluationError> {
+        match self {
+            Self::Constant(value) => Ok(*value),
+            Self::Uniform { min, max } => {
+                let min = evaluate_float(
+                    registry,
+                    min,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                let max = evaluate_float(
+                    registry,
+                    max,
                     scoreboard,
                     command_storage,
                     execution_context,
@@ -608,116 +1334,242 @@ impl NumberProvider {
                     random.next_float() * (max - min) + min
                 })
             }
-            Self::Binomial { .. } => self
-                .get_int(
-                    registry,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )
-                .map(|value| value as f32),
-            Self::Storage { storage, path } => Ok(storage_number(command_storage, storage, path)
+            Self::Storage {
+                storage,
+                path,
+                fallback,
+            } => match storage_number(command_storage, storage, path)
                 .as_ref()
                 .and_then(NbtSelection::as_tag)
                 .and_then(tag_float_value)
-                .unwrap_or(0.0)),
-            Self::Score {
-                holder,
-                objective,
-                scale,
-            } => Ok(scoreboard
-                .score(holder, objective)
-                .map_or(0.0, |value| value as f32 * *scale)),
-            Self::Sum(providers) => {
-                let mut value = 0.0;
-                for provider in registry.number_provider_values(providers) {
-                    value += provider.get_float(
+            {
+                Some(value) => Ok(value),
+                None => evaluate_float(
+                    registry,
+                    fallback,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                ),
+            },
+            Self::Unary { operation, input } => {
+                let input = evaluate_float(
+                    registry,
+                    input,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                Ok(match operation {
+                    FloatUnaryOperation::Absolute => input.abs(),
+                    FloatUnaryOperation::Ceiling => (input.ceil() as i32) as f32,
+                    FloatUnaryOperation::Cosine => mth_cos(f64::from(input)),
+                    FloatUnaryOperation::Floor => input.floor(),
+                    FloatUnaryOperation::Negate => -input,
+                    FloatUnaryOperation::Round => round_float_to_int(input) as f32,
+                    FloatUnaryOperation::Sine => mth_sin(f64::from(input)),
+                    FloatUnaryOperation::SquareRoot => libm::sqrt(f64::from(input)) as f32,
+                    FloatUnaryOperation::Truncate => {
+                        if input > 0.0 {
+                            input.floor()
+                        } else {
+                            input.ceil()
+                        }
+                    }
+                })
+            }
+            Self::Binary {
+                operation,
+                left,
+                right,
+            } => match operation {
+                FloatBinaryOperation::Modulus => {
+                    let right = evaluate_float(
                         registry,
+                        right,
                         scoreboard,
                         command_storage,
                         execution_context,
                         random,
                     )?;
-                }
-                Ok(value)
-            }
-            Self::Product(providers) => {
-                let mut value = 1.0;
-                for provider in registry.number_provider_values(providers) {
-                    value *= provider.get_float(
+                    if right == 0.0 {
+                        return Ok(f32::NAN);
+                    }
+                    let left = evaluate_float(
                         registry,
+                        left,
                         scoreboard,
                         command_storage,
                         execution_context,
                         random,
                     )?;
+                    Ok(((left % right) + right) % right)
                 }
-                Ok(value)
+                FloatBinaryOperation::Difference | FloatBinaryOperation::Quotient => {
+                    let left = evaluate_float(
+                        registry,
+                        left,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )?;
+                    let right = evaluate_float(
+                        registry,
+                        right,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )?;
+                    Ok(match operation {
+                        FloatBinaryOperation::Difference => left - right,
+                        FloatBinaryOperation::Quotient => left / right,
+                        FloatBinaryOperation::Modulus => unreachable!(
+                            "float modulus is evaluated in its operand-order-specific branch"
+                        ),
+                    })
+                }
+            },
+            Self::Power { base, exponent } => {
+                let base = evaluate_float(
+                    registry,
+                    base,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                let exponent = evaluate_float(
+                    registry,
+                    exponent,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                Ok(java_float_pow(base, exponent))
             }
-            Self::Minimum(providers) => {
-                let mut value = f32::MAX;
-                for provider in registry.number_provider_values(providers) {
-                    value = java_min(
-                        value,
-                        provider.get_float(
+            Self::Aggregate { operation, inputs } => match operation {
+                FloatAggregateOperation::Average => {
+                    let mut sum = 0.0_f32;
+                    let mut count = 0_u32;
+                    for provider in registry.float_provider_values(inputs) {
+                        sum += provider.get_float_unsafe(
                             registry,
                             scoreboard,
                             command_storage,
                             execution_context,
                             random,
-                        )?,
-                    );
+                        )?;
+                        count += 1;
+                    }
+                    Ok(sum / count as f32)
                 }
-                Ok(value)
-            }
-            Self::Maximum(providers) => {
-                let mut value = -f32::MAX;
-                for provider in registry.number_provider_values(providers) {
-                    value = java_max(
-                        value,
-                        provider.get_float(
+                FloatAggregateOperation::Length => {
+                    let mut sum_of_squares = 0.0_f32;
+                    for provider in registry.float_provider_values(inputs) {
+                        let value = provider.get_float_unsafe(
                             registry,
                             scoreboard,
                             command_storage,
                             execution_context,
                             random,
-                        )?,
-                    );
+                        )?;
+                        sum_of_squares += value * value;
+                    }
+                    Ok(libm::sqrt(f64::from(sum_of_squares)) as f32)
                 }
-                Ok(value)
-            }
-            Self::Average(providers) => {
-                let mut sum = 0.0_f32;
-                let mut count = 0_u32;
-                for provider in registry.number_provider_values(providers) {
-                    sum += provider.get_float(
-                        registry,
-                        scoreboard,
-                        command_storage,
-                        execution_context,
-                        random,
-                    )?;
-                    count += 1;
+                FloatAggregateOperation::Maximum => {
+                    let mut value = -f32::MAX;
+                    for provider in registry.float_provider_values(inputs) {
+                        value = java_max(
+                            value,
+                            provider.get_float_unsafe(
+                                registry,
+                                scoreboard,
+                                command_storage,
+                                execution_context,
+                                random,
+                            )?,
+                        );
+                    }
+                    Ok(value)
                 }
-                Ok(if count == 0 { 0.0 } else { sum / count as f32 })
-            }
+                FloatAggregateOperation::Minimum => {
+                    let mut value = f32::MAX;
+                    for provider in registry.float_provider_values(inputs) {
+                        value = java_min(
+                            value,
+                            provider.get_float_unsafe(
+                                registry,
+                                scoreboard,
+                                command_storage,
+                                execution_context,
+                                random,
+                            )?,
+                        );
+                    }
+                    Ok(value)
+                }
+                FloatAggregateOperation::Product => {
+                    let mut value = 1.0_f32;
+                    for provider in registry.float_provider_values(inputs) {
+                        value *= provider.get_float_unsafe(
+                            registry,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?;
+                    }
+                    Ok(value)
+                }
+                FloatAggregateOperation::Sum => {
+                    let mut value = 0.0_f32;
+                    for provider in registry.float_provider_values(inputs) {
+                        value += provider.get_float_unsafe(
+                            registry,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?;
+                    }
+                    Ok(value)
+                }
+            },
+            Self::FromInt(input) => evaluate_int(
+                registry,
+                input,
+                scoreboard,
+                command_storage,
+                execution_context,
+                random,
+            )
+            .map(|value| value as f32),
             Self::NumberDispatcher { cases, default } => {
                 let mut selected = default;
                 for case in cases {
-                    if registry.test_predicate(
-                        &case.condition,
-                        scoreboard,
-                        command_storage,
-                        execution_context,
-                        random,
-                    )? {
-                        selected = &case.number_provider;
+                    if registry
+                        .test_predicate(
+                            &case.condition,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )
+                        .map_err(EvaluationError::Context)?
+                    {
+                        selected = &case.value;
                         break;
                     }
                 }
-                registry.resolve_number_provider(selected).get_float(
+                evaluate_float(
                     registry,
+                    selected,
                     scoreboard,
                     command_storage,
                     execution_context,
@@ -729,19 +1581,23 @@ impl NumberProvider {
                 on_true,
                 on_false,
             } => {
-                let selected = if registry.test_predicate(
-                    condition,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )? {
+                let selected = if registry
+                    .test_predicate(
+                        condition,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )
+                    .map_err(EvaluationError::Context)?
+                {
                     on_true
                 } else {
                     on_false
                 };
-                registry.resolve_number_provider(selected).get_float(
+                evaluate_float(
                     registry,
+                    selected,
                     scoreboard,
                     command_storage,
                     execution_context,
@@ -752,226 +1608,177 @@ impl NumberProvider {
                 distribution,
                 total_weight,
             } => {
-                let selected = random.next_int(*total_weight)?;
-                let provider = select_weighted(distribution, selected);
-                registry.resolve_number_provider(provider).get_float(
+                let selected = random
+                    .next_int(*total_weight)
+                    .map_err(EvaluationError::Arithmetic)?;
+                evaluate_float(
                     registry,
+                    select_weighted(distribution, selected),
                     scoreboard,
                     command_storage,
                     execution_context,
                     random,
                 )
             }
-        }
-    }
-
-    fn get_int(
-        &self,
-        registry: &LootRegistry,
-        scoreboard: &Scoreboard,
-        command_storage: &CommandStorage,
-        execution_context: &ExecutionContext,
-        random: &mut LegacyRandom,
-    ) -> Result<i32, String> {
-        match self {
-            Self::Uniform { min, max } => {
-                let min = registry.resolve_number_provider(min).get_int(
-                    registry,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )?;
-                let max = registry.resolve_number_provider(max).get_int(
-                    registry,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )?;
-                if min >= max {
-                    Ok(min)
-                } else {
-                    let bound = max.wrapping_sub(min).wrapping_add(1);
-                    random.next_int(bound).map(|value| value.wrapping_add(min))
-                }
-            }
-            Self::Binomial { n, p } => {
-                let n = registry.resolve_number_provider(n).get_int(
-                    registry,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )?;
-                let p = registry.resolve_number_provider(p).get_float(
-                    registry,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )?;
-                let mut result = 0;
-                for _ in 0..n.max(0) {
-                    if random.next_float() < p {
-                        result += 1;
-                    }
-                }
-                Ok(result)
-            }
-            Self::Storage { storage, path } => Ok(storage_number(command_storage, storage, path)
-                .as_ref()
-                .and_then(NbtSelection::as_tag)
-                .and_then(tag_boxed_int_value)
-                .unwrap_or(0)),
-            Self::Sum(providers) => {
-                let mut value = 0_i64;
-                for provider in registry.number_provider_values(providers) {
-                    value = value.wrapping_add(i64::from(provider.get_int(
-                        registry,
-                        scoreboard,
-                        command_storage,
-                        execution_context,
-                        random,
-                    )?));
-                }
-                Ok(saturated_i64_to_i32(value))
-            }
-            Self::Product(providers) => {
-                let mut value = 1_i64;
-                for provider in registry.number_provider_values(providers) {
-                    value = value.wrapping_mul(i64::from(provider.get_int(
-                        registry,
-                        scoreboard,
-                        command_storage,
-                        execution_context,
-                        random,
-                    )?));
-                }
-                Ok(saturated_i64_to_i32(value))
-            }
-            Self::Minimum(providers) => {
-                let mut value = i32::MAX;
-                for provider in registry.number_provider_values(providers) {
-                    value = value.min(provider.get_int(
-                        registry,
-                        scoreboard,
-                        command_storage,
-                        execution_context,
-                        random,
-                    )?);
-                }
-                Ok(value)
-            }
-            Self::Maximum(providers) => {
-                let mut value = -i32::MAX;
-                for provider in registry.number_provider_values(providers) {
-                    value = value.max(provider.get_int(
-                        registry,
-                        scoreboard,
-                        command_storage,
-                        execution_context,
-                        random,
-                    )?);
-                }
-                Ok(value)
-            }
-            Self::Average(providers) => {
-                let mut sum = 0_i64;
-                let mut count = 0_i64;
-                for provider in registry.number_provider_values(providers) {
-                    sum = sum.wrapping_add(i64::from(provider.get_int(
-                        registry,
-                        scoreboard,
-                        command_storage,
-                        execution_context,
-                        random,
-                    )?));
-                    count += 1;
-                }
-                if count == 0 {
-                    Ok(0)
-                } else {
-                    Ok(saturated_i64_to_i32(sum / count))
-                }
-            }
-            Self::NumberDispatcher { cases, default } => {
-                let mut selected = default;
-                for case in cases {
-                    if registry.test_predicate(
-                        &case.condition,
-                        scoreboard,
-                        command_storage,
-                        execution_context,
-                        random,
-                    )? {
-                        selected = &case.number_provider;
-                        break;
-                    }
-                }
-                registry.resolve_number_provider(selected).get_int(
-                    registry,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )
-            }
-            Self::Conditional {
-                condition,
-                on_true,
-                on_false,
-            } => {
-                let selected = if registry.test_predicate(
-                    condition,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )? {
-                    on_true
-                } else {
-                    on_false
-                };
-                registry.resolve_number_provider(selected).get_int(
-                    registry,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )
-            }
-            Self::WeightedList {
-                distribution,
-                total_weight,
-            } => {
-                let selected = random.next_int(*total_weight)?;
-                let provider = select_weighted(distribution, selected);
-                registry.resolve_number_provider(provider).get_int(
-                    registry,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )
-            }
-            Self::Constant(_) | Self::Score { .. } => self
-                .get_float(
-                    registry,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )
-                .map(round_float_to_int),
         }
     }
 }
 
-fn select_weighted(
-    distribution: &[WeightedProvider],
+#[allow(clippy::too_many_arguments)]
+fn evaluate_int(
+    registry: &LootRegistry,
+    provider: &IntProviderReference,
+    scoreboard: &Scoreboard,
+    command_storage: &CommandStorage,
+    execution_context: &ExecutionContext,
+    random: &mut LegacyRandom,
+) -> Result<i32, EvaluationError> {
+    registry.resolve_int_provider(provider).get_int_unsafe(
+        registry,
+        scoreboard,
+        command_storage,
+        execution_context,
+        random,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_float(
+    registry: &LootRegistry,
+    provider: &FloatProviderReference,
+    scoreboard: &Scoreboard,
+    command_storage: &CommandStorage,
+    execution_context: &ExecutionContext,
+    random: &mut LegacyRandom,
+) -> Result<f32, EvaluationError> {
+    registry.resolve_float_provider(provider).get_float_unsafe(
+        registry,
+        scoreboard,
+        command_storage,
+        execution_context,
+        random,
+    )
+}
+
+fn evaluate_int_binary(
+    operation: IntBinaryOperation,
+    left: i32,
+    right: i32,
+) -> Result<i32, EvaluationError> {
+    match operation {
+        IntBinaryOperation::Difference => left.checked_sub(right).ok_or_else(|| {
+            EvaluationError::Arithmetic(format!(
+                "integer subtraction overflow for {left} - {right}"
+            ))
+        }),
+        IntBinaryOperation::FloorModulus => {
+            if right == 0 {
+                return Err(EvaluationError::Arithmetic(
+                    "integer division by zero".to_owned(),
+                ));
+            }
+            let quotient = if left == i32::MIN && right == -1 {
+                i32::MIN
+            } else {
+                let quotient = left / right;
+                let remainder = left % right;
+                if remainder != 0 && (left < 0) != (right < 0) {
+                    quotient - 1
+                } else {
+                    quotient
+                }
+            };
+            Ok((i64::from(left) - i64::from(quotient) * i64::from(right)) as i32)
+        }
+        IntBinaryOperation::FloorQuotient => floor_div_exact(left, right),
+        IntBinaryOperation::Modulus => {
+            if right == 0 {
+                Err(EvaluationError::Arithmetic(
+                    "integer division by zero".to_owned(),
+                ))
+            } else if left == i32::MIN && right == -1 {
+                Ok(0)
+            } else {
+                Ok(left % right)
+            }
+        }
+        IntBinaryOperation::Quotient => {
+            if right == 0 {
+                Err(EvaluationError::Arithmetic(
+                    "integer division by zero".to_owned(),
+                ))
+            } else if left == i32::MIN && right == -1 {
+                Ok(i32::MIN)
+            } else {
+                Ok(left / right)
+            }
+        }
+    }
+}
+
+fn floor_div_exact(left: i32, right: i32) -> Result<i32, EvaluationError> {
+    if right == 0 {
+        return Err(EvaluationError::Arithmetic(
+            "integer division by zero".to_owned(),
+        ));
+    }
+    if left == i32::MIN && right == -1 {
+        return Err(EvaluationError::Arithmetic(format!(
+            "integer division overflow for {left} / {right}"
+        )));
+    }
+    let quotient = left / right;
+    let remainder = left % right;
+    Ok(if remainder != 0 && (left < 0) != (right < 0) {
+        quotient - 1
+    } else {
+        quotient
+    })
+}
+
+fn int_pow_exact(base: i32, exponent: i32) -> Result<i32, EvaluationError> {
+    if base == 0 && exponent == 0 {
+        return Err(EvaluationError::Arithmetic(
+            "result of 0 to the power of 0 is undefined".to_owned(),
+        ));
+    }
+    let exponent = u32::try_from(exponent).map_err(|_| {
+        EvaluationError::Arithmetic(format!("negative integer exponent {exponent}"))
+    })?;
+    base.checked_pow(exponent).ok_or_else(|| {
+        EvaluationError::Arithmetic(format!(
+            "integer power overflow for {base} to exponent {exponent}"
+        ))
+    })
+}
+
+fn java_float_pow(base: f32, exponent: f32) -> f32 {
+    if exponent.is_nan() || (exponent.is_infinite() && base.abs() == 1.0) {
+        f32::NAN
+    } else {
+        libm::pow(f64::from(base), f64::from(exponent)) as f32
+    }
+}
+
+fn long_to_int_safe(value: i64) -> Result<i32, EvaluationError> {
+    i32::try_from(value).map_err(|_| {
+        EvaluationError::Arithmetic(format!("value {value} cannot be safely converted to int"))
+    })
+}
+
+fn float_to_int_safe(value: f32) -> Result<i32, EvaluationError> {
+    if !value.is_finite() || !(-2_147_483_648.0..2_147_483_648.0).contains(&value) {
+        return Err(EvaluationError::Arithmetic(format!(
+            "value {value} cannot be safely converted to int"
+        )));
+    }
+    Ok(value as i32)
+}
+
+fn select_weighted<T>(
+    distribution: &[WeightedProvider<T>],
     mut selected: i32,
-) -> &NumberProviderReference {
+) -> &ProviderReference<T> {
     for entry in distribution {
         selected -= entry.weight;
         if selected < 0 {
@@ -981,57 +1788,37 @@ fn select_weighted(
     unreachable!("weighted provider selection is below the validated total weight")
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum RegistryResource {
-    NumberProvider(Identifier),
-    Predicate(Identifier),
-}
-
-impl RegistryResource {
-    fn sort_key(&self) -> (u8, String) {
-        match self {
-            Self::NumberProvider(id) => (0, id.to_string()),
-            Self::Predicate(id) => (1, id.to_string()),
-        }
-    }
-
-    pub(crate) fn kind(&self) -> &'static str {
-        match self {
-            Self::NumberProvider(_) => "number provider",
-            Self::Predicate(_) => "predicate",
-        }
-    }
-
-    pub(crate) fn id(&self) -> &Identifier {
-        match self {
-            Self::NumberProvider(id) | Self::Predicate(id) => id,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RegistryValidationError {
-    pub(crate) resource: RegistryResource,
-    pub(crate) reason: String,
-}
-
-pub(crate) fn parse_json(contents: &str) -> Result<NumberProvider, String> {
+pub(crate) fn parse_int_json(contents: &str) -> Result<IntProvider, String> {
     let value = resource_json::parse(contents)?;
-    parse_direct(Input::Json(&value), "root")
+    parse_int_direct(Input::Json(&value), "root")
 }
 
-pub(crate) fn parse_inline_tag(
+pub(crate) fn parse_float_json(contents: &str) -> Result<FloatProvider, String> {
+    let value = resource_json::parse(contents)?;
+    parse_float_direct(Input::Json(&value), "root")
+}
+
+pub(crate) fn parse_inline_int_tag(
     value: &Tag,
     registry: &LootRegistry,
-) -> Result<NumberProvider, String> {
-    let provider = parse_direct(Input::Nbt(value), "provider")?;
-    registry.validate_inline_number_provider(&provider)?;
+) -> Result<IntProvider, String> {
+    let provider = parse_int_direct(Input::Nbt(value), "provider")?;
+    registry.validate_inline_int_provider(&provider)?;
     Ok(provider)
 }
 
-fn parse_direct(input: Input<'_>, path: &str) -> Result<NumberProvider, String> {
-    if let Some(value) = input.number() {
-        return Ok(NumberProvider::Constant(value));
+pub(crate) fn parse_inline_float_tag(
+    value: &Tag,
+    registry: &LootRegistry,
+) -> Result<FloatProvider, String> {
+    let provider = parse_float_direct(Input::Nbt(value), "provider")?;
+    registry.validate_inline_float_provider(&provider)?;
+    Ok(provider)
+}
+
+fn parse_int_direct(input: Input<'_>, path: &str) -> Result<IntProvider, String> {
+    if input.number().is_some() {
+        return int_value(input, path).map(IntProvider::Constant);
     }
     if !input.is_object() {
         return Err(format!("`{path}` must be a number or an object"));
@@ -1039,56 +1826,205 @@ fn parse_direct(input: Input<'_>, path: &str) -> Result<NumberProvider, String> 
     let provider_type = identifier_field(input, path, "type")?;
     if provider_type.namespace() != "minecraft" {
         return Err(format!(
-            "number provider type `{provider_type}` is not supported"
+            "context int provider type `{provider_type}` is not supported"
         ));
     }
     match provider_type.path() {
-        "constant" => Ok(NumberProvider::Constant(float_field(input, path, "value")?)),
-        "uniform" => Ok(NumberProvider::Uniform {
-            min: reference_field(input, path, "min")?,
-            max: reference_field(input, path, "max")?,
+        "constant" => Ok(IntProvider::Constant(int_field(input, path, "value")?)),
+        "uniform" => Ok(IntProvider::Uniform {
+            min: int_reference_field(input, path, "min")?,
+            max: int_reference_field(input, path, "max")?,
         }),
-        "binomial" => Ok(NumberProvider::Binomial {
-            n: reference_field(input, path, "n")?,
-            p: reference_field(input, path, "p")?,
+        "binomial" => Ok(IntProvider::Binomial {
+            n: int_reference_field(input, path, "n")?,
+            p: float_reference_field(input, path, "p")?,
         }),
-        "storage" => Ok(NumberProvider::Storage {
+        "storage" => Ok(IntProvider::Storage {
             storage: identifier_field(input, path, "storage")?,
             path: nbt_path_field(input, path, "path")?,
+            fallback: optional_int_reference_field(input, path, "fallback")?
+                .unwrap_or_else(int_zero_reference),
         }),
-        "score" => Ok(NumberProvider::Score {
+        "score" => Ok(IntProvider::Score {
             holder: fixed_score_holder(input, path)?,
-            objective: string_field(input, path, "score")?.to_string_lossy(),
-            scale: optional_float_field(input, path, "scale")?.unwrap_or(1.0),
+            objective: string_field(input, path, "score")?,
+            fallback: optional_int_reference_field(input, path, "fallback")?
+                .unwrap_or_else(int_zero_reference),
         }),
-        "sum" => Ok(NumberProvider::Sum(provider_set_field(
-            input, path, "operands",
+        "abs" => Ok(IntProvider::Unary {
+            operation: IntUnaryOperation::Absolute,
+            input: int_reference_field(input, path, "input")?,
+        }),
+        "negate" => Ok(IntProvider::Unary {
+            operation: IntUnaryOperation::Negate,
+            input: int_reference_field(input, path, "input")?,
+        }),
+        "sub" => parse_int_binary(input, path, IntBinaryOperation::Difference),
+        "floor_mod" => parse_int_binary(input, path, IntBinaryOperation::FloorModulus),
+        "floor_div" => parse_int_binary(input, path, IntBinaryOperation::FloorQuotient),
+        "mod" => parse_int_binary(input, path, IntBinaryOperation::Modulus),
+        "div" => parse_int_binary(input, path, IntBinaryOperation::Quotient),
+        "pow" => Ok(IntProvider::Power {
+            base: int_reference_field(input, path, "base")?,
+            exponent: int_reference_field(input, path, "exponent")?,
+        }),
+        "avg" => parse_int_aggregate(input, path, IntAggregateOperation::Average),
+        "max" => parse_int_aggregate(input, path, IntAggregateOperation::Maximum),
+        "min" => parse_int_aggregate(input, path, IntAggregateOperation::Minimum),
+        "mul" => parse_int_aggregate(input, path, IntAggregateOperation::Product),
+        "add" => parse_int_aggregate(input, path, IntAggregateOperation::Sum),
+        "from_float" => Ok(IntProvider::FromFloat(float_reference_field(
+            input, path, "input",
         )?)),
-        "product" => Ok(NumberProvider::Product(provider_set_field(
-            input, path, "operands",
-        )?)),
-        "minimum" => Ok(NumberProvider::Minimum(provider_set_field(
-            input, path, "operands",
-        )?)),
-        "maximum" => Ok(NumberProvider::Maximum(provider_set_field(
-            input, path, "operands",
-        )?)),
-        "average" => Ok(NumberProvider::Average(provider_set_field(
-            input, path, "operands",
-        )?)),
-        "weighted_list" => parse_weighted_list(input, path),
-        "number_dispatcher" => parse_number_dispatcher(input, path),
-        "conditional" => parse_conditional(input, path),
-        "enchantment_level" | "environment_attribute" => Err(format!(
-            "number provider type `{provider_type}` depends on a physical-world loot context"
+        "weighted_list" => {
+            let (distribution, total_weight) =
+                parse_weighted_list(input, path, parse_int_reference)?;
+            Ok(IntProvider::WeightedList {
+                distribution,
+                total_weight,
+            })
+        }
+        "number_dispatcher" => parse_int_dispatcher(input, path),
+        "conditional" => parse_int_conditional(input, path),
+        "environment_attribute" => Err(format!(
+            "context int provider type `{provider_type}` depends on a physical-world loot context"
         )),
         _ => Err(format!(
-            "number provider type `{provider_type}` is not supported"
+            "context int provider type `{provider_type}` is not supported"
         )),
     }
 }
 
-fn parse_number_dispatcher(input: Input<'_>, path: &str) -> Result<NumberProvider, String> {
+fn parse_float_direct(input: Input<'_>, path: &str) -> Result<FloatProvider, String> {
+    if let Some(value) = input.number() {
+        return Ok(FloatProvider::Constant(value));
+    }
+    if !input.is_object() {
+        return Err(format!("`{path}` must be a number or an object"));
+    }
+    let provider_type = identifier_field(input, path, "type")?;
+    if provider_type.namespace() != "minecraft" {
+        return Err(format!(
+            "context float provider type `{provider_type}` is not supported"
+        ));
+    }
+    match provider_type.path() {
+        "constant" => Ok(FloatProvider::Constant(float_field(input, path, "value")?)),
+        "uniform" => Ok(FloatProvider::Uniform {
+            min: float_reference_field(input, path, "min")?,
+            max: float_reference_field(input, path, "max")?,
+        }),
+        "storage" => Ok(FloatProvider::Storage {
+            storage: identifier_field(input, path, "storage")?,
+            path: nbt_path_field(input, path, "path")?,
+            fallback: optional_float_reference_field(input, path, "fallback")?
+                .unwrap_or_else(float_zero_reference),
+        }),
+        "abs" => parse_float_unary(input, path, FloatUnaryOperation::Absolute),
+        "ceil" => parse_float_unary(input, path, FloatUnaryOperation::Ceiling),
+        "cos" => parse_float_unary(input, path, FloatUnaryOperation::Cosine),
+        "floor" => parse_float_unary(input, path, FloatUnaryOperation::Floor),
+        "negate" => parse_float_unary(input, path, FloatUnaryOperation::Negate),
+        "round" => parse_float_unary(input, path, FloatUnaryOperation::Round),
+        "sin" => parse_float_unary(input, path, FloatUnaryOperation::Sine),
+        "sqrt" => parse_float_unary(input, path, FloatUnaryOperation::SquareRoot),
+        "truncate" => parse_float_unary(input, path, FloatUnaryOperation::Truncate),
+        "sub" => parse_float_binary(input, path, FloatBinaryOperation::Difference),
+        "mod" => parse_float_binary(input, path, FloatBinaryOperation::Modulus),
+        "div" => parse_float_binary(input, path, FloatBinaryOperation::Quotient),
+        "pow" => Ok(FloatProvider::Power {
+            base: float_reference_field(input, path, "base")?,
+            exponent: float_reference_field(input, path, "exponent")?,
+        }),
+        "avg" => parse_float_aggregate(input, path, FloatAggregateOperation::Average),
+        "length" => parse_float_aggregate(input, path, FloatAggregateOperation::Length),
+        "max" => parse_float_aggregate(input, path, FloatAggregateOperation::Maximum),
+        "min" => parse_float_aggregate(input, path, FloatAggregateOperation::Minimum),
+        "mul" => parse_float_aggregate(input, path, FloatAggregateOperation::Product),
+        "add" => parse_float_aggregate(input, path, FloatAggregateOperation::Sum),
+        "from_int" => Ok(FloatProvider::FromInt(int_reference_field(
+            input, path, "input",
+        )?)),
+        "weighted_list" => {
+            let (distribution, total_weight) =
+                parse_weighted_list(input, path, parse_float_reference)?;
+            Ok(FloatProvider::WeightedList {
+                distribution,
+                total_weight,
+            })
+        }
+        "number_dispatcher" => parse_float_dispatcher(input, path),
+        "conditional" => parse_float_conditional(input, path),
+        "environment_attribute" => Err(format!(
+            "context float provider type `{provider_type}` depends on a physical-world loot context"
+        )),
+        "enchantment_level" => Err(format!(
+            "context float provider type `{provider_type}` requires an enchantment loot context"
+        )),
+        _ => Err(format!(
+            "context float provider type `{provider_type}` is not supported"
+        )),
+    }
+}
+
+fn parse_int_binary(
+    input: Input<'_>,
+    path: &str,
+    operation: IntBinaryOperation,
+) -> Result<IntProvider, String> {
+    Ok(IntProvider::Binary {
+        operation,
+        left: int_reference_field(input, path, "left")?,
+        right: int_reference_field(input, path, "right")?,
+    })
+}
+
+fn parse_float_binary(
+    input: Input<'_>,
+    path: &str,
+    operation: FloatBinaryOperation,
+) -> Result<FloatProvider, String> {
+    Ok(FloatProvider::Binary {
+        operation,
+        left: float_reference_field(input, path, "left")?,
+        right: float_reference_field(input, path, "right")?,
+    })
+}
+
+fn parse_float_unary(
+    input: Input<'_>,
+    path: &str,
+    operation: FloatUnaryOperation,
+) -> Result<FloatProvider, String> {
+    Ok(FloatProvider::Unary {
+        operation,
+        input: float_reference_field(input, path, "input")?,
+    })
+}
+
+fn parse_int_aggregate(
+    input: Input<'_>,
+    path: &str,
+    operation: IntAggregateOperation,
+) -> Result<IntProvider, String> {
+    Ok(IntProvider::Aggregate {
+        operation,
+        inputs: provider_set_field(input, path, "inputs", parse_int_reference)?,
+    })
+}
+
+fn parse_float_aggregate(
+    input: Input<'_>,
+    path: &str,
+    operation: FloatAggregateOperation,
+) -> Result<FloatProvider, String> {
+    Ok(FloatProvider::Aggregate {
+        operation,
+        inputs: provider_set_field(input, path, "inputs", parse_float_reference)?,
+    })
+}
+
+fn parse_int_dispatcher(input: Input<'_>, path: &str) -> Result<IntProvider, String> {
     let cases_path = format!("{path}.cases");
     let cases = required_field(input, path, "cases")?
         .list()
@@ -1099,52 +2035,92 @@ fn parse_number_dispatcher(input: Input<'_>, path: &str) -> Result<NumberProvide
         if !case.is_object() {
             return Err(format!("`{case_path}` must be an object"));
         }
-        parsed_cases.push(NumberDispatcherCase {
+        parsed_cases.push(DispatcherCase {
             condition: parse_predicate_reference(
                 required_field(case, &case_path, "condition")?,
                 &format!("{case_path}.condition"),
             )?,
-            number_provider: parse_reference(
-                required_field(case, &case_path, "number_provider")?,
-                &format!("{case_path}.number_provider"),
+            value: parse_int_reference(
+                required_field(case, &case_path, "value")?,
+                &format!("{case_path}.value"),
             )?,
         });
     }
-    let default = input.field("default").map_or_else(
-        || Ok(constant_zero_reference()),
-        |default| parse_reference(default, &format!("{path}.default")),
-    )?;
-    Ok(NumberProvider::NumberDispatcher {
+    let default =
+        optional_int_reference_field(input, path, "default")?.unwrap_or_else(int_zero_reference);
+    Ok(IntProvider::NumberDispatcher {
         cases: parsed_cases,
         default,
     })
 }
 
-fn parse_conditional(input: Input<'_>, path: &str) -> Result<NumberProvider, String> {
-    let condition = parse_predicate_reference(
-        required_field(input, path, "condition")?,
-        &format!("{path}.condition"),
-    )?;
-    let on_true = parse_reference(
-        required_field(input, path, "on_true")?,
-        &format!("{path}.on_true"),
-    )?;
-    let on_false = input.field("on_false").map_or_else(
-        || Ok(constant_zero_reference()),
-        |value| parse_reference(value, &format!("{path}.on_false")),
-    )?;
-    Ok(NumberProvider::Conditional {
-        condition,
-        on_true,
-        on_false,
+fn parse_float_dispatcher(input: Input<'_>, path: &str) -> Result<FloatProvider, String> {
+    let cases_path = format!("{path}.cases");
+    let cases = required_field(input, path, "cases")?
+        .list()
+        .ok_or_else(|| format!("`{cases_path}` must be a list"))?;
+    let mut parsed_cases = Vec::with_capacity(cases.len());
+    for (index, case) in cases.into_iter().enumerate() {
+        let case_path = format!("{cases_path}[{index}]");
+        if !case.is_object() {
+            return Err(format!("`{case_path}` must be an object"));
+        }
+        parsed_cases.push(DispatcherCase {
+            condition: parse_predicate_reference(
+                required_field(case, &case_path, "condition")?,
+                &format!("{case_path}.condition"),
+            )?,
+            value: parse_float_reference(
+                required_field(case, &case_path, "value")?,
+                &format!("{case_path}.value"),
+            )?,
+        });
+    }
+    let default = optional_float_reference_field(input, path, "default")?
+        .unwrap_or_else(float_zero_reference);
+    Ok(FloatProvider::NumberDispatcher {
+        cases: parsed_cases,
+        default,
     })
 }
 
-fn constant_zero_reference() -> NumberProviderReference {
-    NumberProviderReference::Inline(Box::new(NumberProvider::Constant(0.0)))
+fn parse_int_conditional(input: Input<'_>, path: &str) -> Result<IntProvider, String> {
+    Ok(IntProvider::Conditional {
+        condition: parse_predicate_reference(
+            required_field(input, path, "condition")?,
+            &format!("{path}.condition"),
+        )?,
+        on_true: int_reference_field(input, path, "on_true")?,
+        on_false: optional_int_reference_field(input, path, "on_false")?
+            .unwrap_or_else(int_zero_reference),
+    })
 }
 
-fn parse_weighted_list(input: Input<'_>, path: &str) -> Result<NumberProvider, String> {
+fn parse_float_conditional(input: Input<'_>, path: &str) -> Result<FloatProvider, String> {
+    Ok(FloatProvider::Conditional {
+        condition: parse_predicate_reference(
+            required_field(input, path, "condition")?,
+            &format!("{path}.condition"),
+        )?,
+        on_true: float_reference_field(input, path, "on_true")?,
+        on_false: optional_float_reference_field(input, path, "on_false")?
+            .unwrap_or_else(float_zero_reference),
+    })
+}
+
+fn int_zero_reference() -> IntProviderReference {
+    ProviderReference::Inline(Box::new(IntProvider::Constant(0)))
+}
+
+fn float_zero_reference() -> FloatProviderReference {
+    ProviderReference::Inline(Box::new(FloatProvider::Constant(0.0)))
+}
+
+fn parse_weighted_list<T>(
+    input: Input<'_>,
+    path: &str,
+    parse_reference: fn(Input<'_>, &str) -> Result<ProviderReference<T>, String>,
+) -> Result<(Vec<WeightedProvider<T>>, i32), String> {
     let distribution_path = format!("{path}.distribution");
     let distribution = required_field(input, path, "distribution")?
         .list()
@@ -1156,7 +2132,10 @@ fn parse_weighted_list(input: Input<'_>, path: &str) -> Result<NumberProvider, S
         if !entry.is_object() {
             return Err(format!("`{entry_path}` must be an object"));
         }
-        let provider = reference_field(entry, &entry_path, "data")?;
+        let provider = parse_reference(
+            required_field(entry, &entry_path, "data")?,
+            &format!("{entry_path}.data"),
+        )?;
         let weight = int_field(entry, &entry_path, "weight")?;
         if weight < 0 {
             return Err(format!("`{entry_path}.weight` must be non-negative"));
@@ -1175,17 +2154,15 @@ fn parse_weighted_list(input: Input<'_>, path: &str) -> Result<NumberProvider, S
             "`{distribution_path}` must contain at least one entry with non-zero weight"
         ));
     }
-    Ok(NumberProvider::WeightedList {
-        distribution: entries,
-        total_weight: total_weight as i32,
-    })
+    Ok((entries, total_weight as i32))
 }
 
-fn provider_set_field(
+fn provider_set_field<T>(
     input: Input<'_>,
     path: &str,
     field: &str,
-) -> Result<NumberProviderSet, String> {
+    parse_reference: fn(Input<'_>, &str) -> Result<ProviderReference<T>, String>,
+) -> Result<ProviderSet<T>, String> {
     let field_path = format!("{path}.{field}");
     let value = required_field(input, path, field)?;
     if let Some(string) = value.string() {
@@ -1193,7 +2170,7 @@ fn provider_set_field(
         if let Some(tag) = text.strip_prefix('#') {
             let id = Identifier::parse(tag)
                 .ok_or_else(|| format!("`{field_path}` has invalid tag identifier `{text}`"))?;
-            return Ok(NumberProviderSet::Tag(id));
+            return Ok(ProviderSet::Tag(id));
         }
     }
     let values = value.list().unwrap_or_else(|| vec![value]);
@@ -1202,31 +2179,80 @@ fn provider_set_field(
         .enumerate()
         .map(|(index, value)| parse_reference(value, &format!("{field_path}[{index}]")))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(NumberProviderSet::Direct(providers))
+    Ok(ProviderSet::Direct(providers))
 }
 
-pub(crate) fn parse_reference(
+pub(crate) fn parse_int_reference(
     input: Input<'_>,
     path: &str,
-) -> Result<NumberProviderReference, String> {
+) -> Result<IntProviderReference, String> {
+    parse_provider_reference(input, path, "context int provider", parse_int_direct)
+}
+
+pub(crate) fn parse_float_reference(
+    input: Input<'_>,
+    path: &str,
+) -> Result<FloatProviderReference, String> {
+    parse_provider_reference(input, path, "context float provider", parse_float_direct)
+}
+
+fn parse_provider_reference<T>(
+    input: Input<'_>,
+    path: &str,
+    kind: &str,
+    parse_direct: fn(Input<'_>, &str) -> Result<T, String>,
+) -> Result<ProviderReference<T>, String> {
     if let Some(value) = input.string() {
         let value = ascii_string(&value, path)?;
         let id = Identifier::parse(&value)
-            .ok_or_else(|| format!("`{path}` has invalid number provider identifier `{value}`"))?;
-        return Ok(NumberProviderReference::Named(id));
+            .ok_or_else(|| format!("`{path}` has invalid {kind} identifier `{value}`"))?;
+        return Ok(ProviderReference::Named(id));
     }
-    parse_direct(input, path).map(|provider| NumberProviderReference::Inline(Box::new(provider)))
+    parse_direct(input, path).map(|provider| ProviderReference::Inline(Box::new(provider)))
 }
 
-fn reference_field(
+fn int_reference_field(
     input: Input<'_>,
     path: &str,
     field: &str,
-) -> Result<NumberProviderReference, String> {
-    parse_reference(
+) -> Result<IntProviderReference, String> {
+    parse_int_reference(
         required_field(input, path, field)?,
         &format!("{path}.{field}"),
     )
+}
+
+fn float_reference_field(
+    input: Input<'_>,
+    path: &str,
+    field: &str,
+) -> Result<FloatProviderReference, String> {
+    parse_float_reference(
+        required_field(input, path, field)?,
+        &format!("{path}.{field}"),
+    )
+}
+
+fn optional_int_reference_field(
+    input: Input<'_>,
+    path: &str,
+    field: &str,
+) -> Result<Option<IntProviderReference>, String> {
+    input
+        .field(field)
+        .map(|value| parse_int_reference(value, &format!("{path}.{field}")))
+        .transpose()
+}
+
+fn optional_float_reference_field(
+    input: Input<'_>,
+    path: &str,
+    field: &str,
+) -> Result<Option<FloatProviderReference>, String> {
+    input
+        .field(field)
+        .map(|value| parse_float_reference(value, &format!("{path}.{field}")))
+        .transpose()
 }
 
 fn fixed_score_holder(input: Input<'_>, path: &str) -> Result<JavaString, String> {
@@ -1302,16 +2328,6 @@ pub(crate) fn int_value(input: Input<'_>, path: &str) -> Result<i32, String> {
         Input::NbtLong(value) => Ok(value as i32),
         Input::Json(_) => Err(format!("`{path}` must be a number")),
     }
-}
-
-fn optional_float_field(input: Input<'_>, path: &str, field: &str) -> Result<Option<f32>, String> {
-    let Some(value) = input.field(field) else {
-        return Ok(None);
-    };
-    value
-        .number()
-        .map(Some)
-        .ok_or_else(|| format!("`{path}.{field}` must be a number"))
 }
 
 fn nbt_path_field(input: Input<'_>, path: &str, field: &str) -> Result<NbtPath, String> {
@@ -1454,46 +2470,49 @@ impl<'a> Input<'a> {
     }
 }
 
-fn builtin_providers() -> HashMap<Identifier, NumberProvider> {
+fn builtin_int_providers() -> HashMap<Identifier, IntProvider> {
     fn id(path: &str) -> Identifier {
         Identifier::from_parts("minecraft", path)
-            .expect("built-in number provider identifiers are valid")
+            .expect("built-in context int provider identifiers are valid")
     }
 
-    fn named(path: &str) -> NumberProviderReference {
-        NumberProviderReference::Named(id(path))
+    fn named(path: &str) -> IntProviderReference {
+        ProviderReference::Named(id(path))
+    }
+
+    fn direct(value: i32) -> IntProviderReference {
+        ProviderReference::Inline(Box::new(IntProvider::Constant(value)))
     }
 
     fn predicate(path: &str) -> PredicateReference {
         PredicateReference::Named(id(path))
     }
 
-    fn product(time: f32, multiplier: &str) -> NumberProviderReference {
-        NumberProviderReference::Inline(Box::new(NumberProvider::Product(
-            NumberProviderSet::Direct(vec![
-                NumberProviderReference::Inline(Box::new(NumberProvider::Constant(time))),
-                named(multiplier),
-            ]),
-        )))
-    }
-
-    fn compostable(chance: i32) -> NumberProvider {
-        NumberProvider::WeightedList {
+    fn compostable(chance: i32) -> IntProvider {
+        IntProvider::WeightedList {
             distribution: vec![
                 WeightedProvider {
-                    provider: NumberProviderReference::Inline(Box::new(NumberProvider::Constant(
-                        1.0,
-                    ))),
+                    provider: direct(1),
                     weight: chance,
                 },
                 WeightedProvider {
-                    provider: NumberProviderReference::Inline(Box::new(NumberProvider::Constant(
-                        0.0,
-                    ))),
+                    provider: direct(0),
                     weight: 100 - chance,
                 },
             ],
             total_weight: 100,
+        }
+    }
+
+    fn cooking(time: i32) -> IntProvider {
+        IntProvider::Binary {
+            operation: IntBinaryOperation::Quotient,
+            left: direct(time),
+            right: ProviderReference::Inline(Box::new(IntProvider::Conditional {
+                condition: predicate("block/fast_cooking"),
+                on_true: named("cooking/fast_burn_time_reduction_factor"),
+                on_false: named("cooking/normal_burn_time_reduction_factor"),
+            })),
         }
     }
 
@@ -1502,67 +2521,75 @@ fn builtin_providers() -> HashMap<Identifier, NumberProvider> {
         (id("compostable/low_medium"), compostable(50)),
         (id("compostable/medium"), compostable(65)),
         (id("compostable/medium_high"), compostable(85)),
+        (id("compostable/always_add_one"), IntProvider::Constant(1)),
         (
-            id("compostable/always_add_one"),
-            NumberProvider::Constant(1.0),
+            id("cooking/normal_burn_time_reduction_factor"),
+            IntProvider::Constant(1),
         ),
         (
+            id("cooking/fast_burn_time_reduction_factor"),
+            IntProvider::Constant(2),
+        ),
+        (id("brewing/uses_default"), IntProvider::Constant(20)),
+    ]);
+    for (path, time) in [
+        ("cooking/time_bamboo", 50),
+        ("cooking/time_wool_slabs", 50),
+        ("cooking/time_wool_carpets", 67),
+        ("cooking/time_dry_plants", 100),
+        ("cooking/time_wood_items_extra_small", 100),
+        ("cooking/time_wool", 100),
+        ("cooking/time_wood_slabs", 150),
+        ("cooking/time_wood_items_large", 200),
+        ("cooking/time_roots", 300),
+        ("cooking/time_wood_blocks", 300),
+        ("cooking/time_wood_items_small", 300),
+        ("cooking/time_hanging_signs", 800),
+        ("cooking/time_boats", 1200),
+        ("cooking/time_coal", 1600),
+        ("cooking/time_blaze_rod", 2400),
+        ("cooking/time_dried_kelp_block", 4001),
+        ("cooking/time_coal_block", 16000),
+        ("cooking/time_lava_bucket", 20000),
+    ] {
+        providers.insert(id(path), cooking(time));
+    }
+    providers
+}
+
+fn builtin_float_providers() -> HashMap<Identifier, FloatProvider> {
+    fn id(path: &str) -> Identifier {
+        Identifier::from_parts("minecraft", path)
+            .expect("built-in context float provider identifiers are valid")
+    }
+
+    fn named(path: &str) -> FloatProviderReference {
+        ProviderReference::Named(id(path))
+    }
+
+    fn predicate(path: &str) -> PredicateReference {
+        PredicateReference::Named(id(path))
+    }
+
+    HashMap::from([
+        (
             id("cooking/normal_speed_multiplier"),
-            NumberProvider::Constant(1.0),
+            FloatProvider::Constant(1.0),
         ),
         (
             id("cooking/fast_speed_multiplier"),
-            NumberProvider::Constant(2.0),
-        ),
-        (
-            id("cooking/normal_burn_time_multiplier"),
-            NumberProvider::Constant(1.0),
-        ),
-        (
-            id("cooking/fast_burn_time_multiplier"),
-            NumberProvider::Constant(0.5),
+            FloatProvider::Constant(2.0),
         ),
         (
             id("cooking/speed_default"),
-            NumberProvider::Conditional {
+            FloatProvider::Conditional {
                 condition: predicate("block/fast_cooking"),
                 on_true: named("cooking/fast_speed_multiplier"),
                 on_false: named("cooking/normal_speed_multiplier"),
             },
         ),
-        (id("brewing/speed_default"), NumberProvider::Constant(1.0)),
-        (id("brewing/uses_default"), NumberProvider::Constant(20.0)),
-    ]);
-    for (path, time) in [
-        ("cooking/time_bamboo", 50.0),
-        ("cooking/time_wool_slabs", 50.0),
-        ("cooking/time_wool_carpets", 67.0),
-        ("cooking/time_dry_plants", 100.0),
-        ("cooking/time_wood_items_extra_small", 100.0),
-        ("cooking/time_wool", 100.0),
-        ("cooking/time_wood_slabs", 150.0),
-        ("cooking/time_wood_items_large", 200.0),
-        ("cooking/time_roots", 300.0),
-        ("cooking/time_wood_blocks", 300.0),
-        ("cooking/time_wood_items_small", 300.0),
-        ("cooking/time_hanging_signs", 800.0),
-        ("cooking/time_boats", 1200.0),
-        ("cooking/time_coal", 1600.0),
-        ("cooking/time_blaze_rod", 2400.0),
-        ("cooking/time_dried_kelp_block", 4001.0),
-        ("cooking/time_coal_block", 16000.0),
-        ("cooking/time_lava_bucket", 20000.0),
-    ] {
-        providers.insert(
-            id(path),
-            NumberProvider::Conditional {
-                condition: predicate("block/fast_cooking"),
-                on_true: product(time, "cooking/fast_burn_time_multiplier"),
-                on_false: product(time, "cooking/normal_burn_time_multiplier"),
-            },
-        );
-    }
-    providers
+        (id("brewing/speed_default"), FloatProvider::Constant(1.0)),
+    ])
 }
 
 fn storage_number<'a>(
@@ -1608,10 +2635,6 @@ fn tag_boxed_int_value(value: &Tag) -> Option<i32> {
     }
 }
 
-fn saturated_i64_to_i32(value: i64) -> i32 {
-    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-}
-
 fn java_min(left: f32, right: f32) -> f32 {
     if left.is_nan() {
         left
@@ -1651,12 +2674,32 @@ fn java_max(left: f32, right: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_context::{Position, Rotation};
+
+    fn context() -> ExecutionContext {
+        ExecutionContext::new(Position::new(0.0, 0.0, 0.0), Rotation::new(0.0, 0.0))
+    }
 
     #[test]
-    fn parses_direct_and_compact_holder_sets() {
-        let provider =
-            parse_json(r#"{"type":"sum","operands":[1,{"type":"product","operands":2}]}"#).unwrap();
-        assert!(matches!(provider, NumberProvider::Sum(_)));
+    fn parses_typed_direct_and_compact_holder_sets() {
+        let int_provider =
+            parse_int_json(r#"{"type":"add","inputs":[1,{"type":"mul","inputs":2}]}"#).unwrap();
+        let float_provider =
+            parse_float_json(r#"{"type":"add","inputs":[1,{"type":"mul","inputs":2}]}"#).unwrap();
+        assert!(matches!(
+            int_provider,
+            IntProvider::Aggregate {
+                operation: IntAggregateOperation::Sum,
+                ..
+            }
+        ));
+        assert!(matches!(
+            float_provider,
+            FloatProvider::Aggregate {
+                operation: FloatAggregateOperation::Sum,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1664,14 +2707,14 @@ mod tests {
         fn nested_sum(depth: usize) -> String {
             let mut provider = "1".to_owned();
             for _ in 0..depth {
-                provider = format!(r#"{{"type":"sum","operands":[{provider}]}}"#);
+                provider = format!(r#"{{"type":"add","inputs":[{provider}]}}"#);
             }
             provider
         }
 
-        assert!(parse_json(&nested_sum(65)).is_ok());
+        assert!(parse_int_json(&nested_sum(65)).is_ok());
         assert!(
-            parse_json(&nested_sum(128))
+            parse_int_json(&nested_sum(128))
                 .unwrap_err()
                 .contains("nesting limit 255")
         );
@@ -1679,7 +2722,7 @@ mod tests {
 
     #[test]
     fn weighted_list_rejects_gson_unsupported_number_scale() {
-        let error = parse_json(
+        let error = parse_int_json(
             r#"{"type":"weighted_list","distribution":[{"data":1,"weight":1e10000},{"data":2,"weight":1}]}"#,
         )
         .unwrap_err();
@@ -1687,58 +2730,107 @@ mod tests {
     }
 
     #[test]
-    fn rejects_provider_cycles() {
-        let first = Identifier::parse("example:first").unwrap();
-        let second = Identifier::parse("example:second").unwrap();
-        let providers = HashMap::from([
-            (
-                first.clone(),
-                NumberProvider::Sum(NumberProviderSet::Direct(vec![
-                    NumberProviderReference::Named(second.clone()),
-                ])),
-            ),
-            (
-                second,
-                NumberProvider::Sum(NumberProviderSet::Direct(vec![
-                    NumberProviderReference::Named(first),
-                ])),
-            ),
-        ]);
-        assert!(
-            LootRegistry::new(providers, HashMap::new(), HashMap::new(), HashMap::new()).is_err()
+    fn integer_arithmetic_uses_exact_results() {
+        assert!(matches!(
+            evaluate_int_binary(IntBinaryOperation::Difference, i32::MIN, 1),
+            Err(EvaluationError::Arithmetic(_))
+        ));
+        assert_eq!(
+            evaluate_int_binary(IntBinaryOperation::Quotient, i32::MIN, -1).unwrap(),
+            i32::MIN
         );
+        assert_eq!(
+            evaluate_int_binary(IntBinaryOperation::FloorModulus, i32::MIN, -1).unwrap(),
+            0
+        );
+        assert!(int_pow_exact(0, 0).is_err());
+        assert!(int_pow_exact(2, 31).is_err());
     }
 
     #[test]
-    fn integer_aggregates_round_each_operand() {
-        let registry = LootRegistry::empty();
-        let provider = NumberProviderReference::Inline(Box::new(
-            parse_json(r#"{"type":"sum","operands":[0.6,0.6]}"#).unwrap(),
-        ));
-        let mut random = LegacyRandom::default();
-        let execution_context = ExecutionContext::new(
-            crate::execution_context::Position::new(0.0, 0.0, 0.0),
-            crate::execution_context::Rotation::new(0.0, 0.0),
-        );
-        assert_eq!(
-            registry.get_float(
+    fn invalid_uniform_bound_is_not_caught_as_arithmetic() {
+        let provider = ProviderReference::Inline(Box::new(IntProvider::Uniform {
+            min: ProviderReference::Inline(Box::new(IntProvider::Constant(i32::MIN))),
+            max: ProviderReference::Inline(Box::new(IntProvider::Constant(i32::MAX))),
+        }));
+        let error = LootRegistry::empty()
+            .get_int(
                 &provider,
                 &Scoreboard::default(),
                 &CommandStorage::default(),
-                &execution_context,
-                &mut random,
-            ),
-            Ok(1.2)
+                &context(),
+                &mut LegacyRandom::default(),
+            )
+            .unwrap_err();
+        assert!(error.contains("bound must be positive"));
+    }
+
+    #[test]
+    fn float_modulus_evaluates_zero_right_operand_first() {
+        let provider = ProviderReference::Inline(Box::new(FloatProvider::Binary {
+            operation: FloatBinaryOperation::Modulus,
+            left: ProviderReference::Inline(Box::new(FloatProvider::Uniform {
+                min: ProviderReference::Inline(Box::new(FloatProvider::Constant(0.0))),
+                max: ProviderReference::Inline(Box::new(FloatProvider::Constant(1.0))),
+            })),
+            right: ProviderReference::Inline(Box::new(FloatProvider::Constant(0.0))),
+        }));
+        let mut actual_random = LegacyRandom::default();
+        let mut expected_random = LegacyRandom::default();
+
+        assert!(
+            LootRegistry::empty()
+                .get_float_unsafe(
+                    &provider,
+                    &Scoreboard::default(),
+                    &CommandStorage::default(),
+                    &context(),
+                    &mut actual_random,
+                )
+                .unwrap()
+                .is_nan()
         );
+        assert_eq!(actual_random.next_float(), expected_random.next_float());
+    }
+
+    #[test]
+    fn float_power_uses_java_special_cases() {
+        assert!(java_float_pow(1.0, f32::NAN).is_nan());
+        assert!(java_float_pow(1.0, f32::INFINITY).is_nan());
+        assert!(java_float_pow(-1.0, f32::NEG_INFINITY).is_nan());
+        assert_eq!(java_float_pow(f32::NAN, -0.0).to_bits(), 1.0_f32.to_bits());
+    }
+
+    #[test]
+    fn score_objective_preserves_java_utf16() {
+        let holder = JavaString::from("#holder");
+        let mut scoreboard = Scoreboard::default();
+        scoreboard.add_objective("\u{fffd}").unwrap();
         assert_eq!(
-            registry.get_int(
-                &provider,
-                &Scoreboard::default(),
-                &CommandStorage::default(),
-                &execution_context,
-                &mut random,
+            scoreboard.set_scores(
+                &crate::program::ScoreHolderSet::Named(holder.clone()),
+                "\u{fffd}",
+                7,
             ),
-            Ok(2)
+            Some(7)
+        );
+        let provider = ProviderReference::Inline(Box::new(IntProvider::Score {
+            holder,
+            objective: JavaString::from_units(vec![0xd800]),
+            fallback: ProviderReference::Inline(Box::new(IntProvider::Constant(1))),
+        }));
+
+        assert_eq!(
+            LootRegistry::empty()
+                .get_int_unsafe(
+                    &provider,
+                    &scoreboard,
+                    &CommandStorage::default(),
+                    &context(),
+                    &mut LegacyRandom::default(),
+                )
+                .unwrap(),
+            1
         );
     }
 }

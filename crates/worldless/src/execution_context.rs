@@ -250,12 +250,12 @@ fn wrap_degrees(angle: f32) -> f32 {
     normalized
 }
 
-fn mth_sin(value: f64) -> f32 {
+pub(crate) fn mth_sin(value: f64) -> f32 {
     let index = ((value * 10_430.378_350_470_453) as i64 & 65_535) as u16;
     sine_table_value(index)
 }
 
-fn mth_cos(value: f64) -> f32 {
+pub(crate) fn mth_cos(value: f64) -> f32 {
     let index = ((value * 10_430.378_350_470_453 + 16_384.0) as i64 & 65_535) as u16;
     sine_table_value(index)
 }

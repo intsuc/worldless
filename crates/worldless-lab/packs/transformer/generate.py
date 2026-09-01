@@ -117,20 +117,20 @@ def _score(name: str) -> dict[str, object]:
     }
 
 
-def _product(*operands: object) -> dict[str, object]:
-    return {"type": "product", "operands": list(operands)}
+def _mul(*inputs: object) -> dict[str, object]:
+    return {"type": "mul", "inputs": list(inputs)}
 
 
-def _sum(operands: list[object]) -> dict[str, object]:
-    return {"type": "sum", "operands": operands}
+def _add(inputs: list[object]) -> dict[str, object]:
+    return {"type": "add", "inputs": inputs}
 
 
 def _clamped_score(name: str) -> dict[str, object]:
     return {
-        "type": "maximum",
-        "operands": [
+        "type": "max",
+        "inputs": [
             -127,
-            {"type": "minimum", "operands": [127, _score(name)]},
+            {"type": "min", "inputs": [127, _score(name)]},
         ],
     }
 
@@ -140,23 +140,23 @@ def _round_shift_provider(source: object, shift: int) -> object:
         return source
     half = 1 << (shift - 1)
     clamped = {
-        "type": "maximum",
-        "operands": [-half, {"type": "minimum", "operands": [half, source]}],
+        "type": "max",
+        "inputs": [-half, {"type": "min", "inputs": [half, source]}],
     }
-    provider: object = {"type": "average", "operands": [source, clamped]}
+    provider: object = {"type": "avg", "inputs": [source, clamped]}
     for _ in range(shift - 1):
-        provider = {"type": "average", "operands": [provider, 0]}
+        provider = {"type": "avg", "inputs": [provider, 0]}
     return provider
 
 
 def _requantized_int8_provider(source: object, shift: int) -> object:
     return {
-        "type": "maximum",
-        "operands": [
+        "type": "max",
+        "inputs": [
             -127,
             {
-                "type": "minimum",
-                "operands": [127, _round_shift_provider(source, shift)],
+                "type": "min",
+                "inputs": [127, _round_shift_provider(source, shift)],
             },
         ],
     }
@@ -171,15 +171,15 @@ def _round_half_away_ratio(numerator: int, denominator: int) -> int:
 
 def _compute_to_score(name: str, provider: object) -> str:
     return (
-        f"execute store result score {name} transformer run compute default "
-        f"{_json(provider)} integer"
+        f"execute store result score {name} transformer run compute default integer "
+        f"{_json(provider)}"
     )
 
 
 def _append_clamped(path: str) -> str:
     return (
-        f"data modify storage transformer:runtime {path} append compute default "
-        f"{_json(_clamped_score('#requant'))} integer"
+        f"data modify storage transformer:runtime {path} append compute default integer "
+        f"{_json(_clamped_score('#requant'))}"
     )
 
 
@@ -283,8 +283,8 @@ def _dense_row(
         weight = _storage(
             matrix_storage, f"{matrix_path}[{row * input_width + column}]"
         )
-        terms.append(_product(source, weight))
-    return _sum(terms)
+        terms.append(_mul(source, weight))
+    return _add(terms)
 
 
 def _generate_projection(
@@ -297,7 +297,7 @@ def _generate_projection(
     for row in range(projection.output_width):
         lines.extend(
             (
-                "$data modify storage transformer:runtime state.acc set compute default "
+                "$data modify storage transformer:runtime state.acc set compute default integer "
                 + _json(
                     _dense_row(
                         source_path=projection.source_path,
@@ -306,9 +306,8 @@ def _generate_projection(
                         row=row,
                         input_width=projection.input_width,
                     )
-                )
-                + " integer",
-                f"$data modify storage transformer:runtime {projection.output_path} append compute default $(rq) integer",
+                ),
+                f"$data modify storage transformer:runtime {projection.output_path} append compute default integer $(rq)",
             )
         )
     _write(
@@ -322,11 +321,10 @@ def _generate_relu_squared(root: Path, spec: ModelSpec) -> None:
     lines = ["data modify storage transformer:runtime state.up_squared set value [I;]"]
     for index in range(spec.d_ff):
         source = _storage("transformer:runtime", f"state.up[{index}]")
-        positive = {"type": "maximum", "operands": [0, source]}
+        positive = {"type": "max", "inputs": [0, source]}
         lines.append(
-            "data modify storage transformer:runtime state.up_squared append compute default "
-            + _json(_product(positive, positive))
-            + " integer"
+            "data modify storage transformer:runtime state.up_squared append compute default integer "
+            + _json(_mul(positive, positive))
         )
     _write(root, FUNCTION_ROOT / "core/generated/relu_squared/run.mcfunction", lines)
 
@@ -335,31 +333,29 @@ def _generate_rms(root: Path, spec: ModelSpec) -> None:
     squares = []
     for index in range(spec.d_model):
         value = _storage("transformer:runtime", f"state.hidden[{index}]")
-        squares.append(_product(value, value))
+        squares.append(_mul(value, value))
     _write(
         root,
         FUNCTION_ROOT / "core/generated/rms/sum.mcfunction",
-        [_compute_to_score("#sum_square", _sum(squares))],
+        [_compute_to_score("#sum_square", _add(squares))],
     )
     lines = ["data modify storage transformer:runtime state.norm set value [I;]"]
     for index in range(spec.d_model):
-        product = _product(
+        product = _mul(
             _storage("transformer:runtime", f"state.hidden[{index}]"),
             _score("#gain"),
         )
         lines.extend(
             (
-                "data modify storage transformer:runtime state.acc set compute default "
-                + _json(product)
-                + " integer",
-                "data modify storage transformer:runtime state.norm append compute default "
+                "data modify storage transformer:runtime state.acc set compute default integer "
+                + _json(product),
+                "data modify storage transformer:runtime state.norm append compute default integer "
                 + _json(
                     _requantized_int8_provider(
                         _storage("transformer:runtime", "state.acc"),
                         RMS_GAIN_FRACTION_BITS,
                     )
-                )
-                + " integer",
+                ),
             )
         )
     _write(root, FUNCTION_ROOT / "core/generated/rms/normalize.mcfunction", lines)
@@ -369,14 +365,14 @@ def _generate_residual(root: Path, spec: ModelSpec) -> None:
     lines = ["data modify storage transformer:runtime state.hidden set value [I;]"]
     for index in range(spec.d_model):
         provider = {
-            "type": "maximum",
-            "operands": [
+            "type": "max",
+            "inputs": [
                 -127,
                 {
-                    "type": "minimum",
-                    "operands": [
+                    "type": "min",
+                    "inputs": [
                         127,
-                        _sum(
+                        _add(
                             [
                                 _storage(
                                     "transformer:runtime", f"state.residual[{index}]"
@@ -391,9 +387,8 @@ def _generate_residual(root: Path, spec: ModelSpec) -> None:
             ],
         }
         lines.append(
-            "data modify storage transformer:runtime state.hidden append compute default "
+            "data modify storage transformer:runtime state.hidden append compute default integer "
             + _json(provider)
-            + " integer"
         )
     _write(root, FUNCTION_ROOT / "core/generated/residual/run.mcfunction", lines)
 
@@ -410,7 +405,7 @@ def _generate_attention(root: Path, spec: ModelSpec) -> None:
             terms = []
             for dimension in range(spec.head_dim):
                 terms.append(
-                    _product(
+                    _mul(
                         _storage(
                             "transformer:runtime", f"state.q[{q_base + dimension}]"
                         ),
@@ -427,17 +422,15 @@ def _generate_attention(root: Path, spec: ModelSpec) -> None:
                 spec.alibi_slopes[head][1],
             )
             lines = [
-                "data modify storage transformer:runtime state.acc set compute default "
-                + _json(_sum(terms))
-                + " integer",
-                "execute store result score #score transformer run compute default "
+                "data modify storage transformer:runtime state.acc set compute default integer "
+                + _json(_add(terms)),
+                "execute store result score #score transformer run compute default integer "
                 + _json(
                     _round_shift_provider(
                         _storage("transformer:runtime", "state.acc"),
                         ATTENTION_SCORE_SHIFT,
                     )
-                )
-                + " integer",
+                ),
             ]
             if bias < 0:
                 lines.append(f"scoreboard players remove #score transformer {-bias}")
@@ -454,7 +447,7 @@ def _generate_attention(root: Path, spec: ModelSpec) -> None:
         terms = []
         for key in range(spec.attention_window):
             terms.append(
-                _product(
+                _mul(
                     _storage("transformer:runtime", f"state.weights[{key}]"),
                     _storage(
                         "transformer:runtime",
@@ -464,7 +457,7 @@ def _generate_attention(root: Path, spec: ModelSpec) -> None:
             )
         lines.extend(
             (
-                _compute_to_score("#acc", _sum(terms)),
+                _compute_to_score("#acc", _add(terms)),
                 "function transformer:core/requant/divide",
                 _append_clamped("state.attention"),
             )
@@ -499,7 +492,7 @@ def _generate_value_embedding(root: Path, spec: ModelSpec) -> None:
         base = token * width
         lines = []
         for dimension in range(width):
-            source = _sum(
+            source = _add(
                 [
                     _storage("transformer:runtime", f"state.v[{dimension}]"),
                     _storage(
@@ -509,9 +502,8 @@ def _generate_value_embedding(root: Path, spec: ModelSpec) -> None:
                 ]
             )
             lines.append(
-                f"$data modify storage transformer:runtime state.v[{dimension}] set compute default "
+                f"$data modify storage transformer:runtime state.v[{dimension}] set compute default integer "
                 + _json(_requantized_int8_provider(source, 0))
-                + " integer"
             )
         _write(
             root,
@@ -536,7 +528,7 @@ def _generate_logits(root: Path, spec: ModelSpec) -> None:
         for token in range(spec.vocab_size):
             base = token * spec.d_model
             terms = [
-                _product(
+                _mul(
                     _storage("transformer:runtime", f"state.norm[{dimension}]"),
                     _storage(
                         f"transformer:a{bank}",
@@ -547,7 +539,7 @@ def _generate_logits(root: Path, spec: ModelSpec) -> None:
             ]
             lines.extend(
                 (
-                    _compute_to_score("#acc", _sum(terms)),
+                    _compute_to_score("#acc", _add(terms)),
                     f"execute if score #acc transformer > #logit_max transformer run scoreboard players set #next_token transformer {token}",
                     "execute if score #acc transformer > #logit_max transformer run scoreboard players operation #logit_max transformer = #acc transformer",
                 )
@@ -639,14 +631,14 @@ def _generate_model_validator(root: Path, spec: ModelSpec) -> None:
     for count in sorted({shape[0] * shape[1] for shape in shapes.values()}):
         range_lines: list[str] = []
         for start in range(0, count, chunk_size):
-            operands = [
+            inputs = [
                 _storage("transformer:validation", f"matrix[{index}]")
                 for index in range(start, min(start + chunk_size, count))
             ]
             range_lines.extend(
                 (
                     _compute_to_score(
-                        "#minimum", {"type": "minimum", "operands": operands}
+                        "#minimum", {"type": "min", "inputs": inputs}
                     ),
                     "execute if score #minimum transformer matches ..-128 run scoreboard players set #valid transformer 0",
                 )

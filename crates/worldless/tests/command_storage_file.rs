@@ -86,7 +86,7 @@ fn loads_files_before_execution_and_keeps_vm_state_independent() {
         "return run data get storage probe:state value\n",
     )])])
     .unwrap();
-    let file = TestFile::new(&storage_file(5015, &[("state", 7), ("", 9)]));
+    let file = TestFile::new(&storage_file(5017, &[("state", 7), ("", 9)]));
     let mut loaded = program.create_vm(0);
     let untouched = program.create_vm(0);
 
@@ -134,7 +134,7 @@ fn loaded_storage_is_visible_to_macros_during_the_first_load_tick() {
         ),
     ])])
     .unwrap();
-    let file = TestFile::new(&storage_file(5015, &[("args", 7)]));
+    let file = TestFile::new(&storage_file(5017, &[("args", 7)]));
     let mut vm = program.create_vm(0);
 
     vm.load_command_storage_files([("probe", file.path())])
@@ -153,9 +153,9 @@ fn loaded_storage_is_visible_to_macros_during_the_first_load_tick() {
 
 #[test]
 fn validates_every_file_before_replacing_any_namespace() {
-    let valid = TestFile::new(&storage_file(5015, &[("new", 7)]));
-    let wrong_version = TestFile::new(&storage_file(5014, &[("ignored", 8)]));
-    let empty = TestFile::new(&storage_file(5015, &[]));
+    let valid = TestFile::new(&storage_file(5017, &[("new", 7)]));
+    let wrong_version = TestFile::new(&storage_file(5016, &[("ignored", 8)]));
+    let empty = TestFile::new(&storage_file(5017, &[]));
     let mut vm = empty_program().create_vm(0);
     vm.set_storage("probe:old", CompoundTag::from_snbt("{value:1}").unwrap())
         .unwrap();

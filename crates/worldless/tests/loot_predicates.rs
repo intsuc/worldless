@@ -29,7 +29,7 @@ impl TestPack {
         fs::create_dir(&root).unwrap();
         fs::write(
             root.join("pack.mcmeta"),
-            r#"{"pack":{"description":"test","min_format":[118,0],"max_format":[118,0]}}"#,
+            r#"{"pack":{"description":"test","min_format":[119,0],"max_format":[119,0]}}"#,
         )
         .unwrap();
         Self { root }
@@ -59,16 +59,20 @@ impl Drop for TestPack {
 
 fn resources(
     functions: &[(&str, &str)],
-    number_providers: &[(&str, &str)],
+    int_providers: &[(&str, &str)],
+    float_providers: &[(&str, &str)],
     predicates: &[(&str, &str)],
     predicate_tags: &[(&str, &str)],
 ) -> Result<Vm, LoadError> {
     let functions = functions
         .iter()
         .map(|(id, source)| MemoryResource::new(ResourceKind::Function, *id, *source));
-    let number_providers = number_providers
+    let int_providers = int_providers
         .iter()
-        .map(|(id, source)| MemoryResource::new(ResourceKind::NumberProvider, *id, *source));
+        .map(|(id, source)| MemoryResource::new(ResourceKind::ContextIntProvider, *id, *source));
+    let float_providers = float_providers
+        .iter()
+        .map(|(id, source)| MemoryResource::new(ResourceKind::ContextFloatProvider, *id, *source));
     let predicates = predicates
         .iter()
         .map(|(id, source)| MemoryResource::new(ResourceKind::Predicate, *id, *source));
@@ -77,7 +81,8 @@ fn resources(
         .map(|(id, source)| MemoryResource::new(ResourceKind::PredicateTag, *id, *source));
     CompiledProgram::from_packs([Pack::memory(
         functions
-            .chain(number_providers)
+            .chain(int_providers)
+            .chain(float_providers)
             .chain(predicates)
             .chain(predicate_tags),
     )])
@@ -86,11 +91,19 @@ fn resources(
 
 fn compile(
     functions: &[(&str, &str)],
-    number_providers: &[(&str, &str)],
+    int_providers: &[(&str, &str)],
+    float_providers: &[(&str, &str)],
     predicates: &[(&str, &str)],
     predicate_tags: &[(&str, &str)],
 ) -> Vm {
-    resources(functions, number_providers, predicates, predicate_tags).unwrap()
+    resources(
+        functions,
+        int_providers,
+        float_providers,
+        predicates,
+        predicate_tags,
+    )
+    .unwrap()
 }
 
 fn returned(success: bool, value: i32) -> ExecutionOutcome {
@@ -108,7 +121,7 @@ fn assert_function(vm: &mut Vm, function: &str, expected: ExecutionOutcome) {
 }
 
 #[test]
-fn composites_and_value_checks_follow_minecraft_semantics() {
+fn composites_and_typed_value_checks_follow_minecraft_semantics() {
     let predicates = [
         ("example:truth", r#"{"type":"all_of","terms":[]}"#),
         ("example:falsehood", r#"{"type":"any_of","terms":[]}"#),
@@ -129,32 +142,32 @@ fn composites_and_value_checks_follow_minecraft_semantics() {
             r#"{"type":"all_of","terms":"example:truth"}"#,
         ),
         (
-            "example:rounded_positive",
-            r#"{"type":"value_check","value":1.5,"range":2}"#,
+            "example:float_positive",
+            r#"{"type":"float_value_check","value":1.5,"test":1.5}"#,
         ),
         (
-            "example:rounded_negative",
-            r#"{"type":"value_check","value":-1.5,"range":-1}"#,
+            "example:float_negative",
+            r#"{"type":"float_value_check","value":-1.5,"test":-1.5}"#,
         ),
         (
             "example:minimum",
-            r#"{"type":"value_check","value":3,"range":{"min":3}}"#,
+            r#"{"type":"int_value_check","value":3,"test":{"min":3}}"#,
         ),
         (
             "example:maximum",
-            r#"{"type":"value_check","value":3,"range":{"max":3}}"#,
+            r#"{"type":"int_value_check","value":3,"test":{"max":3}}"#,
         ),
         (
             "example:closed",
-            r#"{"type":"value_check","value":3,"range":{"min":3,"max":3}}"#,
+            r#"{"type":"int_value_check","value":3,"test":{"min":3,"max":3}}"#,
         ),
         (
             "example:unbounded",
-            r#"{"type":"value_check","value":123,"range":{}}"#,
+            r#"{"type":"int_value_check","value":123,"test":{}}"#,
         ),
         (
             "example:outside",
-            r#"{"type":"value_check","value":3,"range":{"min":4,"max":2}}"#,
+            r#"{"type":"int_value_check","value":3,"test":{"min":4,"max":2}}"#,
         ),
     ];
     let functions = [
@@ -183,12 +196,12 @@ fn composites_and_value_checks_follow_minecraft_semantics() {
             "return run execute if predicate example:compact_terms\n",
         ),
         (
-            "example:rounded_positive",
-            "return run execute if predicate example:rounded_positive\n",
+            "example:float_positive",
+            "return run execute if predicate example:float_positive\n",
         ),
         (
-            "example:rounded_negative",
-            "return run execute if predicate example:rounded_negative\n",
+            "example:float_negative",
+            "return run execute if predicate example:float_negative\n",
         ),
         (
             "example:minimum",
@@ -211,7 +224,7 @@ fn composites_and_value_checks_follow_minecraft_semantics() {
             "return run execute unless predicate example:outside\n",
         ),
     ];
-    let mut vm = compile(&functions, &[], &predicates, &[]);
+    let mut vm = compile(&functions, &[], &[], &predicates, &[]);
 
     for function in [
         "example:truth",
@@ -219,8 +232,8 @@ fn composites_and_value_checks_follow_minecraft_semantics() {
         "example:all",
         "example:any",
         "example:compact_terms",
-        "example:rounded_positive",
-        "example:rounded_negative",
+        "example:float_positive",
+        "example:float_negative",
         "example:minimum",
         "example:maximum",
         "example:closed",
@@ -247,10 +260,11 @@ fn resources_tags_references_and_inline_predicates_resolve() {
             ),
             (
                 "example:inline_predicate",
-                r#"return run execute if predicate {type:"value_check",value:1.5,range:2} run return 7
+                r#"return run execute if predicate {type:"float_value_check",value:1.5,test:1.5} run return 7
 "#,
             ),
         ],
+        &[],
         &[],
         &[
             ("example:truth", r#"{"type":"all_of","terms":[]}"#),
@@ -341,6 +355,7 @@ fn vanilla_world_dependent_predicates_exist_with_their_worldless_result() {
             ),
         ],
         &[],
+        &[],
         &[(
             "example:tagged_shears",
             r##"{"type":"all_of","terms":"#example:shears"}"##,
@@ -405,6 +420,7 @@ fn absent_command_context_parameters_produce_their_minecraft_results() {
             ),
         ],
         &[("example:bound", "1")],
+        &[],
         &[
             ("example:survives", r#"{"type":"survives_explosion"}"#),
             ("example:killed", r#"{"type":"killed_by_player"}"#),
@@ -507,6 +523,7 @@ fn missing_required_context_is_an_evaluation_error_and_respects_short_circuiting
             ),
         ],
         &[],
+        &[],
         &[
             (
                 "example:active_true",
@@ -569,20 +586,20 @@ fn context_absent_predicate_codecs_are_validated_at_load_time() {
         "interacting_entity",
     ] {
         let source = format!(r#"{{"type":"entity_scores","scores":{{}},"entity":"{entity}"}}"#);
-        resources(&[], &[], &[("example:test", &source)], &[]).unwrap();
+        resources(&[], &[], &[], &[("example:test", &source)], &[]).unwrap();
     }
 
     for source in [
         r#"{"type":"match_tool","predicate":{"unknown":1}}"#,
         r#"{"type":"damage_source_properties","predicate":{"unknown":1}}"#,
     ] {
-        resources(&[], &[], &[("example:test", source)], &[]).unwrap();
+        resources(&[], &[], &[], &[("example:test", source)], &[]).unwrap();
     }
 
     for (source, expected) in [
         (
             r#"{"type":"entity_scores","scores":{"points":{"min":"example:missing"}},"entity":"this"}"#,
-            "number provider `example:missing` does not exist",
+            "provider `example:missing` does not exist",
         ),
         (
             r#"{"type":"entity_scores","scores":{},"entity":"invalid"}"#,
@@ -605,7 +622,7 @@ fn context_absent_predicate_codecs_are_validated_at_load_time() {
             "must be a boolean",
         ),
     ] {
-        let error = resources(&[], &[], &[("example:test", source)], &[]).unwrap_err();
+        let error = resources(&[], &[], &[], &[("example:test", source)], &[]).unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
     }
 }
@@ -632,6 +649,7 @@ fn macro_instantiation_uses_the_same_predicate_registry_and_inline_parser() {
             ),
         ],
         &[],
+        &[],
         &[("example:truth", r#"{"type":"all_of","terms":[]}"#)],
         &[],
     );
@@ -644,8 +662,9 @@ fn uniform_after(predicate: &str, predicate_tags: &[(&str, &str)]) -> i32 {
     let mut vm = compile(
         &[(
             "example:main",
-            "execute if predicate example:test\nreturn run compute default {type:uniform,min:0,max:10}\n",
+            "execute if predicate example:test\nreturn run compute default float {type:uniform,min:0,max:10}\n",
         )],
+        &[],
         &[],
         &[
             ("example:truth", r#"{"type":"all_of","terms":[]}"#),
@@ -713,9 +732,10 @@ fn random_chance_evaluates_its_provider_before_sampling() {
             ),
             (
                 "example:next",
-                "return run compute default {type:uniform,min:0,max:10}\n",
+                "return run compute default float {type:uniform,min:0,max:10}\n",
             ),
         ],
+        &[],
         &[],
         &[(
             "example:random",
@@ -732,6 +752,7 @@ fn random_chance_evaluates_its_provider_before_sampling() {
             "example:test",
             "return run execute if predicate example:random\n",
         )],
+        &[],
         &[("example:chance", "0.75")],
         &[(
             "example:random",
@@ -794,6 +815,7 @@ fn predicate_conditions_publish_terminal_results_and_preserve_modifier_order() {
             ),
         ],
         &[],
+        &[],
         &[
             ("example:truth", r#"{"type":"all_of","terms":[]}"#),
             ("example:falsehood", r#"{"type":"any_of","terms":[]}"#),
@@ -819,31 +841,31 @@ fn conditional_and_dispatcher_select_their_minecraft_branches() {
         &[
             (
                 "example:conditional_true",
-                "return run compute default example:conditional_true integer\n",
+                "return run compute default integer example:conditional_true\n",
             ),
             (
                 "example:conditional_false",
-                "return run compute default example:conditional_false integer\n",
+                "return run compute default integer example:conditional_false\n",
             ),
             (
                 "example:conditional_default",
-                "return run compute default example:conditional_default integer\n",
+                "return run compute default integer example:conditional_default\n",
             ),
             (
                 "example:inline_conditional",
-                "return run compute default {type:conditional,condition:{type:all_of,terms:[]},on_true:6} integer\n",
+                "return run compute default integer {type:conditional,condition:{type:all_of,terms:[]},on_true:6}\n",
             ),
             (
                 "example:dispatcher",
-                "return run compute default example:dispatcher integer\n",
+                "return run compute default integer example:dispatcher\n",
             ),
             (
                 "example:dispatcher_default",
-                "return run compute default example:dispatcher_default integer\n",
+                "return run compute default integer example:dispatcher_default\n",
             ),
             (
                 "example:dispatcher_implicit",
-                "return run compute default example:dispatcher_implicit integer\n",
+                "return run compute default integer example:dispatcher_implicit\n",
             ),
         ],
         &[
@@ -861,17 +883,18 @@ fn conditional_and_dispatcher_select_their_minecraft_branches() {
             ),
             (
                 "example:dispatcher",
-                r#"{"type":"number_dispatcher","cases":[{"condition":"example:falsehood","number_provider":100},{"condition":"example:truth","number_provider":4},{"condition":"example:truth","number_provider":9}],"default":11}"#,
+                r#"{"type":"number_dispatcher","cases":[{"condition":"example:falsehood","value":100},{"condition":"example:truth","value":4},{"condition":"example:truth","value":9}],"default":11}"#,
             ),
             (
                 "example:dispatcher_default",
-                r#"{"type":"number_dispatcher","cases":[{"condition":"example:falsehood","number_provider":100}],"default":11}"#,
+                r#"{"type":"number_dispatcher","cases":[{"condition":"example:falsehood","value":100}],"default":11}"#,
             ),
             (
                 "example:dispatcher_implicit",
-                r#"{"type":"number_dispatcher","cases":[{"condition":"example:falsehood","number_provider":100}]}"#,
+                r#"{"type":"number_dispatcher","cases":[{"condition":"example:falsehood","value":100}]}"#,
             ),
         ],
+        &[],
         &[
             ("example:truth", r#"{"type":"all_of","terms":[]}"#),
             ("example:falsehood", r#"{"type":"any_of","terms":[]}"#),
@@ -903,11 +926,11 @@ fn conditional_and_dispatcher_do_not_evaluate_unselected_values_or_later_cases()
         &[
             (
                 "example:conditional",
-                "return run compute default example:conditional integer\n",
+                "return run compute default integer example:conditional\n",
             ),
             (
                 "example:next",
-                "return run compute default example:uniform\n",
+                "return run compute default float example:uniform\n",
             ),
         ],
         &[
@@ -917,6 +940,7 @@ fn conditional_and_dispatcher_do_not_evaluate_unselected_values_or_later_cases()
                 r#"{"type":"conditional","condition":"example:falsehood","on_true":"example:uniform","on_false":4}"#,
             ),
         ],
+        &[("example:uniform", r#"{"type":"uniform","min":0,"max":10}"#)],
         &predicates,
         &[],
     );
@@ -927,20 +951,21 @@ fn conditional_and_dispatcher_do_not_evaluate_unselected_values_or_later_cases()
         &[
             (
                 "example:dispatcher",
-                "return run compute default example:dispatcher integer\n",
+                "return run compute default integer example:dispatcher\n",
             ),
             (
                 "example:next",
-                "return run compute default example:uniform\n",
+                "return run compute default float example:uniform\n",
             ),
         ],
         &[
             ("example:uniform", r#"{"type":"uniform","min":0,"max":10}"#),
             (
                 "example:dispatcher",
-                r#"{"type":"number_dispatcher","cases":[{"condition":"example:falsehood","number_provider":"example:uniform"},{"condition":"example:truth","number_provider":4},{"condition":"example:random","number_provider":5}],"default":6}"#,
+                r#"{"type":"number_dispatcher","cases":[{"condition":"example:falsehood","value":"example:uniform"},{"condition":"example:truth","value":4},{"condition":"example:random","value":5}],"default":6}"#,
             ),
         ],
+        &[("example:uniform", r#"{"type":"uniform","min":0,"max":10}"#)],
         &predicates,
         &[],
     );
@@ -983,7 +1008,7 @@ fn invalid_predicates_references_and_cross_registry_cycles_are_rejected() {
             "does not exist",
         ),
     ] {
-        let error = resources(&[], &[], &[(id, source)], &[]).unwrap_err();
+        let error = resources(&[], &[], &[], &[(id, source)], &[]).unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
     }
 
@@ -995,6 +1020,7 @@ fn invalid_predicates_references_and_cross_registry_cycles_are_rejected() {
         )],
         &[],
         &[],
+        &[],
     )
     .unwrap_err();
     assert!(
@@ -1003,6 +1029,7 @@ fn invalid_predicates_references_and_cross_registry_cycles_are_rejected() {
     );
 
     let predicate_cycle = resources(
+        &[],
         &[],
         &[],
         &[
@@ -1026,6 +1053,7 @@ fn invalid_predicates_references_and_cross_registry_cycles_are_rejected() {
     let resource_tag_cycle = resources(
         &[],
         &[],
+        &[],
         &[(
             "example:predicate",
             r##"{"type":"all_of","terms":"#example:self"}"##,
@@ -1039,6 +1067,7 @@ fn invalid_predicates_references_and_cross_registry_cycles_are_rejected() {
     );
 
     let tag_cycle = resources(
+        &[],
         &[],
         &[],
         &[],
@@ -1056,9 +1085,10 @@ fn invalid_predicates_references_and_cross_registry_cycles_are_rejected() {
             "example:provider",
             r#"{"type":"conditional","condition":"example:predicate","on_true":1}"#,
         )],
+        &[],
         &[(
             "example:predicate",
-            r#"{"type":"value_check","value":"example:provider","range":1}"#,
+            r#"{"type":"int_value_check","value":"example:provider","test":1}"#,
         )],
         &[],
     )
@@ -1069,6 +1099,7 @@ fn invalid_predicates_references_and_cross_registry_cycles_are_rejected() {
     );
 
     let random_chance_cycle = resources(
+        &[],
         &[],
         &[(
             "example:provider",
@@ -1092,6 +1123,7 @@ fn invalid_predicates_references_and_cross_registry_cycles_are_rejected() {
     ] {
         let error = resources(
             &[("example:invalid", command)],
+            &[],
             &[],
             &[("example:truth", r#"{"type":"all_of","terms":[]}"#)],
             &[("example:predicates", r#"{"values":["example:truth"]}"#)],

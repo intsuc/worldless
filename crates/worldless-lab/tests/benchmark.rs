@@ -28,7 +28,7 @@ impl BenchmarkFixture {
         fs::create_dir_all(functions.join("model")).unwrap();
         fs::write(
             pack.join("pack.mcmeta"),
-            r#"{"pack":{"description":"benchmark test","min_format":[118,0],"max_format":[118,0]}}"#,
+            r#"{"pack":{"description":"benchmark test","min_format":[119,0],"max_format":[119,0]}}"#,
         )
         .unwrap();
         fs::write(
@@ -80,7 +80,7 @@ fn model_storage_file() -> Vec<u8> {
     let mut output = Vec::new();
     push_named_header(&mut output, 10, "");
     push_named_header(&mut output, 3, "DataVersion");
-    output.extend_from_slice(&5015_i32.to_be_bytes());
+    output.extend_from_slice(&5017_i32.to_be_bytes());
     push_named_header(&mut output, 10, "data");
     push_named_header(&mut output, 10, "contents");
     push_named_header(&mut output, 10, "model");
@@ -222,7 +222,7 @@ fn empty_storage_file() -> Vec<u8> {
     let mut output = Vec::new();
     push_named_header(&mut output, 10, "");
     push_named_header(&mut output, 3, "DataVersion");
-    output.extend_from_slice(&5015_i32.to_be_bytes());
+    output.extend_from_slice(&5017_i32.to_be_bytes());
     push_named_header(&mut output, 10, "data");
     push_named_header(&mut output, 10, "contents");
     output.extend_from_slice(&[0, 0, 0]);

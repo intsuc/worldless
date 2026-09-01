@@ -32,8 +32,11 @@ use crate::{
     macro_function::{Function, FunctionBuilder, MAX_COMMAND_LENGTH},
     nbt::{CompoundTag, JavaString, NbtPath, Tag, parse_compound, parse_path, parse_tag},
     number_provider::{
-        LootRegistry, NumberProviderReference, RegistryResource, RegistryValidationError,
-        parse_inline_tag as parse_inline_number_provider, parse_json as parse_number_provider_json,
+        FloatProviderReference, IntProviderReference, LootRegistry, ProviderReference,
+        RegistryResource, RegistryValidationError, parse_float_json as parse_float_provider_json,
+        parse_inline_float_tag as parse_inline_float_provider,
+        parse_inline_int_tag as parse_inline_int_provider,
+        parse_int_json as parse_int_provider_json,
     },
     pack::{Pack, PackSource, ResourceKind},
     predicate::{
@@ -41,11 +44,11 @@ use crate::{
         parse_json as parse_predicate_json,
     },
     program::{
-        Command as CompiledCommand, ComputeCommand, ComputeMode, DataCommand, DataModifyOperation,
-        DataSource, DataStringSubstring, DoubleRange, FunctionArguments, Instruction, IntegerRange,
-        Modifier, PredicateCondition, Program, RandomCommand, RandomSequenceSettings,
-        ScheduleCommand, ScheduleMode, ScoreComparison, ScoreCondition, ScoreHolderSet,
-        ScorePredicate, ScoreReference, ScoreboardCommand, ScoreboardOperation, StopwatchCommand,
+        Command as CompiledCommand, ComputeCommand, DataCommand, DataModifyOperation, DataSource,
+        DataStringSubstring, DoubleRange, FunctionArguments, Instruction, IntegerRange, Modifier,
+        PredicateCondition, Program, RandomCommand, RandomSequenceSettings, ScheduleCommand,
+        ScheduleMode, ScoreComparison, ScoreCondition, ScoreHolderSet, ScorePredicate,
+        ScoreReference, ScoreboardCommand, ScoreboardOperation, StopwatchCommand,
         StopwatchCondition, StorageCondition, StorageNumberType, StoreKind,
     },
     resource::{FunctionReference, Identifier, is_allowed_in_identifier},
@@ -53,7 +56,7 @@ use crate::{
 };
 
 const TARGET_PACK_FORMAT: PackFormat = PackFormat {
-    major: 118,
+    major: 119,
     minor: 0,
 };
 const LAST_PRE_MINOR_DATA_PACK_FORMAT: i32 = 81;
@@ -110,11 +113,19 @@ pub enum LoadError {
         origin: ResourceOrigin,
         reason: String,
     },
-    InvalidNumberProvider {
+    InvalidContextIntProvider {
         origin: ResourceOrigin,
         reason: String,
     },
-    InvalidNumberProviderTag {
+    InvalidContextIntProviderTag {
+        origin: ResourceOrigin,
+        reason: String,
+    },
+    InvalidContextFloatProvider {
+        origin: ResourceOrigin,
+        reason: String,
+    },
+    InvalidContextFloatProviderTag {
         origin: ResourceOrigin,
         reason: String,
     },
@@ -167,11 +178,26 @@ impl fmt::Display for LoadError {
             Self::InvalidFunctionTag { origin, reason } => {
                 write!(formatter, "invalid function tag {origin}: {reason}")
             }
-            Self::InvalidNumberProvider { origin, reason } => {
-                write!(formatter, "invalid number provider {origin}: {reason}")
+            Self::InvalidContextIntProvider { origin, reason } => {
+                write!(formatter, "invalid context int provider {origin}: {reason}")
             }
-            Self::InvalidNumberProviderTag { origin, reason } => {
-                write!(formatter, "invalid number provider tag {origin}: {reason}")
+            Self::InvalidContextIntProviderTag { origin, reason } => {
+                write!(
+                    formatter,
+                    "invalid context int provider tag {origin}: {reason}"
+                )
+            }
+            Self::InvalidContextFloatProvider { origin, reason } => {
+                write!(
+                    formatter,
+                    "invalid context float provider {origin}: {reason}"
+                )
+            }
+            Self::InvalidContextFloatProviderTag { origin, reason } => {
+                write!(
+                    formatter,
+                    "invalid context float provider tag {origin}: {reason}"
+                )
             }
             Self::InvalidPredicate { origin, reason } => {
                 write!(formatter, "invalid predicate {origin}: {reason}")
@@ -192,11 +218,13 @@ impl Error for LoadError {
     }
 }
 
-const RESOURCE_KINDS: [ResourceKind; 6] = [
+const RESOURCE_KINDS: [ResourceKind; 8] = [
     ResourceKind::Function,
     ResourceKind::FunctionTag,
-    ResourceKind::NumberProvider,
-    ResourceKind::NumberProviderTag,
+    ResourceKind::ContextIntProvider,
+    ResourceKind::ContextIntProviderTag,
+    ResourceKind::ContextFloatProvider,
+    ResourceKind::ContextFloatProviderTag,
     ResourceKind::Predicate,
     ResourceKind::PredicateTag,
 ];
@@ -220,14 +248,24 @@ fn resource_kind_info(kind: ResourceKind) -> ResourceKindInfo {
             directory: "tags/function",
             extension: ".json",
         },
-        ResourceKind::NumberProvider => ResourceKindInfo {
-            name: "number provider",
-            directory: "number_provider",
+        ResourceKind::ContextIntProvider => ResourceKindInfo {
+            name: "context int provider",
+            directory: "context_int_provider",
             extension: ".json",
         },
-        ResourceKind::NumberProviderTag => ResourceKindInfo {
-            name: "number provider tag",
-            directory: "tags/number_provider",
+        ResourceKind::ContextIntProviderTag => ResourceKindInfo {
+            name: "context int provider tag",
+            directory: "tags/context_int_provider",
+            extension: ".json",
+        },
+        ResourceKind::ContextFloatProvider => ResourceKindInfo {
+            name: "context float provider",
+            directory: "context_float_provider",
+            extension: ".json",
+        },
+        ResourceKind::ContextFloatProviderTag => ResourceKindInfo {
+            name: "context float provider tag",
+            directory: "tags/context_float_provider",
             extension: ".json",
         },
         ResourceKind::Predicate => ResourceKindInfo {
@@ -397,25 +435,44 @@ fn inventory_memory_pack(
 }
 
 fn compile_inventory(inventory: &ResourceInventory) -> Result<Program, LoadError> {
-    let mut number_providers = HashMap::new();
-    let mut number_provider_origins = HashMap::new();
-    for (id, stack) in inventory.sorted_stacks(ResourceKind::NumberProvider) {
+    let mut int_providers = HashMap::new();
+    let mut int_provider_origins = HashMap::new();
+    for (id, stack) in inventory.sorted_stacks(ResourceKind::ContextIntProvider) {
         let resource = stack
             .last()
             .expect("every inventoried resource stack is nonempty");
         let source = resource.contents()?;
-        let provider = parse_number_provider_json(&source).map_err(|reason| {
-            LoadError::InvalidNumberProvider {
+        let provider = parse_int_provider_json(&source).map_err(|reason| {
+            LoadError::InvalidContextIntProvider {
                 origin: resource.origin.clone(),
                 reason,
             }
         })?;
-        number_provider_origins.insert(id.clone(), resource.origin.clone());
-        number_providers.insert(id.clone(), provider);
+        int_provider_origins.insert(id.clone(), resource.origin.clone());
+        int_providers.insert(id.clone(), provider);
     }
 
-    let unresolved_number_provider_tags =
-        compose_resource_tags(inventory, ResourceKind::NumberProviderTag)?;
+    let unresolved_int_provider_tags =
+        compose_resource_tags(inventory, ResourceKind::ContextIntProviderTag)?;
+    let mut float_providers = HashMap::new();
+    let mut float_provider_origins = HashMap::new();
+    for (id, stack) in inventory.sorted_stacks(ResourceKind::ContextFloatProvider) {
+        let resource = stack
+            .last()
+            .expect("every inventoried resource stack is nonempty");
+        let source = resource.contents()?;
+        let provider = parse_float_provider_json(&source).map_err(|reason| {
+            LoadError::InvalidContextFloatProvider {
+                origin: resource.origin.clone(),
+                reason,
+            }
+        })?;
+        float_provider_origins.insert(id.clone(), resource.origin.clone());
+        float_providers.insert(id.clone(), provider);
+    }
+
+    let unresolved_float_provider_tags =
+        compose_resource_tags(inventory, ResourceKind::ContextFloatProviderTag)?;
     let mut predicates = HashMap::new();
     let mut predicate_origins = HashMap::new();
     for (id, stack) in inventory.sorted_stacks(ResourceKind::Predicate) {
@@ -434,15 +491,27 @@ fn compile_inventory(inventory: &ResourceInventory) -> Result<Program, LoadError
     let unresolved_predicate_tags = compose_resource_tags(inventory, ResourceKind::PredicateTag)?;
 
     let empty_loot_registry = LootRegistry::empty();
-    let mut provider_ids = empty_loot_registry.number_provider_ids();
-    provider_ids.extend(number_providers.keys().cloned());
-    let number_provider_tags = resolve_resource_tags(
-        &provider_ids,
-        &unresolved_number_provider_tags,
-        "number provider",
-        "number provider tag",
+    let mut int_provider_ids = empty_loot_registry.int_provider_ids();
+    int_provider_ids.extend(int_providers.keys().cloned());
+    let int_provider_tags = resolve_resource_tags(
+        &int_provider_ids,
+        &unresolved_int_provider_tags,
+        "context int provider",
+        "context int provider tag",
     )
-    .map_err(|error| LoadError::InvalidNumberProviderTag {
+    .map_err(|error| LoadError::InvalidContextIntProviderTag {
+        origin: error.origin,
+        reason: error.reason,
+    })?;
+    let mut float_provider_ids = empty_loot_registry.float_provider_ids();
+    float_provider_ids.extend(float_providers.keys().cloned());
+    let float_provider_tags = resolve_resource_tags(
+        &float_provider_ids,
+        &unresolved_float_provider_tags,
+        "context float provider",
+        "context float provider tag",
+    )
+    .map_err(|error| LoadError::InvalidContextFloatProviderTag {
         origin: error.origin,
         reason: error.reason,
     })?;
@@ -460,15 +529,24 @@ fn compile_inventory(inventory: &ResourceInventory) -> Result<Program, LoadError
     })?;
     let loot_registry = Arc::new(
         LootRegistry::new(
-            number_providers,
-            number_provider_tags,
+            int_providers,
+            int_provider_tags,
+            float_providers,
+            float_provider_tags,
             predicates,
             predicate_tags,
         )
         .map_err(
             |RegistryValidationError { resource, reason }| match resource {
-                RegistryResource::NumberProvider(id) => LoadError::InvalidNumberProvider {
-                    origin: number_provider_origins
+                RegistryResource::IntProvider(id) => LoadError::InvalidContextIntProvider {
+                    origin: int_provider_origins
+                        .get(&id)
+                        .expect("validation errors are attributed to selected resources")
+                        .clone(),
+                    reason,
+                },
+                RegistryResource::FloatProvider(id) => LoadError::InvalidContextFloatProvider {
+                    origin: float_provider_origins
                         .get(&id)
                         .expect("validation errors are attributed to selected resources")
                         .clone(),
@@ -540,11 +618,17 @@ fn compose_resource_tags(
 fn invalid_tag_resource(kind: ResourceKind, origin: ResourceOrigin, reason: String) -> LoadError {
     match kind {
         ResourceKind::FunctionTag => LoadError::InvalidFunctionTag { origin, reason },
-        ResourceKind::NumberProviderTag => LoadError::InvalidNumberProviderTag { origin, reason },
-        ResourceKind::PredicateTag => LoadError::InvalidPredicateTag { origin, reason },
-        ResourceKind::Function | ResourceKind::NumberProvider | ResourceKind::Predicate => {
-            unreachable!("only tag resource kinds are composed as stacks")
+        ResourceKind::ContextIntProviderTag => {
+            LoadError::InvalidContextIntProviderTag { origin, reason }
         }
+        ResourceKind::ContextFloatProviderTag => {
+            LoadError::InvalidContextFloatProviderTag { origin, reason }
+        }
+        ResourceKind::PredicateTag => LoadError::InvalidPredicateTag { origin, reason },
+        ResourceKind::Function
+        | ResourceKind::ContextIntProvider
+        | ResourceKind::ContextFloatProvider
+        | ResourceKind::Predicate => unreachable!("only tag resource kinds are composed as stacks"),
     }
 }
 
@@ -893,7 +977,7 @@ fn validate_pack_format(path: &Path, pack: &Map<String, Value>) -> Result<(), Lo
     let (Some(min_value), Some(max_value)) = (min_value, max_value) else {
         return Err(invalid_pack(
             path,
-            "pack format 118 requires `min_format` and `max_format`",
+            "pack format 119 requires `min_format` and `max_format`",
         ));
     };
     let min = parse_pack_format(path, "min_format", min_value, 0)?;
@@ -1903,9 +1987,9 @@ fn compute_command_branch(
     let float: Command<LoweringSource> = Rc::new(|context| {
         context
             .source()
-            .record(CompiledCommand::Compute(ComputeCommand {
-                provider: number_provider(context, "provider"),
-                mode: ComputeMode::Float { scale: 1.0 },
+            .record(CompiledCommand::Compute(ComputeCommand::Float {
+                provider: float_provider(context, "provider"),
+                scale: 1.0,
             }))
     });
     let scaled: Command<LoweringSource> = Rc::new(|context| {
@@ -1913,35 +1997,44 @@ fn compute_command_branch(
             .expect("scaled compute is attached below its scale argument");
         context
             .source()
-            .record(CompiledCommand::Compute(ComputeCommand {
-                provider: number_provider(context, "provider"),
-                mode: ComputeMode::Float { scale },
+            .record(CompiledCommand::Compute(ComputeCommand::Float {
+                provider: float_provider(context, "provider"),
+                scale,
             }))
     });
     let integer: Command<LoweringSource> = Rc::new(|context| {
         context
             .source()
-            .record(CompiledCommand::Compute(ComputeCommand {
-                provider: number_provider(context, "provider"),
-                mode: ComputeMode::Integer,
+            .record(CompiledCommand::Compute(ComputeCommand::Integer {
+                provider: int_provider(context, "provider"),
             }))
     });
-    let provider =
-        RequiredArgumentBuilder::argument("provider", NumberProviderArgument::new(loot_registry))
-            .executes(float)
-            .then(
-                RequiredArgumentBuilder::argument("scale", FloatArgumentType::float())
-                    .executes(scaled),
-            )
-            .expect("a compute provider can contain a scale")
-            .then(LiteralArgumentBuilder::literal("integer").executes(integer))
-            .expect("a compute provider can contain the integer literal");
+    let float_provider = RequiredArgumentBuilder::argument(
+        "provider",
+        FloatProviderArgument::new(Arc::clone(&loot_registry)),
+    )
+    .executes(float)
+    .then(RequiredArgumentBuilder::argument("scale", FloatArgumentType::float()).executes(scaled))
+    .expect("a float compute provider can contain a scale");
+    let int_provider =
+        RequiredArgumentBuilder::argument("provider", IntProviderArgument::new(loot_registry))
+            .executes(integer);
 
     LiteralArgumentBuilder::literal("compute")
         .then(
             LiteralArgumentBuilder::literal("default")
-                .then(provider)
-                .expect("the default context can contain a provider"),
+                .then(
+                    LiteralArgumentBuilder::literal("float")
+                        .then(float_provider)
+                        .expect("float compute can contain a provider"),
+                )
+                .expect("the default context can contain float compute")
+                .then(
+                    LiteralArgumentBuilder::literal("integer")
+                        .then(int_provider)
+                        .expect("integer compute can contain a provider"),
+                )
+                .expect("the default context can contain integer compute"),
         )
         .expect("compute can contain the default context")
 }
@@ -2436,33 +2529,44 @@ fn modify_compute_source(
         record_data_modify(
             context,
             operation(context),
-            DataSource::Compute {
-                provider: number_provider(context, "provider"),
-                integer: false,
-            },
+            DataSource::ComputeFloat(float_provider(context, "provider")),
         )
     });
     let integer: Command<LoweringSource> = Rc::new(move |context| {
         record_data_modify(
             context,
             operation(context),
-            DataSource::Compute {
-                provider: number_provider(context, "provider"),
-                integer: true,
-            },
+            DataSource::ComputeInteger(int_provider(context, "provider")),
         )
     });
-    let provider =
-        RequiredArgumentBuilder::argument("provider", NumberProviderArgument::new(loot_registry))
-            .executes(float)
-            .then(LiteralArgumentBuilder::literal("integer").executes(integer))
-            .expect("a data compute provider can contain the integer literal");
 
     LiteralArgumentBuilder::literal("compute")
         .then(
             LiteralArgumentBuilder::literal("default")
-                .then(provider)
-                .expect("the default context can contain a provider"),
+                .then(
+                    LiteralArgumentBuilder::literal("float")
+                        .then(
+                            RequiredArgumentBuilder::argument(
+                                "provider",
+                                FloatProviderArgument::new(Arc::clone(&loot_registry)),
+                            )
+                            .executes(float),
+                        )
+                        .expect("float data compute can contain a provider"),
+                )
+                .expect("the default context can contain float data compute")
+                .then(
+                    LiteralArgumentBuilder::literal("integer")
+                        .then(
+                            RequiredArgumentBuilder::argument(
+                                "provider",
+                                IntProviderArgument::new(loot_registry),
+                            )
+                            .executes(integer),
+                        )
+                        .expect("integer data compute can contain a provider"),
+                )
+                .expect("the default context can contain integer data compute"),
         )
         .expect("a computed data source can contain the default context")
 }
@@ -3082,14 +3186,18 @@ fn function_reference(context: &CommandContext<LoweringSource>) -> FunctionRefer
         .expect("the function executor is attached below its name argument")
 }
 
-fn number_provider(
-    context: &CommandContext<LoweringSource>,
-    name: &str,
-) -> NumberProviderReference {
+fn int_provider(context: &CommandContext<LoweringSource>, name: &str) -> IntProviderReference {
     context
-        .argument::<NumberProviderReference>(name)
+        .argument::<IntProviderReference>(name)
         .map(|provider| (*provider).clone())
-        .expect("the command executor is attached below its number provider argument")
+        .expect("the command executor is attached below its context int provider argument")
+}
+
+fn float_provider(context: &CommandContext<LoweringSource>, name: &str) -> FloatProviderReference {
+    context
+        .argument::<FloatProviderReference>(name)
+        .map(|provider| (*provider).clone())
+        .expect("the command executor is attached below its context float provider argument")
 }
 
 fn position_coordinates(
@@ -3455,18 +3563,18 @@ impl ArgumentType<LoweringSource> for TimeArgument {
 }
 
 #[derive(Clone)]
-struct NumberProviderArgument {
+struct IntProviderArgument {
     registry: Arc<LootRegistry>,
 }
 
-impl NumberProviderArgument {
+impl IntProviderArgument {
     fn new(registry: Arc<LootRegistry>) -> Self {
         Self { registry }
     }
 }
 
-impl ArgumentType<LoweringSource> for NumberProviderArgument {
-    type Value = NumberProviderReference;
+impl ArgumentType<LoweringSource> for IntProviderArgument {
+    type Value = IntProviderReference;
 
     fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
         let start = reader.cursor();
@@ -3476,11 +3584,11 @@ impl ArgumentType<LoweringSource> for NumberProviderArgument {
         if reader.cursor() != start {
             let raw = reader.substring(start, reader.cursor());
             if let Some(identifier) = Identifier::parse(&raw) {
-                if self.registry.contains_number_provider(&identifier) {
-                    return Ok(NumberProviderReference::Named(identifier));
+                if self.registry.contains_int_provider(&identifier) {
+                    return Ok(ProviderReference::Named(identifier));
                 }
                 return Err(SimpleCommandExceptionType::new(LiteralMessage::new(format!(
-                    "number provider `{identifier}` does not exist or is outside Worldless scope"
+                    "context int provider `{identifier}` does not exist or is outside Worldless scope"
                 )))
                 .create_with_context(reader));
             }
@@ -3488,8 +3596,8 @@ impl ArgumentType<LoweringSource> for NumberProviderArgument {
         }
 
         let value = parse_nbt_argument(reader, parse_tag)?;
-        parse_inline_number_provider(&value, &self.registry)
-            .map(|provider| NumberProviderReference::Inline(Box::new(provider)))
+        parse_inline_int_provider(&value, &self.registry)
+            .map(|provider| ProviderReference::Inline(Box::new(provider)))
             .map_err(|reason| {
                 SimpleCommandExceptionType::new(LiteralMessage::new(reason))
                     .create_with_context(reader)
@@ -3498,6 +3606,60 @@ impl ArgumentType<LoweringSource> for NumberProviderArgument {
 
     fn examples(&self) -> Vec<String> {
         ["foo", "foo:bar", "+1", "{type:constant,value:1}"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn value_equals(&self, left: &Self::Value, right: &Self::Value) -> bool {
+        left == right
+    }
+}
+
+#[derive(Clone)]
+struct FloatProviderArgument {
+    registry: Arc<LootRegistry>,
+}
+
+impl FloatProviderArgument {
+    fn new(registry: Arc<LootRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+impl ArgumentType<LoweringSource> for FloatProviderArgument {
+    type Value = FloatProviderReference;
+
+    fn parse(&self, reader: &mut StringReader) -> Result<Self::Value, CommandSyntaxException> {
+        let start = reader.cursor();
+        while reader.can_read() && is_allowed_in_identifier(reader.peek()) {
+            reader.skip();
+        }
+        if reader.cursor() != start {
+            let raw = reader.substring(start, reader.cursor());
+            if let Some(identifier) = Identifier::parse(&raw) {
+                if self.registry.contains_float_provider(&identifier) {
+                    return Ok(ProviderReference::Named(identifier));
+                }
+                return Err(SimpleCommandExceptionType::new(LiteralMessage::new(format!(
+                    "context float provider `{identifier}` does not exist or is outside Worldless scope"
+                )))
+                .create_with_context(reader));
+            }
+            reader.set_cursor(start);
+        }
+
+        let value = parse_nbt_argument(reader, parse_tag)?;
+        parse_inline_float_provider(&value, &self.registry)
+            .map(|provider| ProviderReference::Inline(Box::new(provider)))
+            .map_err(|reason| {
+                SimpleCommandExceptionType::new(LiteralMessage::new(reason))
+                    .create_with_context(reader)
+            })
+    }
+
+    fn examples(&self) -> Vec<String> {
+        ["foo", "foo:bar", "+1.0", "{type:constant,value:1.0}"]
             .into_iter()
             .map(str::to_owned)
             .collect()

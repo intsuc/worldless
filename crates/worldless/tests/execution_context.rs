@@ -13,8 +13,8 @@ fn predicate(id: &str, source: impl Into<String>) -> MemoryResource {
     MemoryResource::new(ResourceKind::Predicate, id, source)
 }
 
-fn number_provider(id: &str, source: &str) -> MemoryResource {
-    MemoryResource::new(ResourceKind::NumberProvider, id, source)
+fn context_int_provider(id: &str, source: &str) -> MemoryResource {
+    MemoryResource::new(ResourceKind::ContextIntProvider, id, source)
 }
 
 fn function_tag(id: &str, source: &str) -> MemoryResource {
@@ -257,17 +257,17 @@ fn transformed_context_is_inherited_by_children_but_not_the_callers_next_line() 
 }
 
 #[test]
-fn transformed_context_reaches_number_providers_in_compute_and_data_compute() {
+fn transformed_context_reaches_int_providers_in_compute_and_data_compute() {
     let mut vm = compile([
         function(
             "example:compute",
-            "return run execute positioned 5.0 6.0 7.0 run compute default example:contextual integer\n",
+            "return run execute positioned 5.0 6.0 7.0 run compute default integer example:contextual\n",
         ),
         function(
             "example:data_compute",
-            "data merge storage example:state {value:0}\nexecute positioned 5.0 6.0 7.0 run data modify storage example:state value set compute default example:contextual integer\nreturn run data get storage example:state value\n",
+            "data merge storage example:state {value:0}\nexecute positioned 5.0 6.0 7.0 run data modify storage example:state value set compute default integer example:contextual\nreturn run data get storage example:state value\n",
         ),
-        number_provider(
+        context_int_provider(
             "example:contextual",
             r#"{"type":"conditional","condition":"example:transformed","on_true":71,"on_false":72}"#,
         ),

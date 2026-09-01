@@ -17,16 +17,16 @@ fn returned(value: i32) -> ExecutionOutcome {
 
 fn load(
     functions: &[(&str, &str)],
-    providers: &[(&str, &str)],
+    int_providers: &[(&str, &str)],
     world_seed: i64,
 ) -> Result<Vm, LoadError> {
     let functions = functions
         .iter()
         .map(|(id, source)| MemoryResource::new(ResourceKind::Function, *id, *source));
-    let providers = providers
+    let int_providers = int_providers
         .iter()
-        .map(|(id, source)| MemoryResource::new(ResourceKind::NumberProvider, *id, *source));
-    CompiledProgram::from_packs([Pack::memory(functions.chain(providers))])
+        .map(|(id, source)| MemoryResource::new(ResourceKind::ContextIntProvider, *id, *source));
+    CompiledProgram::from_packs([Pack::memory(functions.chain(int_providers))])
         .map(|program| program.create_vm(world_seed))
 }
 
@@ -41,7 +41,7 @@ fn unnamed_values_share_the_vm_random_stream_and_ignore_the_world_seed() {
         ("example:random", "return run random value 0..10\n"),
         (
             "example:compute",
-            "return run compute default example:uniform integer\n",
+            "return run compute default integer example:uniform\n",
         ),
     ];
     let providers = [("example:uniform", r#"{"type":"uniform","min":0,"max":10}"#)];

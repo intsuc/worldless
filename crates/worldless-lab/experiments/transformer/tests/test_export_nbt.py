@@ -112,7 +112,7 @@ def test_export_matches_worldless_command_storage_envelope_and_abi() -> None:
     root = _decode(encode_command_storage(artifact))
 
     assert set(root) == {"DataVersion", "data"}
-    assert root["DataVersion"] == COMMAND_STORAGE_DATA_VERSION == 5015
+    assert root["DataVersion"] == COMMAND_STORAGE_DATA_VERSION == 5017
     assert set(root["data"]) == {"contents"}
     assert set(root["data"]["contents"]) == {"model"}
 

@@ -2,8 +2,9 @@ use crate::{
     execution_context::ExecutionContext,
     nbt::{CommandStorage, Tag},
     number_provider::{
-        Input, LootRegistry, NumberProviderReference, ascii_string, identifier_field, int_value,
-        parse_reference as parse_number_provider_reference, required_field,
+        FloatProvider, FloatProviderReference, Input, IntProvider, IntProviderReference,
+        LootRegistry, ProviderReference, RegistryResource, ascii_string, identifier_field,
+        int_value, parse_float_reference, parse_int_reference, required_field,
     },
     program::Scoreboard,
     random::LegacyRandom,
@@ -29,11 +30,15 @@ pub(crate) enum LootPredicate {
     AnyOf(PredicateSet),
     Inverted(PredicateReference),
     RandomChance {
-        chance: NumberProviderReference,
+        chance: FloatProviderReference,
     },
-    ValueCheck {
-        value: NumberProviderReference,
+    IntValueCheck {
+        value: IntProviderReference,
         range: IntRange,
+    },
+    FloatValueCheck {
+        value: FloatProviderReference,
+        range: FloatRange,
     },
     LocationCheck {
         position: PositionPredicate,
@@ -41,7 +46,7 @@ pub(crate) enum LootPredicate {
     },
     AbsentContext {
         result: bool,
-        referenced_number_providers: Vec<NumberProviderReference>,
+        referenced_int_providers: Vec<IntProviderReference>,
     },
     MissingContextParameter {
         parameter: &'static str,
@@ -49,10 +54,16 @@ pub(crate) enum LootPredicate {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct IntRange {
-    pub(crate) min: Option<NumberProviderReference>,
-    pub(crate) max: Option<NumberProviderReference>,
+pub(crate) enum ProviderRange<T> {
+    Point(ProviderReference<T>),
+    Bounds {
+        min: Option<ProviderReference<T>>,
+        max: Option<ProviderReference<T>>,
+    },
 }
+
+pub(crate) type IntRange = ProviderRange<IntProvider>;
+pub(crate) type FloatRange = ProviderRange<FloatProvider>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PositionPredicate {
@@ -148,23 +159,22 @@ impl LootPredicate {
                 )?;
                 Ok(random.next_float() < chance)
             }
-            Self::ValueCheck { value, range } => {
-                let value = registry.get_int(
-                    value,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )?;
-                range.test(
-                    value,
-                    registry,
-                    scoreboard,
-                    command_storage,
-                    execution_context,
-                    random,
-                )
-            }
+            Self::IntValueCheck { value, range } => range.test(
+                value,
+                registry,
+                scoreboard,
+                command_storage,
+                execution_context,
+                random,
+            ),
+            Self::FloatValueCheck { value, range } => range.test(
+                value,
+                registry,
+                scoreboard,
+                command_storage,
+                execution_context,
+                random,
+            ),
             Self::LocationCheck { position, offset } => {
                 let origin = execution_context.position();
                 Ok(position.test([
@@ -181,29 +191,190 @@ impl LootPredicate {
     }
 }
 
-impl IntRange {
+impl ProviderRange<IntProvider> {
     fn test(
         &self,
-        value: i32,
+        value: &IntProviderReference,
         registry: &LootRegistry,
         scoreboard: &Scoreboard,
         command_storage: &CommandStorage,
         execution_context: &ExecutionContext,
         random: &mut LegacyRandom,
     ) -> Result<bool, String> {
-        if let Some(min) = &self.min
-            && value
-                < registry.get_int(min, scoreboard, command_storage, execution_context, random)?
-        {
-            return Ok(false);
+        match self {
+            Self::Point(expected) => {
+                let value = registry.get_int(
+                    value,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                Ok(value
+                    == registry.get_int(
+                        expected,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )?)
+            }
+            Self::Bounds { min, max } => {
+                if min.is_none() && max.is_none() {
+                    return Ok(true);
+                }
+                let value = registry.get_int(
+                    value,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                if let Some(min) = min
+                    && value
+                        < registry.get_int(
+                            min,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?
+                {
+                    return Ok(false);
+                }
+                if let Some(max) = max
+                    && value
+                        > registry.get_int(
+                            max,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?
+                {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
         }
-        if let Some(max) = &self.max
-            && value
-                > registry.get_int(max, scoreboard, command_storage, execution_context, random)?
-        {
-            return Ok(false);
+    }
+
+    pub(crate) fn collect_dependencies(
+        &self,
+        registry: &LootRegistry,
+        dependencies: &mut Vec<RegistryResource>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Point(value) => registry.collect_int_reference_dependencies(value, dependencies),
+            Self::Bounds { min, max } => {
+                if let Some(min) = min {
+                    registry.collect_int_reference_dependencies(min, dependencies)?;
+                }
+                if let Some(max) = max {
+                    registry.collect_int_reference_dependencies(max, dependencies)?;
+                }
+                Ok(())
+            }
         }
-        Ok(true)
+    }
+}
+
+impl ProviderRange<FloatProvider> {
+    fn test(
+        &self,
+        value: &FloatProviderReference,
+        registry: &LootRegistry,
+        scoreboard: &Scoreboard,
+        command_storage: &CommandStorage,
+        execution_context: &ExecutionContext,
+        random: &mut LegacyRandom,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Point(expected) => {
+                let value = registry.get_float(
+                    value,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                Ok(value
+                    == registry.get_float(
+                        expected,
+                        scoreboard,
+                        command_storage,
+                        execution_context,
+                        random,
+                    )?)
+            }
+            Self::Bounds { min, max } => {
+                if min.is_none() && max.is_none() {
+                    return Ok(true);
+                }
+                let value = registry.get_float(
+                    value,
+                    scoreboard,
+                    command_storage,
+                    execution_context,
+                    random,
+                )?;
+                if let Some(min) = min
+                    && value
+                        < registry.get_float(
+                            min,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?
+                {
+                    return Ok(false);
+                }
+                if let Some(max) = max
+                    && value
+                        > registry.get_float(
+                            max,
+                            scoreboard,
+                            command_storage,
+                            execution_context,
+                            random,
+                        )?
+                {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    pub(crate) fn collect_dependencies(
+        &self,
+        registry: &LootRegistry,
+        dependencies: &mut Vec<RegistryResource>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Point(value) => {
+                registry.collect_float_reference_dependencies(value, dependencies)
+            }
+            Self::Bounds { min, max } => {
+                if let Some(min) = min {
+                    registry.collect_float_reference_dependencies(min, dependencies)?;
+                }
+                if let Some(max) = max {
+                    registry.collect_float_reference_dependencies(max, dependencies)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<T> ProviderRange<T> {
+    fn into_references(self) -> Vec<ProviderReference<T>> {
+        match self {
+            Self::Point(value) => vec![value],
+            Self::Bounds { min, max } => min.into_iter().chain(max).collect(),
+        }
     }
 }
 
@@ -252,13 +423,20 @@ fn parse_direct(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
             input, path, "term",
         )?)),
         "random_chance" => Ok(LootPredicate::RandomChance {
-            chance: number_provider_reference_field(input, path, "chance")?,
+            chance: float_provider_reference_field(input, path, "chance")?,
         }),
-        "value_check" => Ok(LootPredicate::ValueCheck {
-            value: number_provider_reference_field(input, path, "value")?,
+        "int_value_check" => Ok(LootPredicate::IntValueCheck {
+            value: int_provider_reference_field(input, path, "value")?,
             range: parse_int_range(
-                required_field(input, path, "range")?,
-                &format!("{path}.range"),
+                required_field(input, path, "test")?,
+                &format!("{path}.test"),
+            )?,
+        }),
+        "float_value_check" => Ok(LootPredicate::FloatValueCheck {
+            value: float_provider_reference_field(input, path, "value")?,
+            range: parse_float_range(
+                required_field(input, path, "test")?,
+                &format!("{path}.test"),
             )?,
         }),
         "location_check" => parse_location_check(input, path),
@@ -286,7 +464,7 @@ fn parse_direct(input: Input<'_>, path: &str) -> Result<LootPredicate, String> {
 fn absent_context(result: bool) -> LootPredicate {
     LootPredicate::AbsentContext {
         result,
-        referenced_number_providers: Vec::new(),
+        referenced_int_providers: Vec::new(),
     }
 }
 
@@ -305,15 +483,14 @@ fn parse_entity_scores(input: Input<'_>, path: &str) -> Result<LootPredicate, St
     let scores = required_field(input, path, "scores")?
         .object_entries()
         .ok_or_else(|| format!("`{scores_path}` must be an object"))?;
-    let mut referenced_number_providers = Vec::new();
+    let mut referenced_int_providers = Vec::new();
     for (score, range) in scores {
         let range = parse_int_range(range, &format!("{scores_path}.{score}"))?;
-        referenced_number_providers.extend(range.min);
-        referenced_number_providers.extend(range.max);
+        referenced_int_providers.extend(range.into_references());
     }
     Ok(LootPredicate::AbsentContext {
         result: false,
-        referenced_number_providers,
+        referenced_int_providers,
     })
 }
 
@@ -600,39 +777,55 @@ fn predicate_reference_field(
     )
 }
 
-fn number_provider_reference_field(
+fn int_provider_reference_field(
     input: Input<'_>,
     path: &str,
     field: &str,
-) -> Result<NumberProviderReference, String> {
-    parse_number_provider_reference(
+) -> Result<IntProviderReference, String> {
+    parse_int_reference(
+        required_field(input, path, field)?,
+        &format!("{path}.{field}"),
+    )
+}
+
+fn float_provider_reference_field(
+    input: Input<'_>,
+    path: &str,
+    field: &str,
+) -> Result<FloatProviderReference, String> {
+    parse_float_reference(
         required_field(input, path, field)?,
         &format!("{path}.{field}"),
     )
 }
 
 fn parse_int_range(input: Input<'_>, path: &str) -> Result<IntRange, String> {
-    if input.number().is_some() {
-        let value = NumberProviderReference::Inline(Box::new(
-            crate::number_provider::NumberProvider::Constant(int_value(input, path)? as f32),
-        ));
-        return Ok(IntRange {
-            min: Some(value.clone()),
-            max: Some(value),
-        });
-    }
-    if !input.is_object() {
-        return Err(format!("`{path}` must be an integer or an object"));
+    parse_provider_range(input, path, parse_int_reference)
+}
+
+fn parse_float_range(input: Input<'_>, path: &str) -> Result<FloatRange, String> {
+    parse_provider_range(input, path, parse_float_reference)
+}
+
+fn parse_provider_range<T>(
+    input: Input<'_>,
+    path: &str,
+    parse_reference: fn(Input<'_>, &str) -> Result<ProviderReference<T>, String>,
+) -> Result<ProviderRange<T>, String> {
+    match parse_reference(input, path) {
+        Ok(value) => return Ok(ProviderRange::Point(value)),
+        Err(reason) if !input.is_object() => return Err(reason),
+        Err(_) => {}
     }
     let min = input
         .field("min")
-        .map(|value| parse_number_provider_reference(value, &format!("{path}.min")))
+        .map(|value| parse_reference(value, &format!("{path}.min")))
         .transpose()?;
     let max = input
         .field("max")
-        .map(|value| parse_number_provider_reference(value, &format!("{path}.max")))
+        .map(|value| parse_reference(value, &format!("{path}.max")))
         .transpose()?;
-    Ok(IntRange { min, max })
+    Ok(ProviderRange::Bounds { min, max })
 }
 
 pub(crate) fn builtin_predicates() -> std::collections::HashMap<Identifier, LootPredicate> {
@@ -660,14 +853,106 @@ mod tests {
     use crate::execution_context::{Position, Rotation};
 
     #[test]
-    fn parses_supported_predicate_shapes() {
+    fn parses_supported_typed_predicate_shapes() {
         assert!(matches!(
             parse_json(r#"{"type":"all_of","terms":[]}"#).unwrap(),
             LootPredicate::AllOf(PredicateSet::Direct(values)) if values.is_empty()
         ));
         assert!(matches!(
-            parse_json(r#"{"type":"value_check","value":1.5,"range":{"min":1,"max":2}}"#).unwrap(),
-            LootPredicate::ValueCheck { .. }
+            parse_json(r#"{"type":"random_chance","chance":0.25}"#).unwrap(),
+            LootPredicate::RandomChance {
+                chance: ProviderReference::Inline(chance),
+            } if *chance == FloatProvider::Constant(0.25)
+        ));
+        assert!(matches!(
+            parse_json(r#"{"type":"int_value_check","value":2,"test":"example:point"}"#).unwrap(),
+            LootPredicate::IntValueCheck {
+                range: ProviderRange::Point(ProviderReference::Named(id)),
+                ..
+            } if id.to_string() == "example:point"
+        ));
+        assert!(matches!(
+            parse_json(r#"{"type":"int_value_check","value":2,"test":{"min":1,"max":3}}"#).unwrap(),
+            LootPredicate::IntValueCheck {
+                range: ProviderRange::Bounds {
+                    min: Some(_),
+                    max: Some(_),
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_json(r#"{"type":"float_value_check","value":1.5,"test":1.5}"#).unwrap(),
+            LootPredicate::FloatValueCheck {
+                range: ProviderRange::Point(ProviderReference::Inline(expected)),
+                ..
+            } if *expected == FloatProvider::Constant(1.5)
+        ));
+        assert!(matches!(
+            parse_json(r#"{"type":"float_value_check","value":1.5,"test":{"min":1.0,"max":2.0}}"#)
+                .unwrap(),
+            LootPredicate::FloatValueCheck {
+                range: ProviderRange::Bounds {
+                    min: Some(_),
+                    max: Some(_),
+                },
+                ..
+            }
+        ));
+        assert!(
+            parse_json(r#"{"type":"value_check","value":1,"range":1}"#)
+                .unwrap_err()
+                .contains("not supported")
+        );
+    }
+
+    #[test]
+    fn unbounded_typed_range_does_not_evaluate_its_input() {
+        let predicate = parse_json(
+            r#"{
+                "type":"int_value_check",
+                "value":{"type":"uniform","min":0,"max":1},
+                "test":{}
+            }"#,
+        )
+        .unwrap();
+        let mut actual_random = LegacyRandom::default();
+        let mut expected_random = LegacyRandom::default();
+        let context = ExecutionContext::new(Position::new(0.0, 0.0, 0.0), Rotation::new(0.0, 0.0));
+
+        assert_eq!(
+            predicate.test(
+                &LootRegistry::empty(),
+                &Scoreboard::default(),
+                &CommandStorage::default(),
+                &context,
+                &mut actual_random,
+            ),
+            Ok(true)
+        );
+        assert_eq!(actual_random.next_float(), expected_random.next_float());
+    }
+
+    #[test]
+    fn entity_scores_retains_typed_int_provider_dependencies() {
+        let predicate = parse_json(
+            r#"{
+                "type":"entity_scores",
+                "entity":"this",
+                "scores":{
+                    "point":"example:point",
+                    "bounds":{"min":"example:min","max":"example:max"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            predicate,
+            LootPredicate::AbsentContext {
+                result: false,
+                referenced_int_providers,
+            } if referenced_int_providers.len() == 3
         ));
     }
 

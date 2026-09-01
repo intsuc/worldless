@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 pub enum ResourceKind {
     Function,
     FunctionTag,
-    NumberProvider,
-    NumberProviderTag,
+    ContextIntProvider,
+    ContextIntProviderTag,
+    ContextFloatProvider,
+    ContextFloatProviderTag,
     Predicate,
     PredicateTag,
 }

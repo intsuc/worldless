@@ -28,7 +28,7 @@ impl TestPack {
         fs::create_dir(&root).unwrap();
         fs::write(
             root.join("pack.mcmeta"),
-            r#"{"pack":{"description":"test","min_format":[118,0],"max_format":[118,0]}}"#,
+            r#"{"pack":{"description":"test","min_format":[119,0],"max_format":[119,0]}}"#,
         )
         .unwrap();
         Self { root }
@@ -262,7 +262,7 @@ fn requires_the_target_minor_aware_pack_format() {
     let pack = TestPack::new();
     fs::write(
         pack.root().join("pack.mcmeta"),
-        r#"{"pack":{"description":"test","pack_format":118}}"#,
+        r#"{"pack":{"description":"test","pack_format":119}}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -272,7 +272,7 @@ fn requires_the_target_minor_aware_pack_format() {
 
     fs::write(
         pack.root().join("pack.mcmeta"),
-        r#"{"pack":{"description":"test","min_format":[118,1],"max_format":[118,2]}}"#,
+        r#"{"pack":{"description":"test","min_format":[119,1],"max_format":[119,2]}}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -287,14 +287,14 @@ fn accepts_official_compatible_format_encodings() {
     pack.write_function("example:main", "return 1\n");
     fs::write(
         pack.root().join("pack.mcmeta"),
-        r#"{"pack":{"description":"test","pack_format":81,"supported_formats":[81,81],"min_format":[81,0],"max_format":[118,0]}}"#,
+        r#"{"pack":{"description":"test","pack_format":81,"supported_formats":[81,81],"min_format":[81,0],"max_format":[119,0]}}"#,
     )
     .unwrap();
     assert!(load_directory_pack(pack.root()).is_ok());
 
     fs::write(
         pack.root().join("pack.mcmeta"),
-        r#"{"pack":{"description":"test","pack_format":null,"supported_formats":null,"min_format":118.0,"max_format":4294967414}}"#,
+        r#"{"pack":{"description":"test","pack_format":null,"supported_formats":null,"min_format":119.0,"max_format":4294967415}}"#,
     )
     .unwrap();
     assert!(load_directory_pack(pack.root()).is_ok());
@@ -345,7 +345,7 @@ fn rejects_unsupported_pack_features() {
         fs::write(
             pack.root().join("pack.mcmeta"),
             format!(
-                r#"{{"pack":{{"description":"test","min_format":118,"max_format":118}},{extra}}}"#
+                r#"{{"pack":{{"description":"test","min_format":119,"max_format":119}},{extra}}}"#
             ),
         )
         .unwrap();

@@ -29,7 +29,7 @@ impl TestPack {
         fs::create_dir(&root).unwrap();
         fs::write(
             root.join("pack.mcmeta"),
-            r#"{"pack":{"description":"test","min_format":[118,0],"max_format":[118,0]}}"#,
+            r#"{"pack":{"description":"test","min_format":[119,0],"max_format":[119,0]}}"#,
         )
         .unwrap();
         Self { root }
@@ -69,12 +69,12 @@ fn function_tag(id: &str, source: &str) -> MemoryResource {
     resource(ResourceKind::FunctionTag, id, source)
 }
 
-fn number_provider(id: &str, source: &str) -> MemoryResource {
-    resource(ResourceKind::NumberProvider, id, source)
+fn context_int_provider(id: &str, source: &str) -> MemoryResource {
+    resource(ResourceKind::ContextIntProvider, id, source)
 }
 
-fn number_provider_tag(id: &str, source: &str) -> MemoryResource {
-    resource(ResourceKind::NumberProviderTag, id, source)
+fn context_int_provider_tag(id: &str, source: &str) -> MemoryResource {
+    resource(ResourceKind::ContextIntProviderTag, id, source)
 }
 
 fn predicate(id: &str, source: &str) -> MemoryResource {
@@ -109,19 +109,19 @@ fn later_packs_override_ordinary_resources_without_hiding_unrelated_resources() 
         function("example:low_only", "return 4\n"),
         function(
             "example:provider_result",
-            "return run compute default example:number\n",
+            "return run compute default integer example:number\n",
         ),
         function(
             "example:predicate_result",
             "return run execute if predicate example:condition run return 9\n",
         ),
-        number_provider("example:number", "1"),
+        context_int_provider("example:number", "1"),
         predicate("example:condition", r#"{"type":"any_of","terms":[]}"#),
     ]);
     let high = Pack::memory([
         function("example:function_winner", "return 2\n"),
         function("example:high_only", "return 5\n"),
-        number_provider("example:number", "7"),
+        context_int_provider("example:number", "7"),
         predicate("example:condition", r#"{"type":"all_of","terms":[]}"#),
     ]);
 
@@ -143,20 +143,20 @@ fn later_packs_override_ordinary_resources_without_hiding_unrelated_resources() 
 fn only_the_selected_ordinary_resource_is_validated() {
     let low = Pack::memory([
         function("example:function_winner", "not a command\n"),
-        number_provider("example:number", "{"),
+        context_int_provider("example:number", "{"),
         predicate("example:condition", "{"),
     ]);
     let high = Pack::memory([
         function("example:function_winner", "return 8\n"),
         function(
             "example:provider_result",
-            "return run compute default example:number\n",
+            "return run compute default integer example:number\n",
         ),
         function(
             "example:predicate_result",
             "return run execute if predicate example:condition run return 9\n",
         ),
-        number_provider("example:number", "6"),
+        context_int_provider("example:number", "6"),
         predicate("example:condition", r#"{"type":"all_of","terms":[]}"#),
     ]);
 
@@ -274,19 +274,19 @@ fn registry_resource_tags_are_composed_before_their_consumers_are_resolved() {
     let low = Pack::memory([
         function(
             "example:provider_result",
-            "return run compute default example:sum\n",
+            "return run compute default integer example:sum\n",
         ),
         function(
             "example:predicate_result",
             "return run execute if predicate example:tagged run return 7\n",
         ),
-        number_provider("example:one", "1"),
-        number_provider("example:two", "2"),
-        number_provider(
+        context_int_provider("example:one", "1"),
+        context_int_provider("example:two", "2"),
+        context_int_provider(
             "example:sum",
-            r##"{"type":"sum","operands":"#example:values"}"##,
+            r##"{"type":"add","inputs":"#example:values"}"##,
         ),
-        number_provider_tag("example:values", r#"{"values":["example:one"]}"#),
+        context_int_provider_tag("example:values", r#"{"values":["example:one"]}"#),
         predicate("example:falsehood", r#"{"type":"any_of","terms":[]}"#),
         predicate("example:truth", r#"{"type":"all_of","terms":[]}"#),
         predicate(
@@ -296,7 +296,7 @@ fn registry_resource_tags_are_composed_before_their_consumers_are_resolved() {
         predicate_tag("example:checks", r#"{"values":["example:falsehood"]}"#),
     ]);
     let high = Pack::memory([
-        number_provider_tag(
+        context_int_provider_tag(
             "example:values",
             r#"{"values":["example:two","example:one"]}"#,
         ),
@@ -392,7 +392,7 @@ fn filters_and_overlays_remain_explicitly_unsupported() {
         fs::write(
             directory.root().join("pack.mcmeta"),
             format!(
-                r#"{{"pack":{{"description":"test","min_format":[118,0],"max_format":[118,0]}},{section}}}"#
+                r#"{{"pack":{{"description":"test","min_format":[119,0],"max_format":[119,0]}},{section}}}"#
             ),
         )
         .unwrap();

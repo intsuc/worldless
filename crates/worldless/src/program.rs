@@ -6,7 +6,7 @@ use std::{
 use crate::execution_context::ContextTransform;
 use crate::macro_function::Function;
 use crate::nbt::{CompoundTag, JavaString, NbtPath, Tag};
-use crate::number_provider::{LootRegistry, NumberProviderReference};
+use crate::number_provider::{FloatProviderReference, IntProviderReference, LootRegistry};
 use crate::predicate::PredicateReference;
 use crate::resource::{FunctionReference, Identifier};
 
@@ -194,21 +194,20 @@ impl RandomSequenceSettings {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ComputeCommand {
-    pub(crate) provider: NumberProviderReference,
-    pub(crate) mode: ComputeMode,
+pub(crate) enum ComputeCommand {
+    Float {
+        provider: FloatProviderReference,
+        scale: f32,
+    },
+    Integer {
+        provider: IntProviderReference,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PredicateCondition {
     pub(crate) expected: bool,
     pub(crate) predicate: PredicateReference,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum ComputeMode {
-    Float { scale: f32 },
-    Integer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,10 +281,8 @@ pub(crate) enum DataSource {
         path: Option<NbtPath>,
         substring: Option<DataStringSubstring>,
     },
-    Compute {
-        provider: NumberProviderReference,
-        integer: bool,
-    },
+    ComputeFloat(FloatProviderReference),
+    ComputeInteger(IntProviderReference),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
